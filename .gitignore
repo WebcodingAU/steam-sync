@@ -1,0 +1,8 @@
+# Local copy of the site's server config - holds live secrets.
+config.php
+
+bin/
+obj/
+*.user
+.vs/
+
