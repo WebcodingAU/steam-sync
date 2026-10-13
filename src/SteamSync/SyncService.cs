@@ -30,6 +30,7 @@ internal sealed class SyncService : IDisposable
     private DateTimeOffset? _lastSuccess;
     private int _lastGameCount;
     private bool _nonSteamFailing;   // the last non-Steam scan failed and its one quick retry is already spent
+    private int _unknownDeviceStrikes; // consecutive "not paired" answers; the token is only dropped on the second
 
     public event Action<SyncStatus>? StatusChanged;
     public SyncStatus Status { get; private set; }
@@ -109,16 +110,25 @@ internal sealed class SyncService : IDisposable
             if (nonSteam is null && !_nonSteamFailing) ScheduleSync(Quiet);
             _nonSteamFailing = nonSteam is null;
 
+            _unknownDeviceStrikes = 0;
             _lastSuccess = DateTimeOffset.Now;
             _lastGameCount = snapshot.Games.Count;
             Log.Info($"Synced {snapshot.Games.Count} games from {snapshot.Libraries.Count} libraries, "
                      + (nonSteam is null ? "non-Steam games skipped" : $"{nonSteam.Games.Count(g => g.Installed)} non-Steam games installed"));
             Publish(new(SyncState.Synced, $"{snapshot.Games.Count} games synced", _lastSuccess, _lastGameCount));
         }
+        catch (SupabaseException ex) when (ex.IsUnknownDevice && ++_unknownDeviceStrikes < 2)
+        {
+            // Forgetting the pairing can't be undone, so one answer isn't enough: ask again before believing it.
+            Log.Error("Server did not recognise this device; checking again before unpairing", ex);
+            Publish(new(SyncState.Error, "Server didn't recognise this PC — checking again", _lastSuccess, _lastGameCount));
+            ScheduleSync(RetryAfterError);
+        }
         catch (SupabaseException ex) when (ex.IsUnknownDevice)
         {
             Log.Error("Server no longer recognises this device; clearing token", ex);
             DeviceToken.Clear();
+            _unknownDeviceStrikes = 0;
             Publish(new(SyncState.NotPaired, "This PC was removed — pair it again", _lastSuccess, _lastGameCount));
         }
         catch (Exception ex)

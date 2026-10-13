@@ -60,7 +60,12 @@ internal static class DeviceToken
     public static void Save(string token) =>
         File.WriteAllBytes(FilePath, ProtectedData.Protect(Encoding.UTF8.GetBytes(token), null, DataProtectionScope.CurrentUser));
 
-    public static void Clear() => File.Delete(FilePath);
+    public static void Clear()
+    {
+        // Called from error handling, so it must not throw itself.
+        try { File.Delete(FilePath); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Log.Error("Could not delete the device token", ex); }
+    }
 }
 
 /// <summary>Per-user "start with Windows" entry under HKCU\...\Run.</summary>
