@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>SteamSync</AssemblyName>
     <RootNamespace>SteamSync</RootNamespace>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Product>Steam Sync</Product>
     <Company>gamingenjoyer.com</Company>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>

@@ -11,7 +11,11 @@ internal static class Program
         if (args is ["--dump", var outPath])
         {
             var snapshot = SteamLibrary.Scan();
-            File.WriteAllText(outPath, JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true }));
+            object nonSteam;
+            try { nonSteam = NonSteamLibrary.Scan(snapshot); }
+            catch (Exception ex) { nonSteam = new { Error = ex.ToString() }; } // what the tray app would send as p_nonsteam = null
+            var dump = new { snapshot.SteamPath, snapshot.SteamId, snapshot.Libraries, snapshot.Games, NonSteam = nonSteam };
+            File.WriteAllText(outPath, JsonSerializer.Serialize(dump, new JsonSerializerOptions { WriteIndented = true }));
             return 0;
         }
 

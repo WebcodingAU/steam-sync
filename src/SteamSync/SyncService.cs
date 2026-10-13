@@ -5,8 +5,9 @@ internal enum SyncState { NotConfigured, NotPaired, Syncing, Synced, Error }
 internal sealed record SyncStatus(SyncState State, string Message, DateTimeOffset? LastSuccess, int GameCount);
 
 /// <summary>
-/// Watches every Steam library's steamapps folder and pushes the full installed list to Supabase
-/// shortly after anything changes, plus a periodic safety-net sync.
+/// Watches every Steam library's steamapps folder (plus Steam's shortcuts.vdf and the Xbox game folders) and pushes
+/// the full installed list to Supabase shortly after anything changes, plus a periodic safety-net sync that also
+/// picks up registry-only changes (Battle.net, Ubisoft, EA, Battlestate installs).
 /// </summary>
 internal sealed class SyncService : IDisposable
 {
@@ -23,9 +24,12 @@ internal sealed class SyncService : IDisposable
     private readonly System.Threading.Timer _periodicTimer;
     private readonly List<FileSystemWatcher> _watchers = [];
     private IReadOnlyList<string> _watchedLibraries = [];
+    private IReadOnlyList<string> _watchedShortcutDirs = [];
+    private IReadOnlyList<string> _watchedXboxRoots = [];
     private DateTimeOffset? _firstPendingChange;
     private DateTimeOffset? _lastSuccess;
     private int _lastGameCount;
+    private bool _nonSteamFailing;   // the last non-Steam scan failed and its one quick retry is already spent
 
     public event Action<SyncStatus>? StatusChanged;
     public SyncStatus Status { get; private set; }
@@ -85,14 +89,30 @@ internal sealed class SyncService : IDisposable
             Publish(new(SyncState.Syncing, "Syncing…", _lastSuccess, _lastGameCount));
 
             var snapshot = SteamLibrary.Scan();
-            if (!snapshot.Libraries.SequenceEqual(_watchedLibraries, StringComparer.OrdinalIgnoreCase))
-                RefreshWatchers(snapshot.Libraries);
+            var nonSteam = ScanNonSteam(snapshot);
+            // Watch the non-Steam folders even when the scan failed, so Steam fixing shortcuts.vdf triggers a sync.
+            var shortcutDirs = nonSteam?.ShortcutConfigDirs
+                ?? TryFindFolders("Steam shortcut folders", () => NonSteamLibrary.FindShortcutConfigDirs(snapshot.SteamPath, snapshot.SteamId))
+                ?? _watchedShortcutDirs;
+            var xboxRoots = nonSteam?.XboxRoots ?? TryFindFolders("Xbox game folders", NonSteamLibrary.FindXboxRoots) ?? _watchedXboxRoots;
+            if (!snapshot.Libraries.SequenceEqual(_watchedLibraries, StringComparer.OrdinalIgnoreCase)
+                || !shortcutDirs.SequenceEqual(_watchedShortcutDirs, StringComparer.OrdinalIgnoreCase)
+                || !xboxRoots.SequenceEqual(_watchedXboxRoots, StringComparer.OrdinalIgnoreCase))
+            {
+                RefreshWatchers(snapshot.Libraries, shortcutDirs, xboxRoots);
+            }
 
-            await _api.SyncAsync(token, snapshot);
+            await _api.SyncAsync(token, snapshot, nonSteam?.Games);
+
+            // A failed scan is usually transient (e.g. Steam mid-way through rewriting shortcuts.vdf), so go again
+            // soon, but only once per failure streak so a file that stays broken doesn't sync every few seconds.
+            if (nonSteam is null && !_nonSteamFailing) ScheduleSync(Quiet);
+            _nonSteamFailing = nonSteam is null;
 
             _lastSuccess = DateTimeOffset.Now;
             _lastGameCount = snapshot.Games.Count;
-            Log.Info($"Synced {snapshot.Games.Count} games from {snapshot.Libraries.Count} libraries");
+            Log.Info($"Synced {snapshot.Games.Count} games from {snapshot.Libraries.Count} libraries, "
+                     + (nonSteam is null ? "non-Steam games skipped" : $"{nonSteam.Games.Count(g => g.Installed)} non-Steam games installed"));
             Publish(new(SyncState.Synced, $"{snapshot.Games.Count} games synced", _lastSuccess, _lastGameCount));
         }
         catch (SupabaseException ex) when (ex.IsUnknownDevice)
@@ -110,6 +130,34 @@ internal sealed class SyncService : IDisposable
         finally
         {
             _syncGate.Release();
+        }
+    }
+
+    /// <summary>Null when any detector fails, so the server leaves non-Steam data alone instead of unticking games.</summary>
+    private static NonSteamSnapshot? ScanNonSteam(SteamSnapshot steam)
+    {
+        try
+        {
+            return NonSteamLibrary.Scan(steam);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Non-Steam detection failed; not sending non-Steam games this time", ex);
+            return null;
+        }
+    }
+
+    /// <summary>Folders to watch after a failed non-Steam scan; null (keep the current watchers) if they can't be found either.</summary>
+    private static IReadOnlyList<string>? TryFindFolders(string what, Func<IReadOnlyList<string>> find)
+    {
+        try
+        {
+            return find();
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Could not find the {what} to watch", ex);
+            return null;
         }
     }
 
@@ -148,8 +196,17 @@ internal sealed class SyncService : IDisposable
         }
     }
 
-    private void RefreshWatchers(IReadOnlyList<string>? libraries = null)
+    /// <summary>
+    /// Rebuilds every watcher. The non-Steam folders come from each sync (found on their own when its scan fails), so
+    /// none are watched at startup; they only matter once paired, and pairing syncs straight away.
+    /// </summary>
+    private void RefreshWatchers(
+        IReadOnlyList<string>? libraries = null,
+        IReadOnlyList<string>? shortcutDirs = null,
+        IReadOnlyList<string>? xboxRoots = null)
     {
+        shortcutDirs ??= [];
+        xboxRoots ??= [];
         try
         {
             if (libraries is null)
@@ -186,10 +243,47 @@ internal sealed class SyncService : IDisposable
                 watcher.EnableRaisingEvents = true;
                 _watchers.Add(watcher);
             }
+            var libraryWatchers = _watchers.Count;
+
+            // Non-Steam: shortcuts.vdf rewrites, and Xbox game folders appearing, being renamed or removed.
+            // Registry-only installs are left to the periodic sync.
+            foreach (var dir in shortcutDirs)
+                AddNonSteamWatcher(dir, "shortcuts.vdf", NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size);
+            foreach (var root in xboxRoots)
+                AddNonSteamWatcher(root, "*", NotifyFilters.DirectoryName);
+
             _watchedLibraries = libraries;
-            Log.Info($"Watching {_watchers.Count} Steam libraries: {string.Join(", ", libraries)}");
+            _watchedShortcutDirs = shortcutDirs;
+            _watchedXboxRoots = xboxRoots;
+            Log.Info($"Watching {libraryWatchers} Steam libraries: {string.Join(", ", libraries)}");
+            if (shortcutDirs.Count + xboxRoots.Count > 0)
+                Log.Info($"Watching non-Steam folders: {string.Join(", ", shortcutDirs.Concat(xboxRoots))}");
         }
     }
+
+    private void AddNonSteamWatcher(string folder, string filter, NotifyFilters notifyFilter)
+    {
+        if (!Directory.Exists(folder)) return;
+        FileSystemWatcher? watcher = null;
+        try
+        {
+            watcher = new FileSystemWatcher(folder, filter) { NotifyFilter = notifyFilter, IncludeSubdirectories = false };
+            watcher.Created += OnNonSteamChanged;
+            watcher.Changed += OnNonSteamChanged;
+            watcher.Deleted += OnNonSteamChanged;
+            watcher.Renamed += OnNonSteamChanged;
+            watcher.Error += (_, e) => { Log.Error("File watcher error", e.GetException()); ScheduleSync(Quiet); };
+            watcher.EnableRaisingEvents = true;
+            _watchers.Add(watcher);
+        }
+        catch (Exception ex)
+        {
+            watcher?.Dispose();
+            Log.Error($"Could not watch {folder}", ex);
+        }
+    }
+
+    private void OnNonSteamChanged(object sender, FileSystemEventArgs e) => ScheduleSync(Quiet);
 
     public void Dispose()
     {

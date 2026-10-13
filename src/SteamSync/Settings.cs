@@ -115,7 +115,9 @@ internal static class Log
                     File.Move(FilePath, FilePath + ".old", overwrite: true);
                 File.AppendAllText(FilePath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {level} {message}{Environment.NewLine}");
             }
-            catch (IOException) { }
+            // Logging must never throw: a failure here used to escape into the sync's own error handling, which
+            // logs too, so the sync ended mid-way (after the data was sent) and the tray never left "Syncing…".
+            catch (Exception) { }
         }
     }
 }
