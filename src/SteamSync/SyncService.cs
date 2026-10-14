@@ -54,7 +54,7 @@ internal sealed class SyncService : IDisposable
 
     public async Task<string> PairAsync(string code, string deviceName)
     {
-        if (_api is null) throw new InvalidOperationException("Steam Sync is not configured with a Supabase project.");
+        if (_api is null) throw new InvalidOperationException($"{AppInfo.Name} is not configured with a Supabase project.");
         var token = await _api.ClaimPairingCodeAsync(code, deviceName);
         DeviceToken.Save(token);
         Log.Info($"Paired as '{deviceName}'");

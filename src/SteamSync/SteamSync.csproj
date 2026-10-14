@@ -8,14 +8,32 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>SteamSync</AssemblyName>
     <RootNamespace>SteamSync</RootNamespace>
-    <Version>0.2.0</Version>
-    <Product>Steam Sync</Product>
+    <Version>0.3.0</Version>
+    <Product>Gaming Enjoyer</Product>
+    <AssemblyTitle>Gaming Enjoyer</AssemblyTitle>
     <Company>gamingenjoyer.com</Company>
+    <ApplicationIcon>app.ico</ApplicationIcon>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <!-- English-only app: skip the translated framework resources a self-contained publish would otherwise ship. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
 
   <ItemGroup>
     <EmbeddedResource Include="appsettings.json" LogicalName="SteamSync.appsettings.json" />
+    <EmbeddedResource Include="app.ico" LogicalName="SteamSync.app.ico" />
   </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4258.31" />
+    <PackageReference Include="Velopack" Version="1.2.161" />
+  </ItemGroup>
+
+  <!-- The WebView2 package always references its WPF control too; this is a WinForms app, so drop it
+       (it only adds a WindowsBase version conflict and an unused DLL). -->
+  <Target Name="DropWebView2Wpf" BeforeTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <Reference Remove="@(Reference)" Condition="'%(Filename)' == 'Microsoft.Web.WebView2.Wpf'" />
+    </ItemGroup>
+  </Target>
 
 </Project>

@@ -1,7 +1,33 @@
-# Steam Sync
+# Gaming Enjoyer (Steam Sync)
 
-Windows tray app that reports which Steam games are installed on this PC to
-gamingenjoyer.com, so the library's **Installed** flags keep themselves up to date.
+Windows tray app for gamingenjoyer.com. It reports which games are installed on this PC, so the
+library's **Installed** flags keep themselves up to date, and opens the site's Library in a lightweight
+window built to sit next to a running game. (The exe and data folder are still called SteamSync.)
+
+Install: run `GamingEnjoyer-win-Setup.exe` from
+[gaming-enjoyer-releases](https://github.com/WebcodingAU/gaming-enjoyer-releases/releases/latest).
+It installs per user (no admin) to `%LocalAppData%\GamingEnjoyer`, adds a Start menu entry, installs the
+WebView2 runtime if the PC lacks it, and updates itself.
+
+## Library window
+
+Tray → **Open Library** (or the Start menu entry, or double-click the tray icon) opens gamingenjoyer.com
+in a single-site window on the WebView2 (Edge) runtime that ships with Windows:
+
+- Its own profile under `%LocalAppData%\SteamSync\WebView2`; sign in once.
+- Play links launch games directly; other sites open in the default browser. **F11** is fullscreen.
+- GPU off (software rendering): measured ~100 MB lighter and never competes with a game for the GPU.
+- Not the active window → every process in Windows Efficiency mode, low-memory target.
+- Minimized → page frozen; minimized for 2 minutes → the engine shuts down (back to ~30 MB) and the page
+  reloads on restore. Closed → no browser processes at all.
+
+Measured on the Library page (2026-10-14): ~220 MB open, ~30 MB unloaded, ~0% CPU when idle.
+
+## Releasing
+
+`./release.ps1` builds, packs (Velopack) and publishes `<Version>` from the csproj to the releases repo;
+installed copies download it in the background and install it on their next start (or via
+**Restart to update** in the tray menu). `./release.ps1 -NoUpload` only builds the installer locally.
 
 ## How it works
 

@@ -6,3 +6,6 @@ obj/
 *.user
 .vs/
 
+
+# Release builds (release.ps1)
+artifacts/

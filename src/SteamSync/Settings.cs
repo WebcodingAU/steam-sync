@@ -8,6 +8,16 @@ namespace SteamSync;
 
 internal static class AppInfo
 {
+    /// <summary>The name people see (installer, Start menu, tray, windows). The exe and data folder stay SteamSync.</summary>
+    public const string Name = "Gaming Enjoyer";
+
+    /// <summary>The app icon (embedded app.ico) for windows; the tray keeps its coloured status icons.</summary>
+    public static Icon LoadIcon()
+    {
+        using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("SteamSync.app.ico")!;
+        return new Icon(stream);
+    }
+
     public static string Version { get; } =
         Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0]
         ?? "0.0.0";

@@ -13,7 +13,7 @@ internal sealed class PairDialog : Form
     public PairDialog(SyncService sync, string websiteUrl)
     {
         _sync = sync;
-        Text = "Pair this PC — Steam Sync";
+        Text = $"Pair this PC — {AppInfo.Name}";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
@@ -22,7 +22,7 @@ internal sealed class PairDialog : Form
         Padding = new Padding(16);
         AcceptButton = _ok;
         CancelButton = _cancel;
-        Icon = TrayIcons.Create(Color.FromArgb(27, 40, 56));
+        Icon = AppInfo.LoadIcon();
 
         var layout = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false };
         layout.Controls.Add(new Label

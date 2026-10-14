@@ -15,6 +15,10 @@ internal sealed class TrayApp : ApplicationContext
     private readonly ToolStripMenuItem _syncNowItem = new("Sync now");
     private readonly ToolStripMenuItem _pairItem = new();
     private readonly ToolStripMenuItem _startupItem = new("Start with Windows") { CheckOnClick = true };
+    private readonly RegisteredWaitHandle _openWait;
+    private readonly Updater _updater = new();
+    private readonly ToolStripMenuItem _updateItem = new() { Visible = false };
+    private LibraryWindow? _library;
     private readonly Dictionary<SyncState, Icon> _icons = new()
     {
         [SyncState.Synced] = TrayIcons.Create(Color.FromArgb(102, 192, 244)),
@@ -24,7 +28,7 @@ internal sealed class TrayApp : ApplicationContext
         [SyncState.NotConfigured] = TrayIcons.Create(Color.Gray),
     };
 
-    public TrayApp(AppConfig config, bool background)
+    public TrayApp(AppConfig config, bool background, WaitHandle openSignal, bool openLibrary)
     {
         _config = config;
         _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
@@ -38,6 +42,8 @@ internal sealed class TrayApp : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Items.AddRange(
         [
+            new ToolStripMenuItem("Open Library", null, (_, _) => OpenLibrary()) { Font = new Font(menu.Font, FontStyle.Bold) },
+            new ToolStripSeparator(),
             _statusItem,
             _lastSyncItem,
             new ToolStripSeparator(),
@@ -45,31 +51,59 @@ internal sealed class TrayApp : ApplicationContext
             _pairItem,
             _startupItem,
             new ToolStripSeparator(),
-            new ToolStripMenuItem($"Open {new Uri(config.WebsiteUrl).Host}", null, (_, _) => OpenUrl(config.WebsiteUrl)),
+            new ToolStripMenuItem($"Open {new Uri(config.WebsiteUrl).Host} in browser", null, (_, _) => OpenUrl(config.WebsiteUrl)),
             new ToolStripMenuItem("Open log", null, (_, _) => OpenUrl(Log.FilePath)),
             new ToolStripSeparator(),
+            _updateItem,
             new ToolStripMenuItem("Exit", null, (_, _) => ExitThread()),
         ]);
-
         _tray = new NotifyIcon { ContextMenuStrip = menu, Visible = true };
-        _tray.DoubleClick += (_, _) => OpenUrl(config.WebsiteUrl);
+
+        _updateItem.Click += (_, _) => _updater.RestartToUpdate();
+        _updater.UpdateReady += version => _ui.Post(_ =>
+        {
+            _updateItem.Text = $"Restart to update to {version}";
+            _updateItem.Visible = true;
+            _tray.ShowBalloonTip(5000, AppInfo.Name, $"Version {version} is ready. It installs next time {AppInfo.Name} starts, or use \"Restart to update\" in this menu.", ToolTipIcon.Info);
+        }, null);
+        _tray.DoubleClick += (_, _) => OpenLibrary();
+        _openWait = ThreadPool.RegisterWaitForSingleObject(openSignal, (_, _) => _ui.Post(_ => OpenLibrary(), null), null, Timeout.Infinite, executeOnlyOnce: false);
 
         _sync.StatusChanged += s => _ui.Post(_ => Render(s), null);
         Render(_sync.Status);
         _sync.Start();
+        _updater.Start();
 
         StartWithWindows.RefreshPathIfEnabled();
 
         if (_sync.Status.State == SyncState.NotConfigured)
-            _tray.ShowBalloonTip(5000, "Steam Sync", "Supabase settings are missing — see the README.", ToolTipIcon.Warning);
+            _tray.ShowBalloonTip(5000, AppInfo.Name, "Supabase settings are missing — see the README.", ToolTipIcon.Warning);
         else if (!_sync.IsPaired && !background)
             _ui.Post(_ => TogglePairing(), null);
+
+        if (openLibrary) _ui.Post(_ => OpenLibrary(), null);
+    }
+
+    /// <summary>Shows the library window, starting its browser engine only now; closing it shuts the engine down again.</summary>
+    private void OpenLibrary()
+    {
+        if (_library is null || _library.IsDisposed)
+        {
+            _library = new LibraryWindow(_config);
+            _library.FormClosed += (_, _) => _library = null;
+            _library.Show();
+        }
+        else if (_library.WindowState == FormWindowState.Minimized)
+        {
+            _library.WindowState = FormWindowState.Normal;
+        }
+        _library.Activate();
     }
 
     private void Render(SyncStatus s)
     {
         _tray.Icon = _icons[s.State];
-        _tray.Text = Truncate($"Steam Sync — {s.Message}", 127);
+        _tray.Text = Truncate($"{AppInfo.Name} — {s.Message}", 127);
         _statusItem.Text = s.Message;
         _lastSyncItem.Text = s.LastSuccess is { } t ? $"Last synced {t:HH:mm} ({s.GameCount} games)" : "Not synced yet";
         _syncNowItem.Enabled = _sync.IsPaired && s.State != SyncState.Syncing;
@@ -83,7 +117,7 @@ internal sealed class TrayApp : ApplicationContext
         {
             var answer = MessageBox.Show(
                 "Stop syncing this PC? It will also need to be removed on the website to delete its data.",
-                "Steam Sync", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                AppInfo.Name, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             if (answer == DialogResult.Yes) _sync.Unpair();
             return;
         }
@@ -96,7 +130,7 @@ internal sealed class TrayApp : ApplicationContext
                 StartWithWindows.Set(true);
                 _startupItem.Checked = true;
             }
-            _tray.ShowBalloonTip(4000, "Steam Sync", "Paired! Your installed Steam games will stay in sync.", ToolTipIcon.Info);
+            _tray.ShowBalloonTip(4000, AppInfo.Name, "Paired! Your installed Steam games will stay in sync.", ToolTipIcon.Info);
         }
         Render(_sync.Status);
     }
@@ -111,6 +145,9 @@ internal sealed class TrayApp : ApplicationContext
 
     protected override void ExitThreadCore()
     {
+        _openWait.Unregister(null);
+        _updater.Dispose();
+        _library?.Close();
         _tray.Visible = false;
         _tray.Dispose();
         _sync.Dispose();
