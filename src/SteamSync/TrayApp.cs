@@ -21,11 +21,11 @@ internal sealed class TrayApp : ApplicationContext
     private LibraryWindow? _library;
     private readonly Dictionary<SyncState, Icon> _icons = new()
     {
-        [SyncState.Synced] = TrayIcons.Create(Color.FromArgb(102, 192, 244)),
-        [SyncState.Syncing] = TrayIcons.Create(Color.FromArgb(164, 208, 7)),
-        [SyncState.Error] = TrayIcons.Create(Color.FromArgb(232, 84, 84)),
-        [SyncState.NotPaired] = TrayIcons.Create(Color.Gray),
-        [SyncState.NotConfigured] = TrayIcons.Create(Color.Gray),
+        [SyncState.Synced] = TrayIcons.Create(),
+        [SyncState.Syncing] = TrayIcons.Create(),
+        [SyncState.Error] = TrayIcons.Create(Color.FromArgb(232, 52, 52)),
+        [SyncState.NotPaired] = TrayIcons.Create(Color.FromArgb(150, 150, 150)),
+        [SyncState.NotConfigured] = TrayIcons.Create(Color.FromArgb(150, 150, 150)),
     };
 
     public TrayApp(AppConfig config, bool background, WaitHandle openSignal, bool openLibrary)
@@ -155,34 +155,43 @@ internal sealed class TrayApp : ApplicationContext
     }
 }
 
-/// <summary>Draws the tray icon at runtime (a coloured rounded square with an "S") so no .ico asset is needed yet.</summary>
+/// <summary>
+/// The tray icon is the app logo at the taskbar's icon size (picked from app.ico, so it isn't rescaled), with a
+/// coloured dot in the corner when something needs attention. Syncing has no dot: it lasts seconds and would flicker.
+/// </summary>
 internal static class TrayIcons
 {
     [DllImport("user32.dll")]
     private static extern bool DestroyIcon(IntPtr handle);
 
-    public static Icon Create(Color background)
+    public static Icon Create(Color? badge = null)
     {
-        using var bmp = new Bitmap(32, 32);
-        using (var g = Graphics.FromImage(bmp))
+        using var app = AppInfo.LoadIcon();
+        var logo = new Icon(app, SystemInformation.SmallIconSize);
+        if (badge is not { } color) return logo;
+
+        using (logo)
+        using (var bmp = logo.ToBitmap())
         {
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-            using var path = new GraphicsPath();
-            const int r = 8;
-            path.AddArc(0, 0, r * 2, r * 2, 180, 90);
-            path.AddArc(31 - r * 2, 0, r * 2, r * 2, 270, 90);
-            path.AddArc(31 - r * 2, 31 - r * 2, r * 2, r * 2, 0, 90);
-            path.AddArc(0, 31 - r * 2, r * 2, r * 2, 90, 90);
-            path.CloseFigure();
-            using var fill = new SolidBrush(background);
-            g.FillPath(fill, path);
-            using var font = new Font("Segoe UI", 17f, FontStyle.Bold, GraphicsUnit.Pixel);
-            var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-            g.DrawString("S", font, Brushes.White, new RectangleF(0, 1, 32, 32), format);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                float size = bmp.Width, dot = size * 0.5f, gap = Math.Max(1f, size / 12f);
+                // Cut a transparent ring around the dot so it reads against the logo on light and dark taskbars.
+                using (var cut = new GraphicsPath())
+                {
+                    cut.AddEllipse(size - dot - gap, size - dot - gap, dot + gap * 2, dot + gap * 2);
+                    g.CompositingMode = CompositingMode.SourceCopy;
+                    using var clear = new SolidBrush(Color.Transparent);
+                    g.FillPath(clear, cut);
+                    g.CompositingMode = CompositingMode.SourceOver;
+                }
+                using var fill = new SolidBrush(color);
+                g.FillEllipse(fill, size - dot, size - dot, dot, dot);
+            }
+            var handle = bmp.GetHicon();
+            try { return (Icon)Icon.FromHandle(handle).Clone(); }
+            finally { DestroyIcon(handle); }
         }
-        var handle = bmp.GetHicon();
-        try { return (Icon)Icon.FromHandle(handle).Clone(); }
-        finally { DestroyIcon(handle); }
     }
 }
