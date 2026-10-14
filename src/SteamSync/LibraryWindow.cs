@@ -16,11 +16,10 @@ internal sealed class LibraryWindow : Form
     private static readonly string BoundsFile = Path.Combine(AppInfo.DataDir, "window.json");
 
     // Chromium switches that only cost memory or network in a one-site window. Unknown switches are ignored.
-    // GPU off: measured on the Library page (2026-10-14) it is ~100 MB lighter (218 vs 314 MB) and never competes
-    // with a running game for the graphics card; a mostly static page renders fine in software.
+    // The GPU stays on: turning it off measured ~100 MB lighter (218 vs 314 MB on the Library page) but made
+    // scrolling noticeably laggy, and the 2-minute unload already frees everything while a game runs.
     private const string BrowserArguments =
-        "--disable-gpu --disable-gpu-compositing "
-        + "--disable-background-networking --disable-component-update --disable-sync --disable-default-apps "
+        "--disable-background-networking --disable-component-update --disable-sync --disable-default-apps "
         + "--no-first-run --disable-features=Translate,OptimizationHints,MediaRouter,AutofillServerCommunication,"
         + "msSmartScreenProtection,msEdgeShoppingAssistant,msShowSearchInSidebar";
 

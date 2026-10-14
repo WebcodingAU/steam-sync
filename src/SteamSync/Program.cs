@@ -11,6 +11,7 @@ internal static class Program
         // Installer hooks first: Velopack runs the exe with its own arguments during install, update and uninstall,
         // handles them here and exits. Uninstalling also removes the start-with-Windows entry it would leave behind.
         VelopackApp.Build()
+            .OnFirstRun(_ => StartWithWindows.Set(true)) // a sync app should be running; the tray menu can turn it off
             .OnBeforeUninstallFastCallback(_ => StartWithWindows.Set(false))
             .Run();
 

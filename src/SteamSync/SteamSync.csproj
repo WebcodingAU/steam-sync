@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>SteamSync</AssemblyName>
     <RootNamespace>SteamSync</RootNamespace>
-    <Version>0.3.0</Version>
+    <Version>0.3.1</Version>
     <Product>Gaming Enjoyer</Product>
     <AssemblyTitle>Gaming Enjoyer</AssemblyTitle>
     <Company>gamingenjoyer.com</Company>

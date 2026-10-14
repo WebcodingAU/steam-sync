@@ -16,12 +16,12 @@ in a single-site window on the WebView2 (Edge) runtime that ships with Windows:
 
 - Its own profile under `%LocalAppData%\SteamSync\WebView2`; sign in once.
 - Play links launch games directly; other sites open in the default browser. **F11** is fullscreen.
-- GPU off (software rendering): measured ~100 MB lighter and never competes with a game for the GPU.
+- GPU on: software rendering measured ~100 MB lighter but made scrolling laggy, so it stays on.
 - Not the active window → every process in Windows Efficiency mode, low-memory target.
 - Minimized → page frozen; minimized for 2 minutes → the engine shuts down (back to ~30 MB) and the page
   reloads on restore. Closed → no browser processes at all.
 
-Measured on the Library page (2026-10-14): ~220 MB open, ~30 MB unloaded, ~0% CPU when idle.
+Measured on the Library page (2026-10-14): ~310 MB open, ~30 MB unloaded, ~0% CPU when idle.
 
 ## Releasing
 
