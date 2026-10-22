@@ -4,6 +4,11 @@
 #   ./release.ps1 -NoUpload    builds and packs only (artifacts\releases\GamingEnjoyer-win-Setup.exe)
 #
 # Needs the .NET 10 SDK, vpk (dotnet tool install -g vpk) and gh signed in to GitHub (its token does the upload).
+#
+# Code signing: set GAMING_ENJOYER_SIGN_THUMBPRINT (user env var) to the thumbprint of the code signing
+# certificate. With Certum's cloud certificate, log in to SimplySign Desktop first so the certificate is in
+# the store. vpk signs SteamSync.exe, Update.exe and Setup.exe with the signtool it ships. If the variable
+# isn't set, the release is built unsigned.
 param([switch]$NoUpload)
 $ErrorActionPreference = 'Stop'
 
@@ -13,6 +18,18 @@ $repo = 'https://github.com/WebcodingAU/gaming-enjoyer-releases'
 $publish = Join-Path $PSScriptRoot 'artifacts\publish'
 $releases = Join-Path $PSScriptRoot 'artifacts\releases'
 $env:Path += ";$env:USERPROFILE\.dotnet\tools"
+
+$thumbprint = $env:GAMING_ENJOYER_SIGN_THUMBPRINT -replace '\s', ''
+$sign = @()
+if ($thumbprint) {
+    # Check before building: SimplySign drops the certificate from the store when its session ends.
+    if (-not (Test-Path "Cert:\CurrentUser\My\$thumbprint")) {
+        throw "Signing certificate $thumbprint isn't in the store. Log in to SimplySign Desktop and try again."
+    }
+    $sign = '--signParams', "/sha1 $thumbprint /fd sha256 /tr http://time.certum.pl /td sha256"
+} else {
+    Write-Warning 'GAMING_ENJOYER_SIGN_THUMBPRINT is not set: this build is UNSIGNED.'
+}
 
 Write-Host "Gaming Enjoyer $version"
 # Start clean: vpk refuses to pack a version that is already in the output folder (e.g. from a -NoUpload run),
@@ -31,8 +48,15 @@ if ($token) {
 vpk pack -u GamingEnjoyer -v $version -r win-x64 -p $publish -e SteamSync.exe -o $releases `
     --packTitle 'Gaming Enjoyer' --packAuthors 'gamingenjoyer.com' `
     -i (Join-Path $PSScriptRoot 'src\SteamSync\app.ico') `
-    --framework webview2 --shortcuts StartMenuRoot
+    --framework webview2 --shortcuts StartMenuRoot @sign
 if ($LASTEXITCODE) { throw 'vpk pack failed' }
+
+if ($thumbprint) {
+    # Never publish a release that claims to be signed but isn't: installed copies would update to it.
+    $setup = Get-AuthenticodeSignature (Join-Path $releases 'GamingEnjoyer-win-Setup.exe')
+    if ($setup.Status -ne 'Valid') { throw "Setup.exe signature is $($setup.Status): $($setup.StatusMessage)" }
+    Write-Host "Signed by $($setup.SignerCertificate.Subject)"
+}
 
 if ($token) {
     vpk upload github --repoUrl $repo --token $token -o $releases --publish --releaseName "Gaming Enjoyer $version" --tag "v$version"

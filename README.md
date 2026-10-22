@@ -28,6 +28,8 @@ Measured on the Library page (2026-10-14): ~310 MB open, ~30 MB unloaded, ~0% CP
 `./release.ps1` builds, packs (Velopack) and publishes `<Version>` from the csproj to the releases repo;
 installed copies download it in the background and install it on their next start (or via
 **Restart to update** in the tray menu). `./release.ps1 -NoUpload` only builds the installer locally.
+With `GAMING_ENJOYER_SIGN_THUMBPRINT` set to a code signing certificate's thumbprint, the release is
+signed, and the script stops before uploading if the signature isn't valid.
 
 ## How it works
 
@@ -86,3 +88,28 @@ touching the network.
 Logs: `%LOCALAPPDATA%\SteamSync\logs\steamsync.log`.
 To point at another Supabase project without rebuilding, drop an `appsettings.json`
 in `%LOCALAPPDATA%\SteamSync\`.
+
+## Privacy
+
+Nothing leaves the PC until you pair it. After pairing, each sync sends gamingenjoyer.com:
+
+- the device name you chose when pairing (defaults to the PC's name),
+- the signed-in Steam account ID and the app version,
+- the installed Steam games (app IDs) and the detected non-Steam games (name, launcher, launch ID
+  and install folder).
+
+The app also checks the [releases repo](https://github.com/WebcodingAU/gaming-enjoyer-releases) on
+GitHub for updates, and the Library window loads gamingenjoyer.com. Nothing else is sent anywhere.
+To stop syncing, choose **Unpair this PC** in the tray menu or remove the PC on **Your PCs**.
+
+## Code signing policy
+
+Releases are built from this repository's source, and only the maintainer below can approve them.
+
+- Committers, reviewers and approvers: [Joshua Noeth](mailto:dev@gamingenjoyer.com)
+
+Report a security problem to [dev@gamingenjoyer.com](mailto:dev@gamingenjoyer.com).
+
+## License
+
+[MIT](LICENSE).
