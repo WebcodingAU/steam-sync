@@ -90,7 +90,7 @@ non-Steam games that aren't in Steam, and Windows runs `SteamSync.exe --play <li
 
 ## Pairing
 
-1. On gamingenjoyer.com, sign in with Steam → **Your PCs** → **Get a pairing code**.
+1. On gamingenjoyer.com, sign in with Steam → **Settings** → **Your PCs** → **Get a pairing code**.
 2. Tray icon → **Pair this PC…** → enter the code.
 
 Pairing turns on **Start with Windows** (`HKCU\...\Run`); toggle it from the tray menu.
@@ -120,7 +120,7 @@ Nothing leaves the PC until you pair it. After pairing, each sync sends gamingen
 
 The app also checks the [releases repo](https://github.com/WebcodingAU/gaming-enjoyer-releases) on
 GitHub for updates, and the Library window loads gamingenjoyer.com. Nothing else is sent anywhere.
-To stop syncing, choose **Unpair this PC** in the tray menu or remove the PC on **Your PCs**.
+To stop syncing, choose **Unpair this PC** in the tray menu or remove the PC under **Settings** → **Your PCs**.
 
 ## Code signing policy
 

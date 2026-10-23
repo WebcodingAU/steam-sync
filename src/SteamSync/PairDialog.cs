@@ -29,7 +29,7 @@ internal sealed class PairDialog : Form
         {
             AutoSize = true,
             MaximumSize = new Size(260, 0),
-            Text = $"On {new Uri(websiteUrl).Host}, sign in with Steam, open Your PCs and press \"Get a pairing code\".",
+            Text = $"On {new Uri(websiteUrl).Host}, sign in with Steam, open Settings → Your PCs and press \"Get a pairing code\".",
         });
         layout.Controls.Add(new Label { AutoSize = true, Text = "Pairing code", Margin = new Padding(3, 12, 3, 0) });
         layout.Controls.Add(_code);
