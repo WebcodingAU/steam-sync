@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 
 namespace SteamSync;
@@ -85,6 +86,11 @@ internal sealed class SupabaseApi : IDisposable
     public Task<int> RecordPlaySessionsAsync(string token, IReadOnlyList<PlaySession> sessions, CancellationToken ct = default) =>
         CallAsync<int>("record_play_sessions", new { p_token = token, p_sessions = sessions }, ct);
 
+    /// <summary>One live ping sample (LivePing), or null when the game stopped. PGRST202 means the live_ping migration
+    /// isn't applied yet.</summary>
+    public Task ReportLivePingAsync(string token, JsonObject? sample, CancellationToken ct = default) =>
+        CallAsync<JsonElement>("report_live_ping", new { p_token = token, p_sample = sample }, ct);
+
     private async Task<T> CallAsync<T>(string function, object body, CancellationToken ct)
     {
         using var response = await _http.PostAsJsonAsync(function, body, Json, ct);
@@ -101,6 +107,7 @@ internal sealed class SupabaseApi : IDisposable
             catch (JsonException) { }
             throw new SupabaseException(message ?? $"HTTP {(int)response.StatusCode}: {text}", code, response.StatusCode);
         }
+        if (response.StatusCode == HttpStatusCode.NoContent) return default!; // a function returning void
         return (await response.Content.ReadFromJsonAsync<T>(Json, ct))!;
     }
 

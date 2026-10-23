@@ -59,6 +59,10 @@ foreach ($dir in $publish, $releases) { if (Test-Path $dir) { Remove-Item $dir -
 # The version goes into the exe too, so a beta build knows it is one (UpdateChannel.IsBetaBuild).
 dotnet publish $csproj -c Release -r win-x64 --self-contained -o $publish -nologo -v q -p:Version=$version
 if ($LASTEXITCODE) { throw 'dotnet publish failed' }
+# The ping helper ships inside the package, next to SteamSync.exe (one self-contained exe with its own version);
+# the tray app installs it into Program Files when asked (PingHelperClient).
+dotnet publish (Join-Path $PSScriptRoot 'src\PingHelper\PingHelper.csproj') -c Release -o $publish -nologo -v q
+if ($LASTEXITCODE) { throw 'dotnet publish (ping helper) failed' }
 
 if ($token) {
     # The previous release on this channel lets vpk build a small delta package, so updates download only what changed.

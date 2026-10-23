@@ -9,6 +9,9 @@ namespace SteamSync;
 /// <summary>One play session as record_play_sessions takes it (snake_case on the wire).</summary>
 internal sealed record PlaySession(Guid SessionId, string GameKey, string Name, DateTimeOffset StartedAt, DateTimeOffset EndedAt, bool Running);
 
+/// <summary>A game running at the last check, with the processes that matched it (for LivePing).</summary>
+internal sealed record RunningGame(string Key, string Name, IReadOnlyList<int> Pids);
+
 /// <summary>
 /// Notices games running on this PC and reports each session, for play time on games outside Steam and the
 /// site's "Playing now". Steam games are reported too, keyed "steam:&lt;appid&gt;", but the site only uses those for
@@ -88,6 +91,12 @@ internal sealed class PlayTracker : IDisposable
 
     public void Start() => _timer.Change(TimeSpan.FromSeconds(3), Tick);
 
+    /// <summary>The games running at the last check (once a second), oldest session first. Empty before pairing.</summary>
+    public IReadOnlyList<RunningGame> Running { get; private set; } = [];
+
+    /// <summary>The games running right now, without recording anything (SteamSync.exe --live-ping).</summary>
+    public IReadOnlyList<RunningGame> DetectNow() => RunningGames().Values.ToList();
+
     /// <summary>The games to watch, from each sync's scan. Building the exe-name fallback reads the game folders, so this
     /// runs on the sync's worker thread, never the UI's.</summary>
     public void UpdateGames(SteamSnapshot steam, NonSteamSnapshot? nonSteam)
@@ -156,7 +165,7 @@ internal sealed class PlayTracker : IDisposable
         if (Interlocked.Exchange(ref _ticking, 1) == 1) return;
         try
         {
-            if (DeviceToken.Load() is null) return; // nothing is recorded before pairing
+            if (DeviceToken.Load() is null) { Running = []; return; } // nothing is recorded before pairing
 
             var now = DateTimeOffset.UtcNow;
             var running = RunningGames();
@@ -170,16 +179,17 @@ internal sealed class PlayTracker : IDisposable
                     finishedOne |= FinishAll(last);
                 _lastTick = now;
 
-                foreach (var (key, name) in running)
+                foreach (var (key, game) in running)
                 {
                     if (_active.TryGetValue(key, out var a)) a.LastSeen = now;
                     else
                     {
-                        _active[key] = new Active { Id = Guid.NewGuid(), Key = key, Name = name, Started = now, LastSeen = now };
+                        _active[key] = new Active { Id = Guid.NewGuid(), Key = key, Name = game.Name, Started = now, LastSeen = now };
                         startedOne = true;
-                        Log.Info($"Playing {name} ({key})");
+                        Log.Info($"Playing {game.Name} ({key})");
                     }
                 }
+                Running = running.Values.OrderBy(g => _active.TryGetValue(g.Key, out var a) ? a.Started : now).ToList();
                 foreach (var a in _active.Values.Where(a => !running.ContainsKey(a.Key) && now - a.LastSeen > Grace).ToList())
                     finishedOne |= Finish(a, a.LastSeen);
 
@@ -204,13 +214,13 @@ internal sealed class PlayTracker : IDisposable
         }
     }
 
-    /// <summary>The games with a process running now: key → name.</summary>
-    private Dictionary<string, string> RunningGames()
+    /// <summary>The games with a process running now, by key, with their processes.</summary>
+    private Dictionary<string, RunningGame> RunningGames()
     {
         Target[] targets;
         Dictionary<string, Target> byName;
         lock (_gate) { targets = _targets; byName = _byExeName; }
-        var found = new Dictionary<string, string>(StringComparer.Ordinal);
+        var found = new Dictionary<string, RunningGame>(StringComparer.Ordinal);
         if (targets.Length == 0) return found;
 
         if (!ReferenceEquals(_pidCacheFor, targets))
@@ -235,7 +245,11 @@ internal sealed class PlayTracker : IDisposable
                     known = (processName, Identify(p.Id, processName, targets, byName));
                     _pidCache[p.Id] = known;
                 }
-                if (known.Hit is { } hit) found[hit.Key] = hit.Name;
+                if (known.Hit is { } hit)
+                {
+                    if (!found.TryGetValue(hit.Key, out var game)) found[hit.Key] = game = new RunningGame(hit.Key, hit.Name, new List<int>());
+                    ((List<int>)game.Pids).Add(p.Id);
+                }
             }
         }
         foreach (var pid in _pidCache.Keys.Where(pid => !alive.Contains(pid)).ToList()) _pidCache.Remove(pid);

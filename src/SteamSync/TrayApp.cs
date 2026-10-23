@@ -9,6 +9,8 @@ internal sealed class TrayApp : ApplicationContext
     private readonly AppConfig _config;
     private readonly SyncService _sync;
     private readonly PlayTracker _play;
+    private readonly PingHelperClient _pingHelper = new();
+    private readonly LivePing _livePing;
     private readonly SynchronizationContext _ui;
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _statusItem = new() { Enabled = false };
@@ -21,6 +23,7 @@ internal sealed class TrayApp : ApplicationContext
         CheckOnClick = true,
         ToolTipText = "Get test versions before everyone else. Turning it off keeps this version until a newer stable one is out.",
     };
+    private readonly ToolStripMenuItem _pingHelperItem = new();
     private readonly RegisteredWaitHandle _openWait;
     private readonly Updater _updater = new();
     private readonly ToolStripMenuItem _updateItem = new() { Visible = false };
@@ -41,6 +44,7 @@ internal sealed class TrayApp : ApplicationContext
         _sync = new SyncService(config);
         _play = new PlayTracker(config);
         _sync.Scanned += _play.UpdateGames;
+        _livePing = new LivePing(config, _play, _pingHelper);
 
         _syncNowItem.Click += async (_, _) => await _sync.SyncNowAsync();
         _pairItem.Click += (_, _) => TogglePairing();
@@ -66,6 +70,7 @@ internal sealed class TrayApp : ApplicationContext
             _pairItem,
             _startupItem,
             _betaItem,
+            _pingHelperItem,
             new ToolStripSeparator(),
             new ToolStripMenuItem($"Open {new Uri(config.WebsiteUrl).Host} in browser", null, (_, _) => OpenUrl(config.WebsiteUrl)),
             new ToolStripMenuItem("Open log", null, (_, _) => OpenUrl(Log.FilePath)),
@@ -74,6 +79,9 @@ internal sealed class TrayApp : ApplicationContext
             new ToolStripMenuItem("Exit", null, (_, _) => ExitThread()),
         ]);
         _tray = new NotifyIcon { ContextMenuStrip = menu, Visible = true };
+        _pingHelperItem.Click += async (_, _) => await TogglePingHelperAsync();
+        menu.Opening += (_, _) => RenderPingHelper();
+        RenderPingHelper();
 
         _updateItem.Click += (_, _) => _updater.RestartToUpdate();
         _updater.UpdateReady += version => _ui.Post(_ =>
@@ -89,6 +97,8 @@ internal sealed class TrayApp : ApplicationContext
         Render(_sync.Status);
         _sync.Start();
         _play.Start();
+        _pingHelper.Start();
+        _livePing.Start();
         _updater.Start();
 
         StartWithWindows.RefreshPathIfEnabled();
@@ -154,6 +164,56 @@ internal sealed class TrayApp : ApplicationContext
         Render(_sync.Status);
     }
 
+    /// <summary>The ping helper item says what clicking it will do: install, update or remove (hidden in a build without it).</summary>
+    private void RenderPingHelper()
+    {
+        var state = PingHelperClient.State;
+        _pingHelperItem.Visible = state != HelperState.NotBundled;
+        _pingHelperItem.Text = state switch
+        {
+            HelperState.NotInstalled => "Install ping helper (UDP games)…",
+            HelperState.Outdated => "Update ping helper…",
+            _ => _pingHelper.Connected ? "Remove ping helper…" : "Remove ping helper (not running)…",
+        };
+        _pingHelperItem.ToolTipText = "Lets live ping see the servers of games that use UDP (most shooters). "
+            + "A small Windows service; installing, updating or removing it asks for administrator rights.";
+    }
+
+    private async Task TogglePingHelperAsync()
+    {
+        var state = PingHelperClient.State;
+        var install = state != HelperState.Installed;
+        if (state == HelperState.NotInstalled)
+        {
+            var answer = MessageBox.Show(
+                "On its own, live ping only sees the servers of TCP games. The ping helper is a small Windows service that "
+                + "lets it see UDP games too (most shooters). It only counts which servers each program talks to, never what "
+                + "is sent.\n\nInstalling it asks for administrator rights once. Install it?",
+                AppInfo.Name, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (answer != DialogResult.Yes) return;
+        }
+        else if (!install)
+        {
+            var answer = MessageBox.Show("Remove the ping helper? Live ping will only see TCP games.", AppInfo.Name,
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (answer != DialogResult.Yes) return;
+        }
+
+        _pingHelperItem.Enabled = false;
+        try
+        {
+            var problem = await PingHelperClient.RunElevatedAsync(install);
+            if (!string.IsNullOrEmpty(problem)) MessageBox.Show(problem, AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            else if (problem is null)
+                _tray.ShowBalloonTip(4000, AppInfo.Name, install ? "Ping helper installed." : "Ping helper removed.", ToolTipIcon.Info);
+        }
+        finally
+        {
+            _pingHelperItem.Enabled = true;
+            RenderPingHelper();
+        }
+    }
+
     private static void OpenUrl(string target)
     {
         try { Process.Start(new ProcessStartInfo(target) { UseShellExecute = true }); }
@@ -169,6 +229,8 @@ internal sealed class TrayApp : ApplicationContext
         _library?.Close();
         _tray.Visible = false;
         _tray.Dispose();
+        _livePing.Dispose();
+        _pingHelper.Dispose();
         _play.Dispose();
         _sync.Dispose();
         base.ExitThreadCore();

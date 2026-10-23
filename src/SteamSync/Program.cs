@@ -31,6 +31,31 @@ internal static class Program
             return 0;
         }
 
+        // Diagnostics: SteamSync.exe --live-ping out.jsonl [seconds] writes what live ping would send, once a second while
+        // a game runs (default 10 s), and exits. Nothing is sent.
+        if (args.Length is 2 or 3 && args[0] == "--live-ping")
+        {
+            var seconds = args.Length == 3 && int.TryParse(args[2], out var s) ? s : 10;
+            var steam = SteamLibrary.Scan();
+            NonSteamSnapshot? others = null;
+            try { others = NonSteamLibrary.Scan(steam); } catch (Exception ex) { Log.Error("Non-Steam scan failed", ex); }
+            var play = new PlayTracker(AppConfig.Load()); // never disposed: that would save its state file over the real app's
+            play.UpdateGames(steam, others);
+            using var helper = new PingHelperClient();
+            helper.Start();
+            using var live = new LivePing(AppConfig.Load(), play, helper);
+            Thread.Sleep(2500); // let the helper's first line arrive
+            using var output = new StreamWriter(args[1]);
+            for (var i = 0; i < seconds; i++)
+            {
+                var games = play.DetectNow();
+                output.WriteLine(games.Count == 0 ? "null" : live.MeasureNowAsync(games).GetAwaiter().GetResult().ToJsonString());
+                output.Flush();
+                Thread.Sleep(1000);
+            }
+            return 0;
+        }
+
         // The site's Play button: Windows runs SteamSync.exe --play gamingenjoyer://play/<key>. Handled here, before the
         // one-copy check, so it works whether or not the tray app is running; this process starts the game and exits.
         if (args is ["--play", var link])

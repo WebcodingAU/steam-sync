@@ -103,6 +103,43 @@ against the exes in each game folder. Crash reporters, updaters, installers and 
 - Steam games are reported too, but the site only uses them for "Playing now": Steam counts their time.
 - Nothing is recorded before the PC is paired.
 
+## Live ping (testing)
+
+While a game runs, `LivePing.cs` measures the ping to the server it's talking to and sends one sample a second to
+`report_live_ping` (`sql/2026-10-24_live_ping.sql` in the website repo), shown on the site's `ping.php`. When the
+game stops it sends `null`, which clears the PC's live row.
+
+- **Which server:** the busiest internet address the game's processes exchanged packets with in the last second,
+  leaving out web, DNS and LAN traffic. Without the ping helper only the game's TCP connections are visible.
+- **TCP servers:** Windows' own RTT for that connection (`TcpStats.cs`, `GetPerTcpConnectionEStats` FineRtt).
+  It needs no admin rights because Windows already collects it.
+- **UDP servers:** an ICMP ping. A server that drops ICMP shows as lost.
+- **ExitLag:** if the game connects to a port ExitLag listens on (its local proxy), or the game has no traffic of
+  its own while ExitLag's relay is busy, the sample is the ping to ExitLag's relay (`exitlag_relay`). That's only the
+  first leg; the real game server is hidden behind ExitLag.
+- `SteamSync.exe --live-ping out.jsonl [seconds]` writes the samples it would send, without sending them.
+
+### Ping helper (`src/PingHelper`)
+
+Windows only shows which server a UDP socket talks to through ETW (Microsoft-Windows-Kernel-Network), and only
+SYSTEM, Administrators and LOCAL SERVICE may turn that provider on. So UDP games need `GamingEnjoyerPing.exe`, a
+small Windows service:
+
+- Ships inside the package next to `SteamSync.exe` (`release.ps1` publishes it as one trimmed, self-contained exe).
+  The tray menu's **Install ping helper** runs it elevated with `install` (one UAC prompt). That copies it to
+  `C:\Program Files\Gaming Enjoyer\` and registers the `GamingEnjoyerPing` service there.
+- Runs as `NT AUTHORITY\LocalService` with only `SeChangeNotifyPrivilege`. Its exe must stay in Program Files: a
+  service exe in a folder the user can write to could be swapped by any program the user runs.
+- Once a second it writes the last second's flows (process, TCP/UDP, remote address and port, packet and byte counts)
+  as one JSON line on `\\.\pipe\GamingEnjoyer.Ping`. Only people signed in at the PC can read the pipe, never the
+  network. It sees addresses and counts, never packet contents.
+- Has its own `<Version>` in `PingHelper.csproj`. Bump it whenever the helper changes, so the tray offers
+  **Update ping helper** (it compares the installed exe with the bundled one).
+- As administrator: `GamingEnjoyerPing.exe install | uninstall | console` (`console` runs it in the window for
+  testing). Errors go to the Windows Application event log under `GamingEnjoyerPing`.
+- Uninstalling the app doesn't remove the service (that would need a UAC prompt during uninstall). Use **Remove ping
+  helper** in the tray menu first, or `uninstall` as administrator.
+
 ## Pairing
 
 1. On gamingenjoyer.com, sign in with Steam → **Settings** → **Your PCs** → **Get a pairing code**.
@@ -120,6 +157,9 @@ dotnet publish src/SteamSync -c Release -r win-x64 --self-contained -p:PublishSi
 `SteamSync.exe --dump scan.json` writes the local scan (Steam and non-Steam) to a file without
 touching the network.
 
+The ping helper builds on its own: `dotnet publish src/PingHelper -c Release -o <folder>` (`release.ps1` puts it in
+the package).
+
 Logs: `%LOCALAPPDATA%\SteamSync\logs\steamsync.log`.
 To point at another Supabase project without rebuilding, drop an `appsettings.json`
 in `%LOCALAPPDATA%\SteamSync\`.
@@ -132,6 +172,10 @@ Nothing leaves the PC until you pair it. After pairing, each sync sends gamingen
 - the signed-in Steam account ID and the app version,
 - the installed Steam games (app IDs) and the detected non-Steam games (name, launcher, launch ID
   and install folder).
+
+While a game runs, it also sends the game, when it started and stopped (play sessions), and once a second a live
+ping sample: the game, the ping, the address and port of the server it measured, packet rates, and whether ExitLag
+is routing the game.
 
 The app also checks the [releases repo](https://github.com/WebcodingAU/gaming-enjoyer-releases) on
 GitHub for updates, and the Library window loads gamingenjoyer.com. Nothing else is sent anywhere.
