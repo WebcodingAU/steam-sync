@@ -87,16 +87,23 @@ internal static class GameLauncher
         }
     }
 
-    /// <summary>How to start a game: its launcher's own link, the Xbox app's entry, the Battlestate launcher, or its
-    /// Steam shortcut, in that order. Null when there's no safe way.</summary>
+    /// <summary>How to start a game: its launcher's own link, an Xbox game's gamelaunchhelper.exe (or the Xbox app's
+    /// entry), the Battlestate launcher, or its Steam shortcut, in that order. Null when there's no safe way.</summary>
     private static (ProcessStartInfo Start, string Describe)? LaunchTarget(NonSteamGame game)
     {
         if (game.LaunchUri is { } launchUri)
             return (new ProcessStartInfo(launchUri) { UseShellExecute = true }, launchUri.Split(':')[0]);
 
-        if (game.Keys.Any(k => k.StartsWith("xbox:", StringComparison.Ordinal))
-            && game.InstallPath is { } xboxFolder && NonSteamLibrary.XboxAppUserModelId(xboxFolder) is { } aumid)
-            return (new ProcessStartInfo("explorer.exe", $"shell:AppsFolder\\{aumid}") { UseShellExecute = false }, "the Xbox app");
+        if (game.Keys.Any(k => k.StartsWith("xbox:", StringComparison.Ordinal)) && game.InstallPath is { } xboxFolder)
+        {
+            // PC Game Pass games ship Content\gamelaunchhelper.exe, which starts the game properly (the game's own exe
+            // won't run on its own). Older packages without it start through the Xbox app's entry instead.
+            if (XboxLaunchHelper(xboxFolder) is { } helper)
+                return (new ProcessStartInfo(helper) { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(helper) },
+                    "gamelaunchhelper.exe");
+            if (NonSteamLibrary.XboxAppUserModelId(xboxFolder) is { } aumid)
+                return (new ProcessStartInfo("explorer.exe", $"shell:AppsFolder\\{aumid}") { UseShellExecute = false }, "the Xbox app");
+        }
 
         // Battlestate games refuse to start without their launcher signing in first, so Play opens the launcher.
         if (game.Keys.Any(k => k.StartsWith("bsg:", StringComparison.Ordinal)) && BattlestateLauncher() is { } bsg)
@@ -106,6 +113,15 @@ internal static class GameLauncher
             return (new ProcessStartInfo($"steam://rungameid/{shortcutId}") { UseShellExecute = true }, "its Steam shortcut");
 
         return null;
+    }
+
+    /// <summary>&lt;game folder&gt;\Content\gamelaunchhelper.exe (any casing), or null.</summary>
+    private static string? XboxLaunchHelper(string gameFolder)
+    {
+        var content = Path.Combine(gameFolder, "Content");
+        if (!Directory.Exists(content)) return null;
+        return Directory.EnumerateFiles(content, "*.exe")
+            .FirstOrDefault(f => Path.GetFileName(f).Equals("gamelaunchhelper.exe", StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>BsgLauncher.exe from the Battlestate Games Launcher's Programs-list entry, or null.</summary>

@@ -84,7 +84,8 @@ non-Steam games that aren't in Steam, and Windows runs `SteamSync.exe --play <li
 - The PC is scanned again and the key must belong to an installed game that scan found. Nothing from the
   link is run or passed on, so a link on another site can at most start one of your installed games.
 - Started the way its launcher starts it: Battle.net, Ubisoft and EA through their own links; Xbox and Game
-  Pass through `shell:AppsFolder\<package family>!<app id>`; Battlestate by opening its launcher (the games
+  Pass through the game's `Content\gamelaunchhelper.exe` (else `shell:AppsFolder\<package family>!<app id>`);
+  Battlestate by opening its launcher (the games
   need it to sign in); otherwise its Steam shortcut, if it has one.
 - Problems (not installed here, no known way to start it) are shown in a message box.
 
