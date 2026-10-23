@@ -42,6 +42,7 @@ internal sealed class LivePing : IDisposable
     private bool _live;                     // the site holds a sample from this PC, so a stop must be sent
     private DateTimeOffset _skipUntil = DateTimeOffset.MinValue;
     private int[] _exitLag = [];
+    private string[] _exitLagNames = [];
     private DateTimeOffset _exitLagCheckedAt = DateTimeOffset.MinValue;
 
     public LivePing(AppConfig config, PlayTracker play, PingHelperClient helper)
@@ -132,7 +133,10 @@ internal sealed class LivePing : IDisposable
 
         var tcp = TcpStats.Rows();
         var exitLag = ExitLagPids(now);
-        var exitLagFlows = flows?.Where(f => exitLag.Contains(f.Pid) && f.Udp && IsInternet(f.Ip)).OrderByDescending(f => f.Packets).ToList() ?? [];
+        // ExitLag's own traffic to its relay: UDP for games it tunnels, TCP for games that reach it through its local
+        // proxy (AION 2). Not its web traffic (443 and the like).
+        var exitLagFlows = flows?.Where(f => exitLag.Contains(f.Pid) && IsInternet(f.Ip) && !NotGamePorts.Contains(f.RemotePort))
+            .OrderByDescending(f => f.Packets).ToList() ?? [];
         var gameFlows = flows?.Where(f => pids.Contains(f.Pid) && IsInternet(f.Ip) && !NotGamePorts.Contains(f.RemotePort))
             .OrderByDescending(f => f.Packets).ToList() ?? [];
 
@@ -156,9 +160,22 @@ internal sealed class LivePing : IDisposable
             if (exitLagFlows.FirstOrDefault() is { } relay)
             {
                 flow = relay;
-                (ip, port, proto, serverPid, method) = (relay.Ip, relay.RemotePort, "udp", relay.Pid, "exitlag_relay");
-                ping = await IcmpAsync(relay.Ip);
+                (ip, port, proto, serverPid, method) = (relay.Ip, relay.RemotePort, relay.Udp ? "udp" : "tcp", relay.Pid, "exitlag_relay");
+                // A TCP relay connection has Windows' own measured RTT, better than a ping (and relays may not answer one).
+                if (!relay.Udp && relay.Ip.AddressFamily == AddressFamily.InterNetwork
+                    && tcp.FirstOrDefault(r => r.Pid == relay.Pid && r.Remote.Equals(relay.Ip) && r.RemotePort == relay.RemotePort && r.LocalPort == relay.LocalPort) is { } relayRow)
+                    rtt = TcpStats.Rtt(relayRow);
+                ping = rtt?.SmoothedMs ?? await IcmpAsync(relay.Ip);
                 note = "ExitLag is routing this game. This is the ping to ExitLag's relay (the first leg), not to the game server.";
+            }
+            else if (tcp.Where(r => exitLag.Contains(r.Pid) && !r.Listening && IsInternet(r.Remote) && !NotGamePorts.Contains(r.RemotePort))
+                         .FirstOrDefault() is { } elRow)
+            {
+                // No relay traffic from the helper (or no helper): ExitLag's open TCP connections are the next best.
+                (ip, port, proto, serverPid, method) = (elRow.Remote, elRow.RemotePort, "tcp", elRow.Pid, "exitlag_relay");
+                rtt = TcpStats.Rtt(elRow);
+                ping = rtt?.SmoothedMs ?? await IcmpAsync(elRow.Remote);
+                note = "ExitLag is routing this game. This is the ping to ExitLag's relay connection (the first leg), not to the game server.";
             }
             else
             {
@@ -216,8 +233,28 @@ internal sealed class LivePing : IDisposable
             note ??= "This server doesn't answer ping (ICMP), so its ping can't be measured this way.";
 
         var gameTraffic = flows?.Where(f => pids.Contains(f.Pid) && IsInternet(f.Ip)).ToList();
+
+        // When nothing could be measured, what was on the wire this second, so the next fix can be made from data:
+        // the busiest flows by process, protocol and remote port (no addresses), and ExitLag's process names.
+        JsonArray? topFlows = null;
+        if (method == "none" && flows is not null)
+        {
+            topFlows = [];
+            foreach (var f in flows.OrderByDescending(f => f.Packets).Take(8))
+                topFlows.Add(new JsonObject
+                {
+                    ["process"] = ProcessName(f.Pid),
+                    ["proto"] = f.Udp ? "udp" : "tcp",
+                    ["port"] = f.RemotePort,
+                    ["pps"] = f.Packets,
+                    ["internet"] = IsInternet(f.Ip),
+                });
+        }
+
         return new JsonObject
         {
+            ["top_flows"] = topFlows,
+            ["exitlag_procs"] = method == "none" && _exitLagNames.Length > 0 ? new JsonArray(_exitLagNames.Select(n => (JsonNode?)n).ToArray()) : null,
             ["v"] = 1,
             ["at"] = now.ToString("O"),
             ["game_key"] = game.Key,
@@ -277,9 +314,22 @@ internal sealed class LivePing : IDisposable
     {
         if (now - _exitLagCheckedAt < TimeSpan.FromSeconds(5)) return _exitLag;
         _exitLagCheckedAt = now;
-        var found = Process.GetProcessesByName("ExitLag");
-        _exitLag = found.Select(p => p.Id).ToArray();
-        foreach (var p in found) p.Dispose();
+        // Every ExitLag process, not just ExitLag.exe: its tunnel can run in a helper of its own.
+        var ids = new List<int>();
+        var names = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in Process.GetProcesses())
+        {
+            using (p)
+            {
+                string name;
+                try { name = p.ProcessName; } catch (InvalidOperationException) { continue; }
+                if (!name.StartsWith("ExitLag", StringComparison.OrdinalIgnoreCase)) continue;
+                ids.Add(p.Id);
+                names.Add(name);
+            }
+        }
+        _exitLag = ids.ToArray();
+        _exitLagNames = names.ToArray();
         return _exitLag;
     }
 
