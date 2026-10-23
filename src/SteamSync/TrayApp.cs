@@ -75,6 +75,7 @@ internal sealed class TrayApp : ApplicationContext
         _updater.Start();
 
         StartWithWindows.RefreshPathIfEnabled();
+        GameLauncher.Register(); // gamingenjoyer:// for the site's Play button, kept pointing at this exe
 
         if (_sync.Status.State == SyncState.NotConfigured)
             _tray.ShowBalloonTip(5000, AppInfo.Name, "Supabase settings are missing — see the README.", ToolTipIcon.Warning);

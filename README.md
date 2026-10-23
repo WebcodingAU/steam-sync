@@ -68,6 +68,19 @@ aren't in the library as suggestions on **Your PCs** (Add or Hide). Nothing is a
 - If the server predates `p_nonsteam` (PostgREST `PGRST202`), the app retries without it and
   syncs Steam games only, checking again every hour.
 
+## Play button for non-Steam games
+
+The app registers `gamingenjoyer://` for the current user (`HKCU\Software\Classes\gamingenjoyer`, refreshed at
+every start, removed on uninstall). The site's Play button links to `gamingenjoyer://play/<entity key>` for
+non-Steam games that aren't in Steam, and Windows runs `SteamSync.exe --play <link>` (`GameLauncher.cs`):
+
+- The PC is scanned again and the key must belong to an installed game that scan found. Nothing from the
+  link is run or passed on, so a link on another site can at most start one of your installed games.
+- Started the way its launcher starts it: Battle.net, Ubisoft and EA through their own links; Xbox and Game
+  Pass through `shell:AppsFolder\<package family>!<app id>`; Battlestate by opening its launcher (the games
+  need it to sign in); otherwise its Steam shortcut, if it has one.
+- Problems (not installed here, no known way to start it) are shown in a message box.
+
 ## Pairing
 
 1. On gamingenjoyer.com, sign in with Steam → **Your PCs** → **Get a pairing code**.

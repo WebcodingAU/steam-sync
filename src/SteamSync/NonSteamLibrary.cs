@@ -243,6 +243,31 @@ internal static class NonSteamLibrary
         return games;
     }
 
+    /// <summary>
+    /// What the Xbox app starts an installed game by, "&lt;PackageFamilyName&gt;!&lt;app id&gt;" (for
+    /// shell:AppsFolder\…), or null when the package isn't registered for this user or its config can't be read.
+    /// The app id is the first executable's Id in MicrosoftGame.config ("Game" when it has none).
+    /// </summary>
+    public static string? XboxAppUserModelId(string gameFolder)
+    {
+        var content = Path.Combine(gameFolder, "Content");
+        if (!Directory.Exists(content)) return null;
+        var config = Directory.EnumerateFiles(content, "*.config")
+            .FirstOrDefault(f => Path.GetFileName(f).Equals("MicrosoftGame.config", StringComparison.OrdinalIgnoreCase));
+        if (config is null) return null;
+
+        var game = LoadXml(config).Root;
+        var identityName = Child(game, "Identity")?.Attribute("Name")?.Value.Trim();
+        if (string.IsNullOrEmpty(identityName)) return null;
+        var fullName = RegisteredPackages().FirstOrDefault(p => p.StartsWith(identityName + "_", StringComparison.OrdinalIgnoreCase));
+        if (fullName is null) return null;
+
+        // Package names can't contain '_', so the family name is the name part plus the publisher id at the end.
+        var family = $"{fullName[..identityName.Length]}_{fullName[(fullName.LastIndexOf('_') + 1)..]}";
+        var appId = Child(Child(game, "ExecutableList"), "Executable")?.Attribute("Id")?.Value.Trim();
+        return $"{family}!{(string.IsNullOrEmpty(appId) ? "Game" : appId)}";
+    }
+
     /// <summary>PackageFullNames (Name_Version_Arch_ResourceId_PublisherId) registered for the current user.</summary>
     private static string[] RegisteredPackages()
     {

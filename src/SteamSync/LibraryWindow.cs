@@ -29,6 +29,7 @@ internal sealed class LibraryWindow : Form
     {
         "steam", "battlenet", "blizzard", "goggalaxy", "uplay", "origin", "origin2", "com.epicgames.launcher",
         "amazon-games", "itch", "minecraft", "rockstar", "playnite", "heroic", "ea", "eagames", "riot-client",
+        GameLauncher.Scheme, // games started by this app (GameLauncher), not through Steam
     };
 
     // Minimized this long, the browser engine is shut down entirely (freeing ~300 MB, e.g. for a game) and the page

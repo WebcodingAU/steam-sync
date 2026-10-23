@@ -12,7 +12,11 @@ internal static class Program
         // handles them here and exits. Uninstalling also removes the start-with-Windows entry it would leave behind.
         VelopackApp.Build()
             .OnFirstRun(_ => StartWithWindows.Set(true)) // a sync app should be running; the tray menu can turn it off
-            .OnBeforeUninstallFastCallback(_ => StartWithWindows.Set(false))
+            .OnBeforeUninstallFastCallback(_ =>
+            {
+                StartWithWindows.Set(false);
+                GameLauncher.Unregister();
+            })
             .Run();
 
         // Diagnostics: SteamSync.exe --dump out.json writes the local scan and exits (no network).
@@ -24,6 +28,15 @@ internal static class Program
             catch (Exception ex) { nonSteam = new { Error = ex.ToString() }; } // what the tray app would send as p_nonsteam = null
             var dump = new { snapshot.SteamPath, snapshot.SteamId, snapshot.Libraries, snapshot.Games, NonSteam = nonSteam };
             File.WriteAllText(outPath, JsonSerializer.Serialize(dump, new JsonSerializerOptions { WriteIndented = true }));
+            return 0;
+        }
+
+        // The site's Play button: Windows runs SteamSync.exe --play gamingenjoyer://play/<key>. Handled here, before the
+        // one-copy check, so it works whether or not the tray app is running; this process starts the game and exits.
+        if (args is ["--play", var link])
+        {
+            if (GameLauncher.Play(link) is { } problem)
+                MessageBox.Show(problem, AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Information);
             return 0;
         }
 
