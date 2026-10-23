@@ -108,6 +108,9 @@ internal sealed class TrayApp : ApplicationContext
             _tray.ShowBalloonTip(5000, AppInfo.Name, "Supabase settings are missing — see the README.", ToolTipIcon.Warning);
         else if (!_sync.IsPaired && !background)
             _ui.Post(_ => TogglePairing(), null);
+        // An app update can bring a newer ping helper, which only installs with an admin prompt: say so once per start.
+        else if (PingHelperClient.State == HelperState.Outdated)
+            _tray.ShowBalloonTip(6000, AppInfo.Name, "A newer ping helper is ready. Choose \"Update ping helper…\" in this menu (it asks for administrator rights).", ToolTipIcon.Info);
 
         if (openLibrary) _ui.Post(_ => OpenLibrary(), null);
     }

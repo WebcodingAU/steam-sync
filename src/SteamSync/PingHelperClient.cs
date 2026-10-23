@@ -54,13 +54,22 @@ internal sealed class PingHelperClient : IDisposable
             if (!File.Exists(BundledExe)) return HelperState.NotBundled;
             using var key = Registry.LocalMachine.OpenSubKey(ServiceKey);
             if (key is null || !File.Exists(InstalledExe)) return HelperState.NotInstalled;
-            return FileVersion(InstalledExe) == FileVersion(BundledExe) ? HelperState.Installed : HelperState.Outdated;
+            // Only a newer bundled helper is an update. Offering any different one (as up to 0.4.0-beta.9) let a tray
+            // that shipped 1.0.0 "update" an installed 1.1.0 back to 1.0.0, which has no redirects.
+            var installed = HelperVersion(InstalledExe);
+            var bundled = HelperVersion(BundledExe);
+            return installed is not null && bundled is not null && bundled > installed ? HelperState.Outdated : HelperState.Installed;
         }
     }
 
-    private static string? FileVersion(string path)
+    /// <summary>The helper's own version (1.1.0 from "1.1.0+commit"), or null when it can't be read.</summary>
+    private static Version? HelperVersion(string path)
     {
-        try { return FileVersionInfo.GetVersionInfo(path).ProductVersion?.Split('+')[0]; }
+        try
+        {
+            var text = FileVersionInfo.GetVersionInfo(path).ProductVersion?.Split('+', '-')[0];
+            return Version.TryParse(text, out var v) ? v : null;
+        }
         catch (FileNotFoundException) { return null; }
     }
 
