@@ -121,7 +121,8 @@ internal sealed class TrayApp : ApplicationContext
     private void Render(SyncStatus s)
     {
         _tray.Icon = _icons[s.State];
-        _tray.Text = Truncate($"{AppInfo.Name} — {s.Message}", 127);
+        // Synced reads as a green dot and the word; anything else says what's going on.
+        _tray.Text = Truncate($"{AppInfo.Name} — {(s.State == SyncState.Synced && s.LastSuccess is not null ? "🟢 Synced" : s.Message)}", 127);
         _statusItem.Text = s.Message;
         _lastSyncItem.Text = s.LastSuccess is { } t ? $"Last synced {t:HH:mm} ({s.GameCount} games)" : "Not synced yet";
         _syncNowItem.Enabled = _sync.IsPaired && s.State != SyncState.Syncing;

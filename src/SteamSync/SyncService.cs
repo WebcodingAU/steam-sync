@@ -117,10 +117,11 @@ internal sealed class SyncService : IDisposable
 
             _unknownDeviceStrikes = 0;
             _lastSuccess = DateTimeOffset.Now;
-            _lastGameCount = snapshot.Games.Count;
+            // Every installed game it reported: Steam's plus the ones from other launchers and Steam shortcuts.
+            _lastGameCount = snapshot.Games.Count + (nonSteam?.Games.Count(g => g.Installed) ?? 0);
             Log.Info($"Synced {snapshot.Games.Count} games from {snapshot.Libraries.Count} libraries, "
                      + (nonSteam is null ? "non-Steam games skipped" : $"{nonSteam.Games.Count(g => g.Installed)} non-Steam games installed"));
-            Publish(new(SyncState.Synced, $"{snapshot.Games.Count} games synced", _lastSuccess, _lastGameCount));
+            Publish(new(SyncState.Synced, "Synced", _lastSuccess, _lastGameCount));
         }
         catch (SupabaseException ex) when (ex.IsUnknownDevice && ++_unknownDeviceStrikes < 2)
         {
