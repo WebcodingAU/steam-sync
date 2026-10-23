@@ -19,9 +19,12 @@ namespace SteamSync;
 /// a UDP server is pinged (ICMP). Game servers that drop ICMP can't be measured that way and show as lost.
 /// </para>
 /// <para>
-/// ExitLag: when it routes the game, the game talks to ExitLag on this PC and ExitLag forwards the traffic to its own
-/// relay over UDP, so the real game server is out of sight. Then the ping is to that relay (method exitlag_relay):
-/// the first leg only, and the sample says so.
+/// ExitLag: when it routes the game, the game talks to ExitLag's proxy on this PC and ExitLag forwards the traffic to
+/// its own relay, so the system tables never show the real game server. The helper (1.1.0+) still sees where the
+/// game's connection was headed before ExitLag redirected it (PingHelperClient.LatestRedirects); then the game server
+/// itself is pinged by the normal internet route (method exitlag_server), with ExitLag's relay measured alongside.
+/// Without that (older helper, or a connection made before the helper started) the ping is to the relay
+/// (exitlag_relay): the first leg only, and the sample says so.
 /// </para>
 /// </summary>
 internal sealed class LivePing : IDisposable
@@ -36,6 +39,8 @@ internal sealed class LivePing : IDisposable
     private readonly PingHelperClient _helper;
     private readonly System.Threading.Timer _timer;
     private readonly Ping _pinger = new();
+    private readonly Ping _relayPinger = new();     // a Ping sends one at a time; the relay is pinged alongside the server
+    private HelperRedirect? _realServer;            // the game server last picked behind ExitLag, kept unless another is busier
     private readonly Queue<double?> _window = new();
     private string? _windowFor;
     private int _ticking, _uploading;
@@ -154,28 +159,34 @@ internal sealed class LivePing : IDisposable
         double? ping = null;
         TcpRtt? rtt = null;
         HelperFlow? flow = null;
+        Relay? relay = null;
 
         if (viaExitLag)
         {
-            if (exitLagFlows.FirstOrDefault() is { } relay)
+            // The relay (first leg) and, when the helper saw where the game's connection was really headed, the game
+            // server itself, measured at the same time.
+            var real = RealServer(pids, flows);
+            var relayTask = MeasureRelayAsync(exitLagFlows, exitLag, tcp);
+            var serverTask = real is null ? Task.FromResult<double?>(null) : IcmpAsync(real.Ip, _pinger);
+            await Task.WhenAll(relayTask, serverTask);
+            relay = relayTask.Result;
+
+            if (real is not null)
             {
-                flow = relay;
-                (ip, port, proto, serverPid, method) = (relay.Ip, relay.RemotePort, relay.Udp ? "udp" : "tcp", relay.Pid, "exitlag_relay");
-                // A TCP relay connection has Windows' own measured RTT, better than a ping (and relays may not answer one).
-                if (!relay.Udp && relay.Ip.AddressFamily == AddressFamily.InterNetwork
-                    && tcp.FirstOrDefault(r => r.Pid == relay.Pid && r.Remote.Equals(relay.Ip) && r.RemotePort == relay.RemotePort && r.LocalPort == relay.LocalPort) is { } relayRow)
-                    rtt = TcpStats.Rtt(relayRow);
-                ping = rtt?.SmoothedMs ?? await IcmpAsync(relay.Ip);
-                note = "ExitLag is routing this game. This is the ping to ExitLag's relay (the first leg), not to the game server.";
+                flow = flows?.FirstOrDefault(f => f.Pid == real.Pid && f.LocalPort == real.LocalPort);
+                (ip, port, proto, serverPid, method) = (real.Ip, real.Port, flow is { Udp: true } ? "udp" : "tcp", real.Pid, "exitlag_server");
+                ping = serverTask.Result;
+                note = "ExitLag is routing this game. This is the ping to the game server by your normal internet route; "
+                    + "ExitLag's own route to it may be a little faster."
+                    + (relay?.Ping is { } relayPing ? $" ExitLag's relay is {Math.Round(relayPing)} ms away." : "");
             }
-            else if (tcp.Where(r => exitLag.Contains(r.Pid) && !r.Listening && IsInternet(r.Remote) && !NotGamePorts.Contains(r.RemotePort))
-                         .FirstOrDefault() is { } elRow)
+            else if (relay is not null)
             {
-                // No relay traffic from the helper (or no helper): ExitLag's open TCP connections are the next best.
-                (ip, port, proto, serverPid, method) = (elRow.Remote, elRow.RemotePort, "tcp", elRow.Pid, "exitlag_relay");
-                rtt = TcpStats.Rtt(elRow);
-                ping = rtt?.SmoothedMs ?? await IcmpAsync(elRow.Remote);
-                note = "ExitLag is routing this game. This is the ping to ExitLag's relay connection (the first leg), not to the game server.";
+                (ip, port, proto, serverPid, method, flow, rtt, ping) =
+                    (relay.Ip, relay.Port, relay.Proto, relay.Pid, "exitlag_relay", relay.Flow, relay.Rtt, relay.Ping);
+                note = "ExitLag is routing this game. This is the ping to ExitLag's relay (the first leg), not to the game server."
+                    + (PingHelperClient.State == HelperState.Outdated ? " Update the ping helper (tray menu) to see the game server itself."
+                        : flows is not null ? " Reconnect in the game (relog) so the ping helper can see which server it uses." : "");
             }
             else
             {
@@ -228,7 +239,7 @@ internal sealed class LivePing : IDisposable
         double? jitter = null;
         if (values.Count >= 2)
             jitter = values.Zip(values.Skip(1), (a, b) => Math.Abs(b - a)).Average();
-        var pinged = method is "icmp" or "exitlag_relay";
+        var pinged = method is "icmp" or "exitlag_relay" or "exitlag_server";
         if (pinged && _window.Count >= 5 && _window.TakeLast(5).All(v => v is null))
             note ??= "This server doesn't answer ping (ICMP), so its ping can't be measured this way.";
 
@@ -274,6 +285,15 @@ internal sealed class LivePing : IDisposable
                 ["proto"] = proto,
                 ["process"] = ProcessName(serverPid),
             },
+            // Behind ExitLag with the game server known: its relay too (the first leg of ExitLag's route).
+            ["relay"] = method != "exitlag_server" || relay is null ? null : new JsonObject
+            {
+                ["ip"] = relay.Ip.ToString(),
+                ["port"] = relay.Port,
+                ["proto"] = relay.Proto,
+                ["ping_ms"] = Round(relay.Ping),
+                ["process"] = ProcessName(relay.Pid),
+            },
             ["flow"] = flow is null ? null : Traffic([flow]),
             ["game_traffic"] = gameTraffic is null ? null : Traffic(gameTraffic),
             ["tcp_rtt"] = rtt is null ? null : new JsonObject
@@ -299,11 +319,52 @@ internal sealed class LivePing : IDisposable
         ["kbps_in"] = Round(flows.Sum(f => f.BytesIn) * 8 / 1000.0),
     };
 
-    private async Task<double?> IcmpAsync(IPAddress ip)
+    /// <summary>ExitLag's relay: the first leg of its route, measured on its own.</summary>
+    private sealed record Relay(HelperFlow? Flow, IPAddress Ip, int Port, string Proto, int Pid, TcpRtt? Rtt, double? Ping);
+
+    /// <summary>ExitLag's busiest relay this second (helper), else one of its open TCP connections to a non-web port.</summary>
+    private async Task<Relay?> MeasureRelayAsync(List<HelperFlow> exitLagFlows, int[] exitLag, List<TcpRow> tcp)
+    {
+        if (exitLagFlows.FirstOrDefault() is { } f)
+        {
+            // A TCP relay connection has Windows' own measured RTT, better than a ping (and relays may not answer one).
+            TcpRtt? rtt = null;
+            if (!f.Udp && f.Ip.AddressFamily == AddressFamily.InterNetwork
+                && tcp.FirstOrDefault(r => r.Pid == f.Pid && r.Remote.Equals(f.Ip) && r.RemotePort == f.RemotePort && r.LocalPort == f.LocalPort) is { } row)
+                rtt = TcpStats.Rtt(row);
+            return new Relay(f, f.Ip, f.RemotePort, f.Udp ? "udp" : "tcp", f.Pid, rtt, rtt?.SmoothedMs ?? await IcmpAsync(f.Ip, _relayPinger));
+        }
+        if (tcp.FirstOrDefault(r => exitLag.Contains(r.Pid) && !r.Listening && IsInternet(r.Remote) && !NotGamePorts.Contains(r.RemotePort)) is { } open)
+        {
+            var rtt = TcpStats.Rtt(open);
+            return new Relay(null, open.Remote, open.RemotePort, "tcp", open.Pid, rtt, rtt?.SmoothedMs ?? await IcmpAsync(open.Remote, _relayPinger));
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The game server behind ExitLag: of the game's redirected connections (the helper saw it ask for an internet
+    /// server and reach 127.0.0.1), the busiest this second, preferring game ports over web ones. The last pick is kept
+    /// unless another is busier, so a quiet second doesn't flip between the login and the world server.
+    /// </summary>
+    private HelperRedirect? RealServer(HashSet<int> pids, IReadOnlyList<HelperFlow>? flows)
+    {
+        var redirects = _helper.LatestRedirects?.Where(r => pids.Contains(r.Pid) && IsInternet(r.Ip)).ToList();
+        if (redirects is null || redirects.Count == 0) return _realServer = null;
+
+        int Packets(HelperRedirect r) => flows?.Where(f => f.Pid == r.Pid && f.LocalPort == r.LocalPort).Sum(f => f.Packets) ?? 0;
+        var best = redirects.OrderBy(r => NotGamePorts.Contains(r.Port) ? 1 : 0).ThenByDescending(Packets).First();
+        if (_realServer is { } last && redirects.Contains(last) && NotGamePorts.Contains(last.Port) == NotGamePorts.Contains(best.Port)
+            && Packets(best) <= Packets(last))
+            best = last;
+        return _realServer = best;
+    }
+
+    private async Task<double?> IcmpAsync(IPAddress ip, Ping? pinger = null)
     {
         try
         {
-            var reply = await _pinger.SendPingAsync(ip, 1000);
+            var reply = await (pinger ?? _pinger).SendPingAsync(ip, 1000);
             return reply.Status == IPStatus.Success ? reply.RoundtripTime : null;
         }
         catch (PingException) { return null; }
@@ -364,6 +425,7 @@ internal sealed class LivePing : IDisposable
     {
         _timer.Dispose();
         _pinger.Dispose();
+        _relayPinger.Dispose();
         _api?.Dispose();
     }
 }

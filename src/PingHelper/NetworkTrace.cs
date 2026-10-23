@@ -6,7 +6,8 @@ namespace PingHelper;
 /// <summary>
 /// A real-time ETW session on Microsoft-Windows-Kernel-Network: one event per TCP or UDP packet a process sends or
 /// receives, with the process id and the remote address and port. Windows lets only SYSTEM, Administrators and
-/// LOCAL SERVICE turn this provider on, which is why the helper is a LocalService service.
+/// LOCAL SERVICE turn this provider on, which is why the helper is a LocalService service. The same session also
+/// takes Winsock-AFD's bind and connect events, to see the real server behind redirected connections (RedirectTable).
 /// <para>
 /// Plain P/Invoke against advapi32 (StartTrace, EnableTraceEx2, OpenTrace, ProcessTrace) rather than a tracing
 /// library, so the exe stays small and trims safely. The payload layouts are the provider's manifest (the same fields
@@ -23,6 +24,13 @@ internal sealed unsafe class NetworkTrace : IDisposable
     // Event ids from the provider's manifest.
     private const ushort TcpV4Send = 10, TcpV4Recv = 11, TcpV6Send = 26, TcpV6Recv = 27;
     private const ushort UdpV4Send = 42, UdpV4Recv = 43, UdpV6Send = 58, UdpV6Recv = 59;
+
+    // Microsoft-Windows-Winsock-AFD: what programs pass to bind() and connect(), before any driver redirects the
+    // connection (RedirectTable). Only these two events are asked for; the provider's per-packet ones would be a flood.
+    private static readonly Guid WinsockAfd = new("e53c6823-7bb8-44bb-90dc-3f86090d48a6");
+    private const ushort AfdConnect = 1018, AfdBind = 1030;
+    private const ulong AfdKeywords = 0x6;
+    private const byte LevelInformation = 4;
 
     private readonly FlowTable _flows;
     private readonly GCHandle _self;
@@ -57,6 +65,9 @@ internal sealed unsafe class NetworkTrace : IDisposable
             Stop();
             throw new System.ComponentModel.Win32Exception((int)error, $"EnableTraceEx2 failed ({error})");
         }
+        // Without Winsock the flows still work; only redirected connections (ExitLag) go unexplained.
+        error = EnableWinsock();
+        if (error != 0) Log.Write($"Winsock events unavailable ({error}): redirected connections won't show their real server");
 
         // EVENT_TRACE_LOGFILEW is 448 bytes on x64; only these fields matter for a real-time event-record consumer.
         var logfile = stackalloc byte[LogFileSize];
@@ -82,6 +93,33 @@ internal sealed unsafe class NetworkTrace : IDisposable
         _thread.Start();
     }
 
+    /// <summary>Turns on Winsock-AFD for its bind and connect events only, filtered by event id in the kernel
+    /// (ENABLE_TRACE_PARAMETERS v2 with an EVENT_FILTER_TYPE_EVENT_ID descriptor).</summary>
+    private uint EnableWinsock()
+    {
+        // EVENT_FILTER_EVENT_ID: FilterIn, Reserved, Count, then the ids.
+        var ids = stackalloc byte[8];
+        ids[0] = 1;
+        ids[1] = 0;
+        *(ushort*)(ids + 2) = 2;
+        *(ushort*)(ids + 4) = AfdConnect;
+        *(ushort*)(ids + 6) = AfdBind;
+        // EVENT_FILTER_DESCRIPTOR: Ptr, Size, Type.
+        var filter = stackalloc byte[16];
+        *(ulong*)filter = (ulong)ids;
+        *(uint*)(filter + 8) = 8;
+        *(uint*)(filter + 12) = 0x80000200; // EVENT_FILTER_TYPE_EVENT_ID
+        // ENABLE_TRACE_PARAMETERS (x64, 48 bytes): Version, EnableProperty, ControlFlags, SourceId, EnableFilterDesc, FilterDescCount.
+        var parameters = stackalloc byte[48];
+        new Span<byte>(parameters, 48).Clear();
+        *(uint*)parameters = 2;
+        *(IntPtr*)(parameters + 32) = (IntPtr)filter;
+        *(uint*)(parameters + 40) = 1;
+
+        var provider = WinsockAfd;
+        return EnableTraceEx2(_session, &provider, EnableProvider, LevelInformation, AfdKeywords, 0, 0, (IntPtr)parameters);
+    }
+
     private void Pump()
     {
         var handle = _consumer;
@@ -94,9 +132,11 @@ internal sealed unsafe class NetworkTrace : IDisposable
     {
         try
         {
-            if (record->ProviderId != KernelNetwork || record->UserContext == IntPtr.Zero) return;
-            var trace = (NetworkTrace)GCHandle.FromIntPtr(record->UserContext).Target!;
-            trace.Handle(record);
+            if (record->UserContext == IntPtr.Zero) return;
+            if (record->ProviderId == KernelNetwork)
+                ((NetworkTrace)GCHandle.FromIntPtr(record->UserContext).Target!).Handle(record);
+            else if (record->ProviderId == WinsockAfd)
+                ((NetworkTrace)GCHandle.FromIntPtr(record->UserContext).Target!).HandleWinsock(record);
         }
         catch { } // never let an exception unwind into ETW
     }
@@ -147,6 +187,46 @@ internal sealed unsafe class NetworkTrace : IDisposable
             lo = 0x0000FFFF00000000UL | (uint)(remote[0] << 24 | remote[1] << 16 | remote[2] << 8 | remote[3]);
         }
         _flows.Add(new FlowKey(pid, udp, hi, lo, remotePort, localPort), send, size);
+    }
+
+    /// <summary>
+    /// Winsock bind (1030) and connect (1018), version 0 payloads, packed: EnterExit u32, Location u32, Process ptr,
+    /// Endpoint ptr, then for bind: Status u32, AddressLen u32, Address; for connect: Buffer ptr, BufferLength u32,
+    /// Status u32, AddressLen u32, Address. Address is a SOCKADDR_IN or SOCKADDR_IN6. The event's process id is the
+    /// caller's (the event is logged in its context). Bind is logged on entry (port 0) and exit (the port it got).
+    /// </summary>
+    private void HandleWinsock(EventRecord* record)
+    {
+        var data = (byte*)record->UserData;
+        int length = record->UserDataLength, at;
+        if (data is null) return;
+        if (record->EventId == AfdBind) at = 28;
+        else if (record->EventId == AfdConnect) at = 40;
+        else return;
+        if (length < at + 4) return;
+
+        var endpoint = *(ulong*)(data + 16);
+        var addressLength = *(uint*)(data + at);
+        var address = data + at + 4;
+        if (addressLength < 8 || at + 4 + addressLength > length) return;
+
+        var family = *(ushort*)address;
+        var port = (ushort)(address[2] << 8 | address[3]);
+        ulong hi, lo;
+        if (family == 2) // AF_INET
+        {
+            hi = 0;
+            lo = 0x0000FFFF00000000UL | (uint)(address[4] << 24 | address[5] << 16 | address[6] << 8 | address[7]);
+        }
+        else if (family == 23 && addressLength >= 24) // AF_INET6
+        {
+            hi = BigEndian(address + 8);
+            lo = BigEndian(address + 16);
+        }
+        else return;
+
+        if (record->EventId == AfdBind) _flows.Bind(endpoint, record->ProcessId, port);
+        else _flows.Connect(endpoint, hi, lo, port);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -219,6 +299,7 @@ internal sealed unsafe class NetworkTrace : IDisposable
     [StructLayout(LayoutKind.Explicit)]
     private struct EventRecord
     {
+        [FieldOffset(12)] public uint ProcessId;
         [FieldOffset(24)] public Guid ProviderId;
         [FieldOffset(40)] public ushort EventId;
         [FieldOffset(86)] public ushort UserDataLength;

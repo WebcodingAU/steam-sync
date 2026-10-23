@@ -21,11 +21,25 @@ internal sealed class FlowTable
     private Dictionary<FlowKey, Counts> _current = [];
     private Dictionary<FlowKey, Counts> _spare = [];
     private long _dropped;
+    private readonly RedirectTable _redirects = new();
+
+    /// <summary>Winsock bound a socket to a local port (RedirectTable).</summary>
+    public void Bind(ulong endpoint, uint pid, ushort localPort)
+    {
+        lock (_gate) _redirects.Bind(endpoint, pid, localPort);
+    }
+
+    /// <summary>A program asked Winsock to connect a socket to this address (RedirectTable).</summary>
+    public void Connect(ulong endpoint, ulong hi, ulong lo, ushort port)
+    {
+        lock (_gate) _redirects.Connect(endpoint, hi, lo, port);
+    }
 
     public void Add(FlowKey key, bool send, uint size)
     {
         lock (_gate)
         {
+            _redirects.Traffic(key.Pid, key.LocalPort, key.AddrHi, key.AddrLo);
             if (!_current.TryGetValue(key, out var c))
             {
                 if (_current.Count >= MaxFlows) { _dropped++; return; }
@@ -37,7 +51,9 @@ internal sealed class FlowTable
     }
 
     /// <summary>The last second's flows as one line of JSON (no newline), and a fresh table for the next second:
-    /// {"v":1,"helper":"1.0.0","t":unix ms,"dropped":n,"flows":[{"pid","p":"udp"|"tcp","ip","rp","lp","po","pi","bo","bi"}]}</summary>
+    /// {"v":1,"helper":"1.1.0","t":unix ms,"dropped":n,"flows":[{"pid","p":"udp"|"tcp","ip","rp","lp","po","pi","bo","bi"}],
+    ///  "redirects":[{"pid","lp","ip","rp"}]} where a redirect is a connection whose real destination (ip:rp, what the
+    /// program asked for) differs from where its traffic goes (127.0.0.1, e.g. ExitLag's proxy). Redirects since 1.1.0.</summary>
     public byte[] TakeSnapshot(string version)
     {
         Dictionary<FlowKey, Counts> taken;
@@ -75,6 +91,7 @@ internal sealed class FlowTable
                 json.WriteEndObject();
             }
             json.WriteEndArray();
+            lock (_gate) _redirects.Write(json);
             json.WriteEndObject();
         }
         // Only touched by this (the pipe server's) thread from here on, until the next swap hands it back to Add.
@@ -82,7 +99,7 @@ internal sealed class FlowTable
         return buffer.WrittenSpan.ToArray();
     }
 
-    private static string FormatAddress(ulong hi, ulong lo)
+    public static string FormatAddress(ulong hi, ulong lo)
     {
         if (hi == 0 && (lo >> 32) == 0xFFFF)
         {

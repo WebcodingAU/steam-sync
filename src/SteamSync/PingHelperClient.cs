@@ -13,6 +13,10 @@ internal sealed record HelperFlow(int Pid, bool Udp, IPAddress Ip, int RemotePor
     public int Packets => PacketsOut + PacketsIn;
 }
 
+/// <summary>A connection that was redirected (ExitLag's proxy): the program asked for Ip:Port, but its socket on LocalPort
+/// talks to 127.0.0.1. From helper 1.1.0.</summary>
+internal sealed record HelperRedirect(int Pid, int LocalPort, IPAddress Ip, int Port);
+
 internal enum HelperState { NotBundled, NotInstalled, Outdated, Installed }
 
 /// <summary>
@@ -29,7 +33,7 @@ internal sealed class PingHelperClient : IDisposable
         Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Gaming Enjoyer", "GamingEnjoyerPing.exe");
 
     private readonly CancellationTokenSource _stop = new();
-    private (DateTimeOffset At, IReadOnlyList<HelperFlow> Flows)? _latest;
+    private (DateTimeOffset At, IReadOnlyList<HelperFlow> Flows, IReadOnlyList<HelperRedirect> Redirects)? _latest;
     private Task? _reader;
 
     /// <summary>True while lines are arriving from the helper.</summary>
@@ -37,6 +41,9 @@ internal sealed class PingHelperClient : IDisposable
 
     /// <summary>The last second's flows, or null when the helper isn't running (or not installed).</summary>
     public IReadOnlyList<HelperFlow>? Latest => Connected ? _latest!.Value.Flows : null;
+
+    /// <summary>Redirected connections still in use; empty from a helper older than 1.1.0, null when it isn't running.</summary>
+    public IReadOnlyList<HelperRedirect>? LatestRedirects => Connected ? _latest!.Value.Redirects : null;
 
     public void Start() => _reader = Task.Run(() => ReadLoop(_stop.Token));
 
@@ -94,7 +101,10 @@ internal sealed class PingHelperClient : IDisposable
                 Log.Info("Connected to the ping helper");
                 using var reader = new StreamReader(pipe);
                 while (await reader.ReadLineAsync(ct) is { } line)
-                    _latest = (DateTimeOffset.UtcNow, Parse(line));
+                {
+                    var (flows, redirects) = Parse(line);
+                    _latest = (DateTimeOffset.UtcNow, flows, redirects);
+                }
                 Log.Info("The ping helper closed its pipe");
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
@@ -107,27 +117,41 @@ internal sealed class PingHelperClient : IDisposable
         }
     }
 
-    private static List<HelperFlow> Parse(string line)
+    private static (List<HelperFlow> Flows, List<HelperRedirect> Redirects) Parse(string line)
     {
         using var doc = JsonDocument.Parse(line);
         var flows = new List<HelperFlow>();
-        if (!doc.RootElement.TryGetProperty("flows", out var array)) return flows;
-        foreach (var f in array.EnumerateArray())
+        var redirects = new List<HelperRedirect>();
+        if (doc.RootElement.TryGetProperty("flows", out var array))
         {
-            if (!IPAddress.TryParse(f.GetProperty("ip").GetString(), out var ip)) continue;
-            flows.Add(new HelperFlow(
-                f.GetProperty("pid").GetInt32(),
-                f.GetProperty("p").GetString() == "udp",
-                ip.IsIPv4MappedToIPv6 ? ip.MapToIPv4() : ip,
-                f.GetProperty("rp").GetInt32(),
-                f.GetProperty("lp").GetInt32(),
-                f.GetProperty("po").GetInt32(),
-                f.GetProperty("pi").GetInt32(),
-                f.GetProperty("bo").GetInt64(),
-                f.GetProperty("bi").GetInt64()));
+            foreach (var f in array.EnumerateArray())
+            {
+                if (!IPAddress.TryParse(f.GetProperty("ip").GetString(), out var ip)) continue;
+                flows.Add(new HelperFlow(
+                    f.GetProperty("pid").GetInt32(),
+                    f.GetProperty("p").GetString() == "udp",
+                    Unmap(ip),
+                    f.GetProperty("rp").GetInt32(),
+                    f.GetProperty("lp").GetInt32(),
+                    f.GetProperty("po").GetInt32(),
+                    f.GetProperty("pi").GetInt32(),
+                    f.GetProperty("bo").GetInt64(),
+                    f.GetProperty("bi").GetInt64()));
+            }
         }
-        return flows;
+        // Helper 1.1.0+.
+        if (doc.RootElement.TryGetProperty("redirects", out array))
+        {
+            foreach (var r in array.EnumerateArray())
+            {
+                if (!IPAddress.TryParse(r.GetProperty("ip").GetString(), out var ip)) continue;
+                redirects.Add(new HelperRedirect(r.GetProperty("pid").GetInt32(), r.GetProperty("lp").GetInt32(), Unmap(ip), r.GetProperty("rp").GetInt32()));
+            }
+        }
+        return (flows, redirects);
     }
+
+    private static IPAddress Unmap(IPAddress ip) => ip.IsIPv4MappedToIPv6 ? ip.MapToIPv4() : ip;
 
     public void Dispose()
     {
