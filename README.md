@@ -96,7 +96,7 @@ inside its install folder (launchers and `gamelaunchhelper.exe` hand over to the
 process isn't timed); a process whose path is hidden (some anti-cheat-protected games) is matched by exe name
 against the exes in each game folder. Crash reporters, updaters, installers and anti-cheat services don't count.
 
-- A session is reported as running as soon as it's seen, and ends 10 seconds after the last process closes;
+- A session is reported as running as soon as it's seen, and ends 2 seconds after the last process closes (back within a minute = the same session);
   runs under a minute don't count as play (one already reported is sent back with no length); sleep ends it.
 - Starts and ends are sent at once, otherwise about once a minute, to `record_play_sessions`
   (`sql/2026-10-23_play_sessions.sql` in the website repo). Unsent ones wait in `play_sessions.json`.

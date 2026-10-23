@@ -24,7 +24,8 @@ internal sealed record RunningGame(string Key, string Name, IReadOnlyList<int> P
 /// </para>
 /// <para>
 /// A session starts with the first matching process and is reported as running straight away, so the site's
-/// "Playing now" shows within seconds; it ends once none has been seen for 10 seconds. Runs shorter than a minute
+/// "Playing now" shows within seconds; it ends once none has been seen for 2 seconds, and a game that comes back
+/// within a minute (a restart, a launcher handing over) carries on the same session. Runs shorter than a minute
 /// don't count as play: one already reported is sent back with no length, which clears "Playing now". When the PC sleeps the session ends at the last check before it. Only while paired:
 /// nothing is recorded before that. Unsent sessions live in %LocalAppData%\SteamSync\play_sessions.json, so a
 /// session played offline, or one cut short by quitting the app, is sent later.
@@ -35,7 +36,10 @@ internal sealed class PlayTracker : IDisposable
     // Every second, so "Playing now" shows on the site within a couple of seconds. Cheap: only processes not seen
     // before are looked at (_pidCache), which is none in most seconds.
     private static readonly TimeSpan Tick = TimeSpan.FromSeconds(1);
-    private static readonly TimeSpan Grace = TimeSpan.FromSeconds(10);
+    // Gone this long = closed. Short, so "Playing now" clears within seconds; a game that comes back within Resume
+    // (a restart, a launcher handing over) carries on the same session instead of starting a new one.
+    private static readonly TimeSpan Grace = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan Resume = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan SaveEvery = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan MinSession = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan SleepGap = TimeSpan.FromMinutes(2);
@@ -58,6 +62,7 @@ internal sealed class PlayTracker : IDisposable
     private Dictionary<string, Target> _byExeName = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Active> _active = new(StringComparer.Ordinal);
     private readonly List<PlaySession> _pending = [];
+    private readonly Dictionary<string, Active> _recent = new(StringComparer.Ordinal);   // just ended, by game key
     private DateTimeOffset? _lastTick;
     private DateTimeOffset _lastUpload = DateTimeOffset.MinValue;
     private DateTimeOffset _skipUploadsUntil = DateTimeOffset.MinValue;
@@ -182,6 +187,15 @@ internal sealed class PlayTracker : IDisposable
                 foreach (var (key, game) in running)
                 {
                     if (_active.TryGetValue(key, out var a)) a.LastSeen = now;
+                    else if (_recent.Remove(key, out var back) && now - back.LastSeen <= Resume)
+                    {
+                        // Back within a minute: the same session carries on, and what was queued for its end goes.
+                        _pending.RemoveAll(p => p.SessionId == back.Id);
+                        back.LastSeen = now;
+                        _active[key] = back;
+                        startedOne = true;
+                        Log.Info($"Back to {back.Name} ({key}); same session");
+                    }
                     else
                     {
                         _active[key] = new Active { Id = Guid.NewGuid(), Key = key, Name = game.Name, Started = now, LastSeen = now };
@@ -192,6 +206,8 @@ internal sealed class PlayTracker : IDisposable
                 Running = running.Values.OrderBy(g => _active.TryGetValue(g.Key, out var a) ? a.Started : now).ToList();
                 foreach (var a in _active.Values.Where(a => !running.ContainsKey(a.Key) && now - a.LastSeen > Grace).ToList())
                     finishedOne |= Finish(a, a.LastSeen);
+                foreach (var key in _recent.Where(r => now - r.Value.LastSeen > Resume).Select(r => r.Key).ToList())
+                    _recent.Remove(key);
 
                 // Starts and ends are saved at once; a running session's last-seen time every 30 s is enough.
                 if (startedOne || finishedOne || (_active.Count > 0 && now - _lastSave >= SaveEvery))
@@ -281,6 +297,8 @@ internal sealed class PlayTracker : IDisposable
     private bool Finish(Active a, DateTimeOffset end)
     {
         _active.Remove(a.Key);
+        a.LastSeen = end;
+        _recent[a.Key] = a;   // so a quick restart carries on this session
         if (end - a.Started < MinSession)
         {
             Log.Info($"Stopped {a.Name} after under a minute; not counted");
