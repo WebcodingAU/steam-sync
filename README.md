@@ -113,11 +113,18 @@ game stops it sends `null`, which clears the PC's live row.
   leaving out web, DNS and LAN traffic. Without the ping helper only the game's TCP connections are visible.
 - **TCP servers:** Windows' own RTT for that connection (`TcpStats.cs`, `GetPerTcpConnectionEStats` FineRtt).
   It needs no admin rights because Windows already collects it.
-- **UDP servers:** an ICMP ping. A server that drops ICMP shows as lost.
+- **UDP servers:** an ICMP ping.
+- **Servers that drop ping** (AWS blocks ICMP by default): after 3 missed pings the sample becomes an estimate,
+  `cloud_estimate` with an `estimate` object (`CloudRegions.cs`). That's the TCP handshake time to the public endpoint
+  of the AWS region the server is in, taken from AWS's published `ip-ranges.json`. The list is fetched on first need
+  and cached for a week. Ping is tried again every minute. An address AWS marks GLOBAL (anycast or accelerator style,
+  e.g. Hunger Playtest's) has no region to time, and the note says so. Servers outside AWS show as lost.
 - **ExitLag:** if the game connects to a port ExitLag listens on (its local proxy), or the game has no traffic of
-  its own while ExitLag's relay is busy, the sample is the ping to ExitLag's relay (`exitlag_relay`). That's only the
-  first leg; the real game server is hidden behind ExitLag.
+  its own while ExitLag's relay is busy, ExitLag is routing it. With helper 1.1.0+ the sample is the real game
+  server, pinged by the normal route (`exitlag_server`), with ExitLag's relay alongside. Otherwise it's the relay
+  (`exitlag_relay`), which is only the first leg.
 - `SteamSync.exe --live-ping out.jsonl [seconds]` writes the samples it would send, without sending them.
+  `SteamSync.exe --cloud-region <ip> out.txt` shows the region an address is in and times its endpoint.
 
 ### Ping helper (`src/PingHelper`)
 
@@ -175,7 +182,9 @@ Nothing leaves the PC until you pair it. After pairing, each sync sends gamingen
 
 While a game runs, it also sends the game, when it started and stopped (play sessions), and once a second a live
 ping sample: the game, the ping, the address and port of the server it measured, packet rates, and whether ExitLag
-is routing the game.
+is routing the game. To measure that ping, it pings the game server, and for servers that don't answer it downloads
+AWS's public address list (ip-ranges.amazonaws.com) and connects to that AWS region's public endpoint without
+sending anything over the connection.
 
 The app also checks the [releases repo](https://github.com/WebcodingAU/gaming-enjoyer-releases) on
 GitHub for updates, and the Library window loads gamingenjoyer.com. Nothing else is sent anywhere.

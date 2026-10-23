@@ -16,7 +16,9 @@ namespace SteamSync;
 /// </para>
 /// <para>
 /// Measuring it: a TCP server uses Windows' own RTT for that connection (TcpStats), which is the game's real traffic;
-/// a UDP server is pinged (ICMP). Game servers that drop ICMP can't be measured that way and show as lost.
+/// a UDP server is pinged (ICMP). A server that drops ICMP (AWS does by default) is estimated instead after 3 missed
+/// pings: the time to reach the public endpoint of the cloud region it is in (CloudRegions; method cloud_estimate, and
+/// labelled as an estimate). One outside a known cloud shows as lost.
 /// </para>
 /// <para>
 /// ExitLag: when it routes the game, the game talks to ExitLag's proxy on this PC and ExitLag forwards the traffic to
@@ -41,6 +43,9 @@ internal sealed class LivePing : IDisposable
     private readonly Ping _pinger = new();
     private readonly Ping _relayPinger = new();     // a Ping sends one at a time; the relay is pinged alongside the server
     private HelperRedirect? _realServer;            // the game server last picked behind ExitLag, kept unless another is busier
+    private readonly CloudRegions _cloud = new();
+    private readonly Dictionary<IPAddress, int> _icmpFailures = [];              // pings in a row a server didn't answer
+    private readonly Dictionary<IPAddress, DateTimeOffset> _icmpDeadUntil = [];  // servers estimated instead, until then
     private readonly Queue<double?> _window = new();
     private string? _windowFor;
     private int _ticking, _uploading;
@@ -160,6 +165,7 @@ internal sealed class LivePing : IDisposable
         TcpRtt? rtt = null;
         HelperFlow? flow = null;
         Relay? relay = null;
+        CloudRegion? estimate = null;
 
         if (viaExitLag)
         {
@@ -167,7 +173,7 @@ internal sealed class LivePing : IDisposable
             // server itself, measured at the same time.
             var real = RealServer(pids, flows);
             var relayTask = MeasureRelayAsync(exitLagFlows, exitLag, tcp);
-            var serverTask = real is null ? Task.FromResult<double?>(null) : IcmpAsync(real.Ip, _pinger);
+            var serverTask = real is null ? Task.FromResult<(double?, CloudRegion?)>((null, null)) : PingOrEstimateAsync(real.Ip);
             await Task.WhenAll(relayTask, serverTask);
             relay = relayTask.Result;
 
@@ -175,7 +181,7 @@ internal sealed class LivePing : IDisposable
             {
                 flow = flows?.FirstOrDefault(f => f.Pid == real.Pid && f.LocalPort == real.LocalPort);
                 (ip, port, proto, serverPid, method) = (real.Ip, real.Port, flow is { Udp: true } ? "udp" : "tcp", real.Pid, "exitlag_server");
-                ping = serverTask.Result;
+                (ping, estimate) = serverTask.Result;
                 note = "ExitLag is routing this game. This is the ping to the game server by your normal internet route; "
                     + "ExitLag's own route to it may be a little faster."
                     + (relay?.Ping is { } relayPing ? $" ExitLag's relay is {Math.Round(relayPing)} ms away." : "");
@@ -204,7 +210,11 @@ internal sealed class LivePing : IDisposable
                 && tcp.FirstOrDefault(r => r.Pid == top.Pid && r.Remote.Equals(top.Ip) && r.RemotePort == top.RemotePort && r.LocalPort == top.LocalPort) is { } row)
                 rtt = TcpStats.Rtt(row);
             if (rtt is not null) { method = "tcp_rtt"; ping = rtt.SmoothedMs; }
-            else { method = "icmp"; ping = await IcmpAsync(top.Ip); }
+            else
+            {
+                (ping, estimate) = await PingOrEstimateAsync(top.Ip);
+                method = estimate is null || estimate.IsGlobal ? "icmp" : "cloud_estimate";
+            }
         }
         else if (tcp.Where(r => pids.Contains(r.Pid) && !r.Listening && IsInternet(r.Remote) && !NotGamePorts.Contains(r.RemotePort))
                      .FirstOrDefault() is { } row)
@@ -213,7 +223,11 @@ internal sealed class LivePing : IDisposable
             (ip, port, proto, serverPid) = (row.Remote, row.RemotePort, "tcp", row.Pid);
             rtt = TcpStats.Rtt(row);
             if (rtt is not null) { method = "tcp_rtt"; ping = rtt.SmoothedMs; }
-            else { method = "icmp"; ping = await IcmpAsync(row.Remote); }
+            else
+            {
+                (ping, estimate) = await PingOrEstimateAsync(row.Remote);
+                method = estimate is null || estimate.IsGlobal ? "icmp" : "cloud_estimate";
+            }
         }
         else
         {
@@ -223,8 +237,21 @@ internal sealed class LivePing : IDisposable
                 : "No game traffic seen this second.";
         }
 
-        // Stats over the last minute of the same target; a new server starts a new window.
-        var windowFor = $"{game.Key}|{method}|{ip}|{port}";
+        if (estimate is { IsGlobal: true })
+        {
+            const string unknown = "This server doesn't answer ping, and its address is one AWS doesn't tie to a region (anycast or "
+                + "accelerator style), so its ping can't be measured or estimated from here.";
+            note = method == "exitlag_server" ? $"ExitLag is routing this game. {unknown}" : unknown;
+        }
+        else if (estimate is not null)
+        {
+            var where = $"{estimate.Provider} {estimate.Name ?? estimate.Code}";
+            var estimated = $"This server doesn't answer ping, so this is an estimate: the time to reach {where} ({estimate.Code}), the cloud region the server is in.";
+            note = method == "exitlag_server" ? $"ExitLag is routing this game. {estimated} By your normal route; ExitLag's own may be a little faster." : estimated;
+        }
+
+        // Stats over the last minute of the same target; a new server, or switching to an estimate, starts a new window.
+        var windowFor = $"{game.Key}|{method}|{ip}|{port}|{estimate?.Code}";
         if (windowFor != _windowFor)
         {
             _window.Clear();
@@ -239,7 +266,7 @@ internal sealed class LivePing : IDisposable
         double? jitter = null;
         if (values.Count >= 2)
             jitter = values.Zip(values.Skip(1), (a, b) => Math.Abs(b - a)).Average();
-        var pinged = method is "icmp" or "exitlag_relay" or "exitlag_server";
+        var pinged = method is "icmp" or "exitlag_relay" or "exitlag_server" or "cloud_estimate";
         if (pinged && _window.Count >= 5 && _window.TakeLast(5).All(v => v is null))
             note ??= "This server doesn't answer ping (ICMP), so its ping can't be measured this way.";
 
@@ -284,6 +311,15 @@ internal sealed class LivePing : IDisposable
                 ["port"] = port,
                 ["proto"] = proto,
                 ["process"] = ProcessName(serverPid),
+            },
+            // The server doesn't answer ping: ping_ms is the time to its cloud region's public endpoint (method
+            // cloud_estimate, or exitlag_server with this set).
+            ["estimate"] = estimate is null ? null : new JsonObject
+            {
+                ["provider"] = estimate.Provider,
+                ["region"] = estimate.Code,
+                ["region_name"] = estimate.Name,
+                ["endpoint"] = estimate.Endpoint,
             },
             // Behind ExitLag with the game server known: its relay too (the first leg of ExitLag's route).
             ["relay"] = method != "exitlag_server" || relay is null ? null : new JsonObject
@@ -360,6 +396,34 @@ internal sealed class LivePing : IDisposable
         return _realServer = best;
     }
 
+    /// <summary>
+    /// The server's ping, or, once it has missed 3 pings in a row, an estimate from its cloud region (CloudRegions),
+    /// for a minute before ping is tried again. A server that misses pings but isn't in a known cloud stays unmeasured.
+    /// </summary>
+    private async Task<(double? Ping, CloudRegion? Estimate)> PingOrEstimateAsync(IPAddress ip)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (!(_icmpDeadUntil.TryGetValue(ip, out var until) && until > now))
+        {
+            var icmp = await IcmpAsync(ip, _pinger);
+            if (icmp is not null)
+            {
+                _icmpFailures.Remove(ip);
+                _icmpDeadUntil.Remove(ip);
+                return (icmp, null);
+            }
+            var misses = _icmpFailures.GetValueOrDefault(ip) + 1;
+            if (misses < 3)
+            {
+                _icmpFailures[ip] = misses;
+                return (null, null);
+            }
+            _icmpFailures.Remove(ip);
+            _icmpDeadUntil[ip] = now.AddMinutes(1);
+        }
+        return _cloud.Find(ip) is { } region ? (await _cloud.ProbeAsync(region), region) : (null, null);
+    }
+
     private async Task<double?> IcmpAsync(IPAddress ip, Ping? pinger = null)
     {
         try
@@ -426,6 +490,7 @@ internal sealed class LivePing : IDisposable
         _timer.Dispose();
         _pinger.Dispose();
         _relayPinger.Dispose();
+        _cloud.Dispose();
         _api?.Dispose();
     }
 }

@@ -31,6 +31,21 @@ internal static class Program
             return 0;
         }
 
+        // Diagnostics: SteamSync.exe --cloud-region <ip> out.txt writes which cloud region the address is in and five
+        // timings of that region's endpoint (live ping's estimate for servers that drop ping), and exits.
+        if (args is ["--cloud-region", var regionIp, var regionOut] && System.Net.IPAddress.TryParse(regionIp, out var address))
+        {
+            using var cloud = new CloudRegions();
+            using var output = new StreamWriter(regionOut);
+            CloudRegion? region = null;
+            for (var i = 0; i < 60 && (region = cloud.Find(address)) is null; i++) Thread.Sleep(500); // the ranges load on first use
+            output.WriteLine(region is null ? "not in a known cloud" : $"{region.Provider} {region.Code} {region.Name} {region.Endpoint}");
+            if (region is { IsGlobal: false })
+                for (var i = 0; i < 5; i++, Thread.Sleep(2100))
+                    output.WriteLine($"{cloud.ProbeAsync(region).GetAwaiter().GetResult():0.0} ms");
+            return 0;
+        }
+
         // Diagnostics: SteamSync.exe --live-ping out.jsonl [seconds] writes what live ping would send, once a second while
         // a game runs (default 10 s), and exits. Nothing is sent.
         if (args.Length is 2 or 3 && args[0] == "--live-ping")
