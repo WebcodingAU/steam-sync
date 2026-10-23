@@ -46,6 +46,23 @@ internal static class Program
             return 0;
         }
 
+        // Diagnostics: SteamSync.exe --probe <ip> <port> <steam|other>[-noping] out.txt [seconds] runs live ping's measuring
+        // of one server (ping, then the fallbacks for servers that ignore it) once a second (default 20 s), and exits.
+        // -noping treats the server as ignoring ping, to try the fallbacks on one that answers it.
+        if (args.Length is 5 or 6 && args[0] == "--probe" && System.Net.IPAddress.TryParse(args[1], out var probeIp) && int.TryParse(args[2], out var probePort))
+        {
+            var seconds = args.Length == 6 && int.TryParse(args[5], out var s) ? s : 20;
+            using var helper = new PingHelperClient();
+            using var live = new LivePing(AppConfig.Load(), new PlayTracker(AppConfig.Load()), helper);
+            using var output = new StreamWriter(args[4]);
+            for (var i = 0; i < seconds; i++, Thread.Sleep(1000))
+            {
+                output.WriteLine(live.ProbeNowAsync(probeIp, probePort, args[3].StartsWith("steam"), skipPing: args[3].EndsWith("-noping")).GetAwaiter().GetResult());
+                output.Flush();
+            }
+            return 0;
+        }
+
         // Diagnostics: SteamSync.exe --live-ping out.jsonl [seconds] writes what live ping would send, once a second while
         // a game runs (default 10 s), and exits. Nothing is sent.
         if (args.Length is 2 or 3 && args[0] == "--live-ping")

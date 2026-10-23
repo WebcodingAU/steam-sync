@@ -16,9 +16,9 @@ namespace SteamSync;
 /// </para>
 /// <para>
 /// Measuring it: a TCP server uses Windows' own RTT for that connection (TcpStats), which is the game's real traffic;
-/// a UDP server is pinged (ICMP). A server that drops ICMP (AWS does by default) is estimated instead after 3 missed
-/// pings: the time to reach the public endpoint of the cloud region it is in (CloudRegions; method cloud_estimate, and
-/// labelled as an estimate). One outside a known cloud shows as lost.
+/// a UDP server is pinged (ICMP). A server that drops ICMP (AWS does by default) is measured another way after 3
+/// missed pings: the Steam server query, a router next to it, the GameLift beacon the game used, or its cloud region's
+/// endpoint (ProbeServerAsync has the order). Everything but the Steam query is labelled as an estimate.
 /// </para>
 /// <para>
 /// ExitLag: when it routes the game, the game talks to ExitLag's proxy on this PC and ExitLag forwards the traffic to
@@ -34,7 +34,8 @@ internal sealed class LivePing : IDisposable
     private static readonly TimeSpan Tick = TimeSpan.FromSeconds(1);
     private const int WindowSize = 60;
     // Web, DNS and LAN discovery: a game's launcher and overlay traffic, never its game server.
-    private static readonly HashSet<int> NotGamePorts = [53, 80, 443, 1900, 3702, 5353, 5355];
+    // GameLift's region ping beacons (7770) too: a game surveys them before joining a server.
+    private static readonly HashSet<int> NotGamePorts = [53, 80, 443, 1900, 3702, 5353, 5355, GameLiftBeacons.Port];
 
     private readonly SupabaseApi? _api;
     private readonly PlayTracker _play;
@@ -44,6 +45,11 @@ internal sealed class LivePing : IDisposable
     private readonly Ping _relayPinger = new();     // a Ping sends one at a time; the relay is pinged alongside the server
     private HelperRedirect? _realServer;            // the game server last picked behind ExitLag, kept unless another is busier
     private readonly CloudRegions _cloud = new();
+    private readonly SteamQuery _steamQuery = new();
+    private readonly HopProber _hops;
+    private readonly GameLiftBeacons _beacons = new();
+    private readonly HashSet<IPAddress> _gameBeacons = [];   // GameLift beacons the current game pinged (beacon_estimate)
+    private string? _beaconsFor;                              // the game they belong to
     private readonly Dictionary<IPAddress, int> _icmpFailures = [];              // pings in a row a server didn't answer
     private readonly Dictionary<IPAddress, DateTimeOffset> _icmpDeadUntil = [];  // servers estimated instead, until then
     private readonly Queue<double?> _window = new();
@@ -60,6 +66,7 @@ internal sealed class LivePing : IDisposable
         if (config.IsConfigured) _api = new SupabaseApi(config.SupabaseUrl, config.SupabaseAnonKey);
         _play = play;
         _helper = helper;
+        _hops = new HopProber(_cloud);
         _timer = new(_ => _ = TickAsync());
     }
 
@@ -79,6 +86,7 @@ internal sealed class LivePing : IDisposable
                 // The game stopped: clear the PC's live row once.
                 if (_live && await SendAsync(token, null)) _live = false;
                 _windowFor = null;
+                _beaconsFor = null;
                 return;
             }
 
@@ -121,6 +129,18 @@ internal sealed class LivePing : IDisposable
         return false;
     }
 
+    /// <summary>One measuring of a server, as text (SteamSync.exe --probe).</summary>
+    public async Task<string> ProbeNowAsync(IPAddress ip, int port, bool steamGame, bool skipPing = false)
+    {
+        if (skipPing) _icmpDeadUntil[ip] = DateTimeOffset.MaxValue;
+        var p = await ProbeServerAsync(ip, port, steamGame);
+        return $"{DateTime.Now:HH:mm:ss} {p.Probe} {Round(p.Ms)?.ToString() ?? "-"} ms"
+            + (p.Steam is { } q ? $" steam_query port {q.Port}" : "")
+            + (p.Hop is { } h ? $" hop {h.Hop.Ip} ttl {h.Hop.Ttl} same_network {h.Hop.SameNetwork} edge {h.Hop.Edge}" : "")
+            + (p.Beacon is { } b ? $" beacon {b.Ip} {b.Region?.Code}" : "")
+            + (p.Region is { } r ? $" region {r.Code}" : "");
+    }
+
     /// <summary>One sample, as the next tick would send it (SteamSync.exe --live-ping).</summary>
     public Task<JsonObject> MeasureNowAsync(IReadOnlyList<RunningGame> games) => MeasureAsync(games, DateTimeOffset.UtcNow);
 
@@ -147,6 +167,15 @@ internal sealed class LivePing : IDisposable
         // proxy (AION 2). Not its web traffic (443 and the like).
         var exitLagFlows = flows?.Where(f => exitLag.Contains(f.Pid) && IsInternet(f.Ip) && !NotGamePorts.Contains(f.RemotePort))
             .OrderByDescending(f => f.Packets).ToList() ?? [];
+        // The GameLift region beacons the game surveys before joining a server, kept for the game's session.
+        if (game.Key != _beaconsFor)
+        {
+            _gameBeacons.Clear();
+            _beaconsFor = game.Key;
+        }
+        foreach (var f in flows ?? [])
+            if (pids.Contains(f.Pid) && f.Udp && f.RemotePort == GameLiftBeacons.Port && IsInternet(f.Ip)) _gameBeacons.Add(f.Ip);
+
         var gameFlows = flows?.Where(f => pids.Contains(f.Pid) && IsInternet(f.Ip) && !NotGamePorts.Contains(f.RemotePort))
             .OrderByDescending(f => f.Packets).ToList() ?? [];
 
@@ -165,7 +194,8 @@ internal sealed class LivePing : IDisposable
         TcpRtt? rtt = null;
         HelperFlow? flow = null;
         Relay? relay = null;
-        CloudRegion? estimate = null;
+        ServerProbe? probe = null;
+        var steamGame = game.Key.StartsWith("steam:", StringComparison.Ordinal);
 
         if (viaExitLag)
         {
@@ -173,15 +203,16 @@ internal sealed class LivePing : IDisposable
             // server itself, measured at the same time.
             var real = RealServer(pids, flows);
             var relayTask = MeasureRelayAsync(exitLagFlows, exitLag, tcp);
-            var serverTask = real is null ? Task.FromResult<(double?, CloudRegion?)>((null, null)) : PingOrEstimateAsync(real.Ip);
-            await Task.WhenAll(relayTask, serverTask);
+            var serverTask = real is null ? null : ProbeServerAsync(real.Ip, real.Port, steamGame);
+            await Task.WhenAll(relayTask, serverTask ?? Task.CompletedTask);
             relay = relayTask.Result;
 
             if (real is not null)
             {
                 flow = flows?.FirstOrDefault(f => f.Pid == real.Pid && f.LocalPort == real.LocalPort);
                 (ip, port, proto, serverPid, method) = (real.Ip, real.Port, flow is { Udp: true } ? "udp" : "tcp", real.Pid, "exitlag_server");
-                (ping, estimate) = serverTask.Result;
+                probe = serverTask!.Result;
+                ping = probe.Ms;
                 note = "ExitLag is routing this game. This is the ping to the game server by your normal internet route; "
                     + "ExitLag's own route to it may be a little faster."
                     + (relay?.Ping is { } relayPing ? $" ExitLag's relay is {Math.Round(relayPing)} ms away." : "");
@@ -212,8 +243,8 @@ internal sealed class LivePing : IDisposable
             if (rtt is not null) { method = "tcp_rtt"; ping = rtt.SmoothedMs; }
             else
             {
-                (ping, estimate) = await PingOrEstimateAsync(top.Ip);
-                method = estimate is null || estimate.IsGlobal ? "icmp" : "cloud_estimate";
+                probe = await ProbeServerAsync(top.Ip, top.RemotePort, steamGame);
+                (method, ping) = (probe.Probe, probe.Ms);
             }
         }
         else if (tcp.Where(r => pids.Contains(r.Pid) && !r.Listening && IsInternet(r.Remote) && !NotGamePorts.Contains(r.RemotePort))
@@ -225,8 +256,8 @@ internal sealed class LivePing : IDisposable
             if (rtt is not null) { method = "tcp_rtt"; ping = rtt.SmoothedMs; }
             else
             {
-                (ping, estimate) = await PingOrEstimateAsync(row.Remote);
-                method = estimate is null || estimate.IsGlobal ? "icmp" : "cloud_estimate";
+                probe = await ProbeServerAsync(row.Remote, row.RemotePort, steamGame);
+                (method, ping) = (probe.Probe, probe.Ms);
             }
         }
         else
@@ -237,21 +268,38 @@ internal sealed class LivePing : IDisposable
                 : "No game traffic seen this second.";
         }
 
-        if (estimate is { IsGlobal: true })
+        // How a server that ignores ping was measured instead, said in the note.
+        var estimate = probe?.Region;
+        var how = probe switch
         {
-            const string unknown = "This server doesn't answer ping, and its address is one AWS doesn't tie to a region (anycast or "
-                + "accelerator style), so its ping can't be measured or estimated from here.";
-            note = method == "exitlag_server" ? $"ExitLag is routing this game. {unknown}" : unknown;
-        }
-        else if (estimate is not null)
-        {
-            var where = $"{estimate.Provider} {estimate.Name ?? estimate.Code}";
-            var estimated = $"This server doesn't answer ping, so this is an estimate: the time to reach {where} ({estimate.Code}), the cloud region the server is in.";
-            note = method == "exitlag_server" ? $"ExitLag is routing this game. {estimated} By your normal route; ExitLag's own may be a little faster." : estimated;
-        }
+            { Probe: "steam_query", Steam: { } q } =>
+                $"This server doesn't answer ping, so this is the Steam server query (port {q.Port}), answered by the game server itself.",
+            { Probe: "hop_estimate", Hop: { Hop.Edge: true } h } =>
+                $"This server doesn't answer ping and has an AWS global address, so this is the ping to AWS's edge in front of it "
+                + $"({h.Hop.Ip}, hop {h.Hop.Ttl}). That's a lower bound: the rest of the way is AWS's own network.",
+            { Probe: "hop_estimate", Hop: { Hop.SameNetwork: true } h } =>
+                $"This server doesn't answer ping, so this is the ping to the last router before it that answers ({h.Hop.Ip}, hop {h.Hop.Ttl}, "
+                + "in the same AWS region): close to the server's own.",
+            { Probe: "hop_estimate", Hop: { } h } =>
+                $"This server doesn't answer ping, so this is the ping to the last router before it that answers ({h.Hop.Ip}, hop {h.Hop.Ttl}). "
+                + "That's a lower bound: the server is further on.",
+            { Probe: "beacon_estimate", Beacon: { } b } =>
+                $"This server doesn't answer ping and has an AWS global address. Before joining, the game measured AWS GameLift regions; "
+                + $"this is the ping to the nearest one, {b.Region?.Name ?? b.Region?.Code ?? b.Ip.ToString()}, where the matchmaker most likely put the server. An estimate.",
+            { Probe: "cloud_estimate", Region: { } r } =>
+                $"This server doesn't answer ping, so this is an estimate: the time to reach {r.Provider} {r.Name ?? r.Code} ({r.Code}), the cloud region the server is in.",
+            { Probe: "icmp", Ms: null, Region.IsGlobal: true } =>
+                "This server doesn't answer ping, and its address is one AWS doesn't tie to a region (anycast or accelerator style), "
+                + "so its ping can't be measured or estimated from here.",
+            _ => null,
+        };
+        if (how is not null)
+            note = method == "exitlag_server"
+                ? $"ExitLag is routing this game. {how}" + (probe!.Probe == "icmp" ? "" : " By your normal route; ExitLag's own may be a little faster.")
+                : how;
 
-        // Stats over the last minute of the same target; a new server, or switching to an estimate, starts a new window.
-        var windowFor = $"{game.Key}|{method}|{ip}|{port}|{estimate?.Code}";
+        // Stats over the last minute of the same target; a new server, or a new way of measuring it, starts a new window.
+        var windowFor = $"{game.Key}|{method}|{ip}|{port}|{probe?.Probe}";
         if (windowFor != _windowFor)
         {
             _window.Clear();
@@ -266,7 +314,7 @@ internal sealed class LivePing : IDisposable
         double? jitter = null;
         if (values.Count >= 2)
             jitter = values.Zip(values.Skip(1), (a, b) => Math.Abs(b - a)).Average();
-        var pinged = method is "icmp" or "exitlag_relay" or "exitlag_server" or "cloud_estimate";
+        var pinged = method is "icmp" or "exitlag_relay" or "exitlag_server" or "cloud_estimate" or "steam_query" or "hop_estimate" or "beacon_estimate";
         if (pinged && _window.Count >= 5 && _window.TakeLast(5).All(v => v is null))
             note ??= "This server doesn't answer ping (ICMP), so its ping can't be measured this way.";
 
@@ -312,8 +360,28 @@ internal sealed class LivePing : IDisposable
                 ["proto"] = proto,
                 ["process"] = ProcessName(serverPid),
             },
-            // The server doesn't answer ping: ping_ms is the time to its cloud region's public endpoint (method
-            // cloud_estimate, or exitlag_server with this set).
+            // How the server itself was measured (icmp, steam_query, hop_estimate, cloud_estimate): the same as method
+            // for a game played directly, and the way behind method exitlag_server. Null for tcp_rtt and the relay.
+            ["probe"] = probe?.Probe,
+            ["steam_query"] = probe?.Steam is { } sq ? new JsonObject { ["port"] = sq.Port, ["ms"] = Round(sq.Ms) } : null,
+            ["beacon"] = probe?.Beacon is { } bc ? new JsonObject
+            {
+                ["ip"] = bc.Ip.ToString(),
+                ["port"] = GameLiftBeacons.Port,
+                ["region"] = bc.Region?.Code,
+                ["region_name"] = bc.Region?.Name,
+                ["ms"] = Round(bc.Ms),
+            } : null,
+            ["hop"] = probe?.Hop is { } hp ? new JsonObject
+            {
+                ["ip"] = hp.Hop.Ip.ToString(),
+                ["ttl"] = hp.Hop.Ttl,
+                ["ms"] = Round(hp.Ms),
+                ["same_network"] = hp.Hop.SameNetwork,
+                ["edge"] = hp.Hop.Edge,
+            } : null,
+            // The server's cloud region, when known (looked up once it stops answering ping). With probe cloud_estimate,
+            // ping_ms is the time to this region's public endpoint.
             ["estimate"] = estimate is null ? null : new JsonObject
             {
                 ["provider"] = estimate.Provider,
@@ -396,11 +464,26 @@ internal sealed class LivePing : IDisposable
         return _realServer = best;
     }
 
+    /// <summary>How a server was measured: Probe is icmp, steam_query, hop_estimate or cloud_estimate. Region is its
+    /// cloud region when known (looked up once ping fails), whichever way it was measured.</summary>
+    private sealed record ServerProbe(string Probe, double? Ms, CloudRegion? Region = null, (int Port, double? Ms)? Steam = null,
+        (Hop Hop, double? Ms)? Hop = null, (IPAddress Ip, CloudRegion? Region, double? Ms)? Beacon = null);
+
     /// <summary>
-    /// The server's ping, or, once it has missed 3 pings in a row, an estimate from its cloud region (CloudRegions),
-    /// for a minute before ping is tried again. A server that misses pings but isn't in a known cloud stays unmeasured.
+    /// A server's ping. ICMP while it answers; once it misses 3 in a row, for a minute (then ICMP is tried again), the
+    /// first of these that works, closest to the real thing first:
+    /// <list type="number">
+    /// <item>steam_query: the Steam server query (Steam games), answered by the game server itself.</item>
+    /// <item>hop_estimate: the last router on the route, when it's in the server's own AWS region (HopProber).</item>
+    /// <item>beacon_estimate: for a server without a region (AWS GLOBAL), the nearest GameLift beacon the game measured.</item>
+    /// <item>cloud_estimate: the server's AWS region endpoint (CloudRegions).</item>
+    /// <item>hop_estimate: any other usable last hop, AWS's edge or a router far from home: a lower bound. Tested from
+    /// Australia, a far hop came in 25-35 ms under the region estimate (Oregon 160 vs 184, Singapore 115 vs 148).</item>
+    /// </list>
+    /// Steam query and hop keep their method while they have an answering port or hop, so a missed reply counts as loss
+    /// rather than flipping methods every second.
     /// </summary>
-    private async Task<(double? Ping, CloudRegion? Estimate)> PingOrEstimateAsync(IPAddress ip)
+    private async Task<ServerProbe> ProbeServerAsync(IPAddress ip, int port, bool steamGame)
     {
         var now = DateTimeOffset.UtcNow;
         if (!(_icmpDeadUntil.TryGetValue(ip, out var until) && until > now))
@@ -410,18 +493,39 @@ internal sealed class LivePing : IDisposable
             {
                 _icmpFailures.Remove(ip);
                 _icmpDeadUntil.Remove(ip);
-                return (icmp, null);
+                return new ServerProbe("icmp", icmp);
             }
             var misses = _icmpFailures.GetValueOrDefault(ip) + 1;
             if (misses < 3)
             {
                 _icmpFailures[ip] = misses;
-                return (null, null);
+                return new ServerProbe("icmp", null);
             }
             _icmpFailures.Remove(ip);
             _icmpDeadUntil[ip] = now.AddMinutes(1);
         }
-        return _cloud.Find(ip) is { } region ? (await _cloud.ProbeAsync(region), region) : (null, null);
+
+        var region = _cloud.Find(ip);
+        if (steamGame && port > 0 && _steamQuery.CanTry(ip, port))
+        {
+            var (queryPort, ms) = await _steamQuery.QueryAsync(ip, port);
+            if (queryPort is { } p) return new ServerProbe("steam_query", ms, region, Steam: (p, ms));
+        }
+        var hop = _hops.Find(ip, region);
+        if (hop is { SameNetwork: true }) return await TimeHopAsync(hop);
+        // A server without a region (AWS GLOBAL, or no known cloud): the nearest GameLift beacon the game itself measured.
+        if (region is null or { IsGlobal: true } && _gameBeacons.Count > 0 && await _beacons.MeasureAsync(_gameBeacons) is { } beacon)
+            return new ServerProbe("beacon_estimate", beacon.Ms, region, Beacon: (beacon.Ip, _cloud.Find(beacon.Ip), beacon.Ms));
+        if (region is { IsGlobal: false })
+            return new ServerProbe("cloud_estimate", await _cloud.ProbeAsync(region), region);
+        if (hop is not null) return await TimeHopAsync(hop);
+        return new ServerProbe("icmp", null, region);
+
+        async Task<ServerProbe> TimeHopAsync(Hop h)
+        {
+            var ms = await _hops.TimeAsync(ip, h);
+            return new ServerProbe("hop_estimate", ms, region, Hop: (h, ms));
+        }
     }
 
     private async Task<double?> IcmpAsync(IPAddress ip, Ping? pinger = null)
@@ -490,6 +594,7 @@ internal sealed class LivePing : IDisposable
         _timer.Dispose();
         _pinger.Dispose();
         _relayPinger.Dispose();
+        _hops.Dispose();
         _cloud.Dispose();
         _api?.Dispose();
     }

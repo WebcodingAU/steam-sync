@@ -114,17 +114,27 @@ game stops it sends `null`, which clears the PC's live row.
 - **TCP servers:** Windows' own RTT for that connection (`TcpStats.cs`, `GetPerTcpConnectionEStats` FineRtt).
   It needs no admin rights because Windows already collects it.
 - **UDP servers:** an ICMP ping.
-- **Servers that drop ping** (AWS blocks ICMP by default): after 3 missed pings the sample becomes an estimate,
-  `cloud_estimate` with an `estimate` object (`CloudRegions.cs`). That's the TCP handshake time to the public endpoint
-  of the AWS region the server is in, taken from AWS's published `ip-ranges.json`. The list is fetched on first need
-  and cached for a week. Ping is tried again every minute. An address AWS marks GLOBAL (anycast or accelerator style,
-  e.g. Hunger Playtest's) has no region to time, and the note says so. Servers outside AWS show as lost.
+- **Servers that drop ping** (AWS blocks ICMP by default): after 3 missed pings, for a minute before ping is tried
+  again, the first of these that works. `probe` in the sample says which one, and `estimate` holds the server's AWS
+  region whenever it's known (from AWS's `ip-ranges.json`, fetched on first need and cached for a week):
+  1. `steam_query` (Steam games): an A2S_INFO query to the game port, the next port or 27015, answered by the game
+     server itself, so real latency (`SteamQuery.cs`). Gives up on a silent server for 10 minutes.
+  2. `hop_estimate` with `hop.same_network`: the last router that answers on the route (tracert style,
+     `HopProber.cs`), when it's in the server's own AWS region.
+  3. `beacon_estimate`: for a region-less server (AWS GLOBAL, like Hunger Playtest's), the nearest AWS GameLift region
+     beacon (UDP echo on port 7770) that the game itself pinged before joining (`GameLiftBeacons.cs`). Hunger from
+     Australia: Sydney, ~20 ms.
+  4. `cloud_estimate`: the TCP handshake time to the public endpoint of the server's AWS region (`CloudRegions.cs`).
+  5. `hop_estimate` with any other usable hop: AWS's edge (`hop.edge`) or a router far from home. That's a lower bound;
+     from Australia, a far hop came in 25–35 ms under the region estimate.
+  Anything left shows as lost, with a note saying why.
 - **ExitLag:** if the game connects to a port ExitLag listens on (its local proxy), or the game has no traffic of
   its own while ExitLag's relay is busy, ExitLag is routing it. With helper 1.1.0+ the sample is the real game
   server, pinged by the normal route (`exitlag_server`), with ExitLag's relay alongside. Otherwise it's the relay
   (`exitlag_relay`), which is only the first leg.
 - `SteamSync.exe --live-ping out.jsonl [seconds]` writes the samples it would send, without sending them.
   `SteamSync.exe --cloud-region <ip> out.txt` shows the region an address is in and times its endpoint.
+  `SteamSync.exe --probe <ip> <port> <steam|other>[-noping] out.txt [seconds]` runs the measuring of one server.
 
 ### Ping helper (`src/PingHelper`)
 
@@ -182,9 +192,12 @@ Nothing leaves the PC until you pair it. After pairing, each sync sends gamingen
 
 While a game runs, it also sends the game, when it started and stopped (play sessions), and once a second a live
 ping sample: the game, the ping, the address and port of the server it measured, packet rates, and whether ExitLag
-is routing the game. To measure that ping, it pings the game server, and for servers that don't answer it downloads
-AWS's public address list (ip-ranges.amazonaws.com) and connects to that AWS region's public endpoint without
-sending anything over the connection.
+is routing the game. To measure that ping, it pings the game server. For servers that don't answer, it may also:
+- send them a Steam server query,
+- ping the routers on the way to them,
+- echo the AWS GameLift beacons the game itself pinged,
+- download AWS's public address list (ip-ranges.amazonaws.com) and connect to that AWS region's public endpoint,
+  without sending anything over the connection.
 
 The app also checks the [releases repo](https://github.com/WebcodingAU/gaming-enjoyer-releases) on
 GitHub for updates, and the Library window loads gamingenjoyer.com. Nothing else is sent anywhere.

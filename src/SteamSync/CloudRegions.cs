@@ -109,6 +109,10 @@ internal sealed class CloudRegions : IDisposable
                 ip = addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork) ?? addresses.FirstOrDefault();
                 if (ip is null) return null;
                 lock (_gate) _endpoints[region.Endpoint] = (ip, now);
+                // The first handshake to a new address runs slow (381 ms against a usual 148 in testing): spend it untimed.
+                using var warm = new Socket(ip.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                using var warmTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                await warm.ConnectAsync(ip, 443, warmTimeout.Token);
             }
 
             using var socket = new Socket(ip.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
