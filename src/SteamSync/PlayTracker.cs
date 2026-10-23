@@ -20,16 +20,17 @@ internal sealed record PlaySession(Guid SessionId, string GameKey, string Name, 
 /// reporters, updaters, installers and anti-cheat services don't count.
 /// </para>
 /// <para>
-/// A session starts with the first matching process and ends once none has been seen for a minute; runs shorter
-/// than a minute aren't kept. When the PC sleeps the session ends at the last check before it. Only while paired:
+/// A session starts with the first matching process and is reported as running straight away, so the site's
+/// "Playing now" shows within seconds; it ends once none has been seen for 30 seconds. Runs shorter than a minute
+/// don't count as play: one already reported is sent back with no length, which clears "Playing now". When the PC sleeps the session ends at the last check before it. Only while paired:
 /// nothing is recorded before that. Unsent sessions live in %LocalAppData%\SteamSync\play_sessions.json, so a
 /// session played offline, or one cut short by quitting the app, is sent later.
 /// </para>
 /// </summary>
 internal sealed class PlayTracker : IDisposable
 {
-    private static readonly TimeSpan Tick = TimeSpan.FromSeconds(15);
-    private static readonly TimeSpan Grace = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan Tick = TimeSpan.FromSeconds(5);   // a start shows on the site within seconds
+    private static readonly TimeSpan Grace = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan MinSession = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan SleepGap = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan UploadEvery = TimeSpan.FromSeconds(60);
@@ -65,6 +66,7 @@ internal sealed class PlayTracker : IDisposable
         public string Name { get; init; } = "";
         public DateTimeOffset Started { get; init; }
         public DateTimeOffset LastSeen { get; set; }
+        public bool Reported { get; set; }   // sent to the site as running at least once
     }
 
     private sealed record State(List<Active> Active, List<PlaySession> Pending);
@@ -76,7 +78,7 @@ internal sealed class PlayTracker : IDisposable
         LoadState();
     }
 
-    public void Start() => _timer.Change(TimeSpan.FromSeconds(20), Tick);
+    public void Start() => _timer.Change(TimeSpan.FromSeconds(5), Tick);
 
     /// <summary>The games to watch, from each sync's scan. Building the exe-name fallback reads the game folders, so this
     /// runs on the sync's worker thread, never the UI's.</summary>
@@ -151,6 +153,7 @@ internal sealed class PlayTracker : IDisposable
             var now = DateTimeOffset.UtcNow;
             var running = RunningGames();
             var finishedOne = false;
+            var startedOne = false;
 
             lock (_gate)
             {
@@ -165,6 +168,7 @@ internal sealed class PlayTracker : IDisposable
                     else
                     {
                         _active[key] = new Active { Id = Guid.NewGuid(), Key = key, Name = name, Started = now, LastSeen = now };
+                        startedOne = true;
                         Log.Info($"Playing {name} ({key})");
                     }
                 }
@@ -174,7 +178,8 @@ internal sealed class PlayTracker : IDisposable
                 SaveState();
             }
 
-            if (finishedOne || now - _lastUpload >= UploadEvery) await UploadAsync(now);
+            // A start or an end goes out at once, for "Playing now"; otherwise once a minute.
+            if (startedOne || finishedOne || now - _lastUpload >= UploadEvery) await UploadAsync(now);
         }
         catch (Exception ex)
         {
@@ -227,14 +232,18 @@ internal sealed class PlayTracker : IDisposable
         return any;
     }
 
-    /// <summary>Ends a session: kept for sending when it lasted a minute or more. True when one was kept.</summary>
+    /// <summary>Ends a session: kept for sending when it lasted a minute or more. A shorter one already reported as
+    /// running is sent once more with no length, so the site stops showing it as playing. True when something is
+    /// waiting to be sent.</summary>
     private bool Finish(Active a, DateTimeOffset end)
     {
         _active.Remove(a.Key);
         if (end - a.Started < MinSession)
         {
             Log.Info($"Stopped {a.Name} after under a minute; not counted");
-            return false;
+            if (!a.Reported) return false;
+            _pending.Add(new PlaySession(a.Id, a.Key, a.Name, a.Started, a.Started, Running: false));
+            return true;
         }
         Log.Info($"Stopped {a.Name} after {(end - a.Started).TotalMinutes:0} min");
         _pending.Add(new PlaySession(a.Id, a.Key, a.Name, a.Started, end, Running: false));
@@ -242,7 +251,7 @@ internal sealed class PlayTracker : IDisposable
         return true;
     }
 
-    /// <summary>Sends every finished session not sent yet, plus every running one that has lasted a minute.</summary>
+    /// <summary>Sends every finished session not sent yet, plus every running one.</summary>
     private async Task UploadAsync(DateTimeOffset now)
     {
         if (_api is null || now < _skipUploadsUntil || DeviceToken.Load() is not { } token) return;
@@ -251,9 +260,7 @@ internal sealed class PlayTracker : IDisposable
         lock (_gate)
         {
             batch = _pending.ToList();
-            batch.AddRange(_active.Values
-                .Where(a => a.LastSeen - a.Started >= MinSession)
-                .Select(a => new PlaySession(a.Id, a.Key, a.Name, a.Started, a.LastSeen, Running: true)));
+            batch.AddRange(_active.Values.Select(a => new PlaySession(a.Id, a.Key, a.Name, a.Started, a.LastSeen, Running: true)));
         }
         _lastUpload = now;
         if (batch.Count == 0) return;
@@ -263,6 +270,8 @@ internal sealed class PlayTracker : IDisposable
             await _api.RecordPlaySessionsAsync(token, batch);
             lock (_gate)
             {
+                foreach (var s in batch.Where(s => s.Running))
+                    if (_active.TryGetValue(s.GameKey, out var a) && a.Id == s.SessionId) a.Reported = true;
                 var sent = batch.Where(s => !s.Running).Select(s => s.SessionId).ToHashSet();
                 _pending.RemoveAll(s => sent.Contains(s.SessionId));
                 SaveState();
