@@ -15,6 +15,11 @@ internal sealed class TrayApp : ApplicationContext
     private readonly ToolStripMenuItem _syncNowItem = new("Sync now");
     private readonly ToolStripMenuItem _pairItem = new();
     private readonly ToolStripMenuItem _startupItem = new("Start with Windows") { CheckOnClick = true };
+    private readonly ToolStripMenuItem _betaItem = new("Beta updates")
+    {
+        CheckOnClick = true,
+        ToolTipText = "Get test versions before everyone else. Turning it off keeps this version until a newer stable one is out.",
+    };
     private readonly RegisteredWaitHandle _openWait;
     private readonly Updater _updater = new();
     private readonly ToolStripMenuItem _updateItem = new() { Visible = false };
@@ -38,6 +43,13 @@ internal sealed class TrayApp : ApplicationContext
         _pairItem.Click += (_, _) => TogglePairing();
         _startupItem.Checked = StartWithWindows.IsEnabled;
         _startupItem.CheckedChanged += (_, _) => StartWithWindows.Set(_startupItem.Checked);
+        _betaItem.Checked = UpdateChannel.IsBeta;
+        _betaItem.CheckedChanged += (_, _) =>
+        {
+            UpdateChannel.Set(_betaItem.Checked);
+            Log.Info($"Update channel set to {(_betaItem.Checked ? "beta" : "stable")}");
+            _updater.CheckNow();
+        };
 
         var menu = new ContextMenuStrip();
         menu.Items.AddRange(
@@ -50,6 +62,7 @@ internal sealed class TrayApp : ApplicationContext
             _syncNowItem,
             _pairItem,
             _startupItem,
+            _betaItem,
             new ToolStripSeparator(),
             new ToolStripMenuItem($"Open {new Uri(config.WebsiteUrl).Host} in browser", null, (_, _) => OpenUrl(config.WebsiteUrl)),
             new ToolStripMenuItem("Open log", null, (_, _) => OpenUrl(Log.FilePath)),

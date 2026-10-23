@@ -7,6 +7,11 @@ namespace SteamSync;
 /// Quiet self-updates from the public releases repo. A new version downloads in the background and installs the next
 /// time the app starts (Velopack applies downloaded updates on startup); "Restart to update" installs it straight away.
 /// Only active in an installed copy, never in a dev build.
+/// <para>
+/// Two channels (<see cref="UpdateChannel"/>): stable reads releases.win.json from normal releases; beta reads
+/// releases.beta.json from pre-releases, so a beta only ever reaches copies set to beta. Leaving beta never goes
+/// back a version: the copy stays on its beta build until a stable release is newer.
+/// </para>
 /// </summary>
 internal sealed class Updater : IDisposable
 {
@@ -14,7 +19,7 @@ internal sealed class Updater : IDisposable
     private static readonly TimeSpan FirstCheck = TimeSpan.FromMinutes(1); // after startup syncing has settled
     private static readonly TimeSpan Interval = TimeSpan.FromHours(6);
 
-    private readonly UpdateManager _manager = new(new GithubSource(ReleasesRepo, null, false));
+    private volatile UpdateManager _manager = CreateManager(); // replaced when the channel changes
     private readonly System.Threading.Timer _timer;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private UpdateInfo? _ready;
@@ -23,6 +28,20 @@ internal sealed class Updater : IDisposable
     public event Action<string>? UpdateReady;
 
     public Updater() => _timer = new(_ => _ = CheckAsync());
+
+    private static UpdateManager CreateManager()
+    {
+        var beta = UpdateChannel.IsBeta;
+        return new UpdateManager(new GithubSource(ReleasesRepo, null, prerelease: beta),
+            new UpdateOptions { ExplicitChannel = beta ? "beta" : "win" });
+    }
+
+    /// <summary>After the channel changes: read the new channel's feed now rather than in up to six hours.</summary>
+    public void CheckNow()
+    {
+        _manager = CreateManager();
+        if (_manager.IsInstalled) _ = CheckAsync();
+    }
 
     public bool IsInstalled => _manager.IsInstalled;
 
@@ -42,6 +61,7 @@ internal sealed class Updater : IDisposable
         try
         {
             if (_ready is not null) return; // already downloaded; it installs on the next start
+            Log.Info($"Checking for updates ({(UpdateChannel.IsBeta ? "beta" : "stable")} channel)");
             var update = await _manager.CheckForUpdatesAsync();
             if (update is null) return;
 

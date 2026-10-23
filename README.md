@@ -25,6 +25,13 @@ Measured on the Library page (2026-10-14): ~310 MB open, ~30 MB unloaded, ~0% CP
 
 ## Releasing
 
+**Beta channel.** `./release.ps1 -Channel beta` publishes `<Version>-beta.N` as a GitHub pre-release for the
+`beta` channel only (`releases.beta.json`); copies on stable never see it. A copy follows beta when it was
+installed from a beta (`GamingEnjoyer-beta-Setup.exe` on the pre-release) or when **Beta updates** is ticked in
+the tray menu; unticking it keeps the current version until a newer stable one is out. Test a beta on your own
+PC, then run `./release.ps1` (no `-Channel`) to release that version to everyone. The GitHub Actions build can
+pack either channel (Run workflow → channel).
+
 `./release.ps1` builds, packs (Velopack) and publishes `<Version>` from the csproj to the releases repo;
 installed copies download it in the background and install it on their next start (or via
 **Restart to update** in the tray menu). `./release.ps1 -NoUpload` only builds the installer locally.

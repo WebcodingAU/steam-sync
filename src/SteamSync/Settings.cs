@@ -79,6 +79,33 @@ internal static class DeviceToken
 }
 
 /// <summary>Per-user "start with Windows" entry under HKCU\...\Run.</summary>
+/// <summary>
+/// Which releases this copy updates to: stable (Velopack's default "win" channel, what everyone gets) or beta
+/// (pre-releases packed with -c beta, for testing before a release goes to everyone). A beta build
+/// (version like 0.4.0-beta.1) follows beta until told otherwise; the tray's "Beta updates" saves a choice.
+/// </summary>
+internal static class UpdateChannel
+{
+    private static readonly string FilePath = Path.Combine(AppInfo.DataDir, "update-channel.txt");
+
+    public static bool IsBetaBuild => AppInfo.Version.Contains('-');
+
+    public static bool IsBeta
+    {
+        get
+        {
+            try
+            {
+                if (File.Exists(FilePath)) return File.ReadAllText(FilePath).Trim().Equals("beta", StringComparison.OrdinalIgnoreCase);
+            }
+            catch (Exception ex) { Log.Error("Could not read the update channel", ex); }
+            return IsBetaBuild;
+        }
+    }
+
+    public static void Set(bool beta) => File.WriteAllText(FilePath, beta ? "beta" : "stable");
+}
+
 internal static class StartWithWindows
 {
     private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";

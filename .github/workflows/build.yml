@@ -8,6 +8,15 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Update channel to pack for'
+        type: choice
+        options: [stable, beta]
+        default: stable
+      beta:
+        description: 'Beta number (beta channel only): builds <Version>-beta.N'
+        default: '1'
 
 permissions:
   contents: read
@@ -28,7 +37,7 @@ jobs:
 
       - name: Build and pack
         shell: pwsh
-        run: ./release.ps1 -NoUpload
+        run: ./release.ps1 -NoUpload -Channel '${{ inputs.channel || 'stable' }}' -Beta ${{ inputs.beta || 0 }}
 
       - uses: actions/upload-artifact@v4
         with:
