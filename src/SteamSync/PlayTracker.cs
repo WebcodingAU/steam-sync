@@ -21,7 +21,7 @@ internal sealed record PlaySession(Guid SessionId, string GameKey, string Name, 
 /// </para>
 /// <para>
 /// A session starts with the first matching process and is reported as running straight away, so the site's
-/// "Playing now" shows within seconds; it ends once none has been seen for 30 seconds. Runs shorter than a minute
+/// "Playing now" shows within seconds; it ends once none has been seen for 10 seconds. Runs shorter than a minute
 /// don't count as play: one already reported is sent back with no length, which clears "Playing now". When the PC sleeps the session ends at the last check before it. Only while paired:
 /// nothing is recorded before that. Unsent sessions live in %LocalAppData%\SteamSync\play_sessions.json, so a
 /// session played offline, or one cut short by quitting the app, is sent later.
@@ -29,8 +29,11 @@ internal sealed record PlaySession(Guid SessionId, string GameKey, string Name, 
 /// </summary>
 internal sealed class PlayTracker : IDisposable
 {
-    private static readonly TimeSpan Tick = TimeSpan.FromSeconds(5);   // a start shows on the site within seconds
-    private static readonly TimeSpan Grace = TimeSpan.FromSeconds(30);
+    // Every second, so "Playing now" shows on the site within a couple of seconds. Cheap: only processes not seen
+    // before are looked at (_pidCache), which is none in most seconds.
+    private static readonly TimeSpan Tick = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan Grace = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan SaveEvery = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan MinSession = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan SleepGap = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan UploadEvery = TimeSpan.FromSeconds(60);
@@ -56,6 +59,11 @@ internal sealed class PlayTracker : IDisposable
     private DateTimeOffset _lastUpload = DateTimeOffset.MinValue;
     private DateTimeOffset _skipUploadsUntil = DateTimeOffset.MinValue;
     private int _ticking;
+    private DateTimeOffset _lastSave = DateTimeOffset.MinValue;
+    // What each running process was found to be, so a process is only looked at once: pid → (its name, the game or
+    // null). The name guards against a pid being reused. Cleared when the game list changes.
+    private readonly Dictionary<int, (string Name, Target? Hit)> _pidCache = [];
+    private Target[] _pidCacheFor = [];
 
     private sealed record Target(string Key, string Name, string Folder);
 
@@ -78,7 +86,7 @@ internal sealed class PlayTracker : IDisposable
         LoadState();
     }
 
-    public void Start() => _timer.Change(TimeSpan.FromSeconds(5), Tick);
+    public void Start() => _timer.Change(TimeSpan.FromSeconds(3), Tick);
 
     /// <summary>The games to watch, from each sync's scan. Building the exe-name fallback reads the game folders, so this
     /// runs on the sync's worker thread, never the UI's.</summary>
@@ -175,7 +183,12 @@ internal sealed class PlayTracker : IDisposable
                 foreach (var a in _active.Values.Where(a => !running.ContainsKey(a.Key) && now - a.LastSeen > Grace).ToList())
                     finishedOne |= Finish(a, a.LastSeen);
 
-                SaveState();
+                // Starts and ends are saved at once; a running session's last-seen time every 30 s is enough.
+                if (startedOne || finishedOne || (_active.Count > 0 && now - _lastSave >= SaveEvery))
+                {
+                    SaveState();
+                    _lastSave = now;
+                }
             }
 
             // A start or an end goes out at once, for "Playing now"; otherwise once a minute.
@@ -200,29 +213,45 @@ internal sealed class PlayTracker : IDisposable
         var found = new Dictionary<string, string>(StringComparer.Ordinal);
         if (targets.Length == 0) return found;
 
+        if (!ReferenceEquals(_pidCacheFor, targets))
+        {
+            _pidCache.Clear();
+            _pidCacheFor = targets;
+        }
+
         var self = Environment.ProcessId;
+        var alive = new HashSet<int>();
         foreach (var p in Process.GetProcesses())
         {
             using (p)
             {
                 if (p.Id == self || p.Id <= 4) continue;
-                Target? hit = null;
-                if (ImagePath(p.Id) is { } path)
+                string processName;
+                try { processName = p.ProcessName; } catch (InvalidOperationException) { continue; }
+                alive.Add(p.Id);
+
+                if (!_pidCache.TryGetValue(p.Id, out var known) || known.Name != processName)
                 {
-                    if (NotTheGame.IsMatch(Path.GetFileName(path))) continue;
-                    hit = targets.FirstOrDefault(t => path.StartsWith(t.Folder + "\\", StringComparison.OrdinalIgnoreCase));
+                    known = (processName, Identify(p.Id, processName, targets, byName));
+                    _pidCache[p.Id] = known;
                 }
-                else
-                {
-                    // The path is hidden from us (protected or elevated processes): go by the exe's name.
-                    string name;
-                    try { name = p.ProcessName + ".exe"; } catch (InvalidOperationException) { continue; }
-                    byName.TryGetValue(name, out hit);
-                }
-                if (hit is not null) found[hit.Key] = hit.Name;
+                if (known.Hit is { } hit) found[hit.Key] = hit.Name;
             }
         }
+        foreach (var pid in _pidCache.Keys.Where(pid => !alive.Contains(pid)).ToList()) _pidCache.Remove(pid);
         return found;
+    }
+
+    /// <summary>The game a process belongs to, or null: by where its exe is, else (path hidden) by its name.</summary>
+    private static Target? Identify(int pid, string processName, Target[] targets, Dictionary<string, Target> byName)
+    {
+        if (ImagePath(pid) is { } path)
+        {
+            if (NotTheGame.IsMatch(Path.GetFileName(path))) return null;
+            return targets.FirstOrDefault(t => path.StartsWith(t.Folder + "\\", StringComparison.OrdinalIgnoreCase));
+        }
+        // The path is hidden from us (protected or elevated processes): go by the exe's name.
+        return byName.TryGetValue(processName + ".exe", out var hit) && !NotTheGame.IsMatch(processName + ".exe") ? hit : null;
     }
 
     private bool FinishAll(DateTimeOffset at)
