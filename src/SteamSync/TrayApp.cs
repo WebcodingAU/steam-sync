@@ -8,6 +8,7 @@ internal sealed class TrayApp : ApplicationContext
 {
     private readonly AppConfig _config;
     private readonly SyncService _sync;
+    private readonly PlayTracker _play;
     private readonly SynchronizationContext _ui;
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _statusItem = new() { Enabled = false };
@@ -38,6 +39,8 @@ internal sealed class TrayApp : ApplicationContext
         _config = config;
         _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
         _sync = new SyncService(config);
+        _play = new PlayTracker(config);
+        _sync.Scanned += _play.UpdateGames;
 
         _syncNowItem.Click += async (_, _) => await _sync.SyncNowAsync();
         _pairItem.Click += (_, _) => TogglePairing();
@@ -85,6 +88,7 @@ internal sealed class TrayApp : ApplicationContext
         _sync.StatusChanged += s => _ui.Post(_ => Render(s), null);
         Render(_sync.Status);
         _sync.Start();
+        _play.Start();
         _updater.Start();
 
         StartWithWindows.RefreshPathIfEnabled();
@@ -164,6 +168,7 @@ internal sealed class TrayApp : ApplicationContext
         _library?.Close();
         _tray.Visible = false;
         _tray.Dispose();
+        _play.Dispose();
         _sync.Dispose();
         base.ExitThreadCore();
     }

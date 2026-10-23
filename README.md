@@ -89,6 +89,19 @@ non-Steam games that aren't in Steam, and Windows runs `SteamSync.exe --play <li
   need it to sign in); otherwise its Steam shortcut, if it has one.
 - Problems (not installed here, no known way to start it) are shown in a message box.
 
+## Play time and "Playing now"
+
+`PlayTracker.cs` checks the running processes every 15 seconds. A game is running when a process's exe sits
+inside its install folder (launchers and `gamelaunchhelper.exe` hand over to the real exe, so the launched
+process isn't timed); a process whose path is hidden (some anti-cheat-protected games) is matched by exe name
+against the exes in each game folder. Crash reporters, updaters, installers and anti-cheat services don't count.
+
+- A session ends a minute after the last process closes; runs under a minute aren't kept; sleep ends it.
+- About once a minute the app sends running and finished sessions to `record_play_sessions`
+  (`sql/2026-10-23_play_sessions.sql` in the website repo). Unsent ones wait in `play_sessions.json`.
+- Steam games are reported too, but the site only uses them for "Playing now": Steam counts their time.
+- Nothing is recorded before the PC is paired.
+
 ## Pairing
 
 1. On gamingenjoyer.com, sign in with Steam → **Settings** → **Your PCs** → **Get a pairing code**.

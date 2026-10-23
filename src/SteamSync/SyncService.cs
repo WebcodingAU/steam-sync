@@ -33,6 +33,9 @@ internal sealed class SyncService : IDisposable
     private int _unknownDeviceStrikes; // consecutive "not paired" answers; the token is only dropped on the second
 
     public event Action<SyncStatus>? StatusChanged;
+
+    /// <summary>Raised (on a worker thread) after each scan, before sending it: what's installed, for PlayTracker.</summary>
+    public event Action<SteamSnapshot, NonSteamSnapshot?>? Scanned;
     public SyncStatus Status { get; private set; }
 
     public SyncService(AppConfig config)
@@ -91,6 +94,8 @@ internal sealed class SyncService : IDisposable
 
             var snapshot = SteamLibrary.Scan();
             var nonSteam = ScanNonSteam(snapshot);
+            try { Scanned?.Invoke(snapshot, nonSteam); }
+            catch (Exception ex) { Log.Error("Updating the games to watch failed", ex); }
             // Watch the non-Steam folders even when the scan failed, so Steam fixing shortcuts.vdf triggers a sync.
             var shortcutDirs = nonSteam?.ShortcutConfigDirs
                 ?? TryFindFolders("Steam shortcut folders", () => NonSteamLibrary.FindShortcutConfigDirs(snapshot.SteamPath, snapshot.SteamId))

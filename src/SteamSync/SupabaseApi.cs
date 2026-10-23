@@ -80,6 +80,11 @@ internal sealed class SupabaseApi : IDisposable
         }, ct);
     }
 
+    /// <summary>Play sessions (PlayTracker): finished ones not sent yet and every running one. PGRST202 means the
+    /// play_sessions migration isn't applied yet.</summary>
+    public Task<int> RecordPlaySessionsAsync(string token, IReadOnlyList<PlaySession> sessions, CancellationToken ct = default) =>
+        CallAsync<int>("record_play_sessions", new { p_token = token, p_sessions = sessions }, ct);
+
     private async Task<T> CallAsync<T>(string function, object body, CancellationToken ct)
     {
         using var response = await _http.PostAsJsonAsync(function, body, Json, ct);
