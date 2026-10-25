@@ -28,6 +28,10 @@ namespace SteamSync;
 /// Without that (older helper, or a connection made before the helper started) the ping is to the relay
 /// (exitlag_relay): the first leg only, and the sample says so.
 /// </para>
+/// <para>
+/// Each sample also carries the PC's load (SystemStats): CPU, GPU, memory, an approximate responsiveness and the
+/// game's own CPU, so the page can show whether a lag spike was the network or the PC.
+/// </para>
 /// </summary>
 internal sealed class LivePing : IDisposable
 {
@@ -49,6 +53,7 @@ internal sealed class LivePing : IDisposable
     private readonly UnreachableProbe _unreachable = new();
     private readonly HopProber _hops;
     private readonly GameLiftBeacons _beacons = new();
+    private readonly SystemStats _system = new();
     private readonly HashSet<IPAddress> _gameBeacons = [];   // GameLift beacons the current game pinged (beacon_estimate)
     private string? _beaconsFor;                              // the game they belong to
     private readonly Dictionary<IPAddress, int> _icmpFailures = [];              // pings in a row a server didn't answer
@@ -417,6 +422,7 @@ internal sealed class LivePing : IDisposable
             ["via_exitlag"] = viaExitLag,
             ["exitlag_running"] = exitLag.Length > 0,
             ["helper"] = helper,
+            ["system"] = _system.Sample(game.Pids),
             ["note"] = note,
             ["app_version"] = AppInfo.Version,
         };
@@ -611,6 +617,7 @@ internal sealed class LivePing : IDisposable
         _relayPinger.Dispose();
         _hops.Dispose();
         _cloud.Dispose();
+        _system.Dispose();
         _api?.Dispose();
     }
 }
