@@ -46,7 +46,7 @@ internal static class Program
             return 0;
         }
 
-        // Diagnostics: SteamSync.exe --probe <ip> <port> <steam|other>[-noping] out.txt [seconds] runs live ping's measuring
+        // Diagnostics: SteamSync.exe --probe <ip> <port> <steam|other>[-udp][-noping] out.txt [seconds] runs live ping's measuring
         // of one server (ping, then the fallbacks for servers that ignore it) once a second (default 20 s), and exits.
         // -noping treats the server as ignoring ping, to try the fallbacks on one that answers it.
         if (args.Length is 5 or 6 && args[0] == "--probe" && System.Net.IPAddress.TryParse(args[1], out var probeIp) && int.TryParse(args[2], out var probePort))
@@ -57,7 +57,7 @@ internal static class Program
             using var output = new StreamWriter(args[4]);
             for (var i = 0; i < seconds; i++, Thread.Sleep(1000))
             {
-                output.WriteLine(live.ProbeNowAsync(probeIp, probePort, args[3].StartsWith("steam"), skipPing: args[3].EndsWith("-noping")).GetAwaiter().GetResult());
+                output.WriteLine(live.ProbeNowAsync(probeIp, probePort, args[3].StartsWith("steam"), udp: args[3].Contains("-udp"), skipPing: args[3].EndsWith("-noping")).GetAwaiter().GetResult());
                 output.Flush();
             }
             return 0;

@@ -119,13 +119,16 @@ game stops it sends `null`, which clears the PC's live row.
   region whenever it's known (from AWS's `ip-ranges.json`, fetched on first need and cached for a week):
   1. `steam_query` (Steam games): an A2S_INFO query to the game port, the next port or 27015, answered by the game
      server itself, so real latency (`SteamQuery.cs`). Gives up on a silent server for 10 minutes.
-  2. `hop_estimate` with `hop.same_network`: the last router that answers on the route (tracert style,
+  2. `udp_unreachable` (UDP servers): one byte to a closed port next to the game's (+1, +2, +3, −1). Where the server's
+     firewall lets it through, the server's own network stack answers "port unreachable", so that's real latency
+     too (`UnreachableProbe.cs`). WARDOGS: game port 4192 on an AWS GLOBAL address, port 4193 answers in ~23 ms.
+  3. `hop_estimate` with `hop.same_network`: the last router that answers on the route (tracert style,
      `HopProber.cs`), when it's in the server's own AWS region.
-  3. `beacon_estimate`: for a region-less server (AWS GLOBAL, like Hunger Playtest's), the nearest AWS GameLift region
+  4. `beacon_estimate`: for a region-less server (AWS GLOBAL, like Hunger Playtest's), the nearest AWS GameLift region
      beacon (UDP echo on port 7770) that the game itself pinged before joining (`GameLiftBeacons.cs`). Hunger from
      Australia: Sydney, ~20 ms.
-  4. `cloud_estimate`: the TCP handshake time to the public endpoint of the server's AWS region (`CloudRegions.cs`).
-  5. `hop_estimate` with any other usable hop: AWS's edge (`hop.edge`) or a router far from home. That's a lower bound;
+  5. `cloud_estimate`: the TCP handshake time to the public endpoint of the server's AWS region (`CloudRegions.cs`).
+  6. `hop_estimate` with any other usable hop: AWS's edge (`hop.edge`) or a router far from home. That's a lower bound;
      from Australia, a far hop came in 25–35 ms under the region estimate.
   Anything left shows as lost, with a note saying why.
 - **ExitLag:** if the game connects to a port ExitLag listens on (its local proxy), or the game has no traffic of
@@ -134,7 +137,7 @@ game stops it sends `null`, which clears the PC's live row.
   (`exitlag_relay`), which is only the first leg.
 - `SteamSync.exe --live-ping out.jsonl [seconds]` writes the samples it would send, without sending them.
   `SteamSync.exe --cloud-region <ip> out.txt` shows the region an address is in and times its endpoint.
-  `SteamSync.exe --probe <ip> <port> <steam|other>[-noping] out.txt [seconds]` runs the measuring of one server.
+  `SteamSync.exe --probe <ip> <port> <steam|other>[-udp][-noping] out.txt [seconds]` runs the measuring of one server.
 
 ### Ping helper (`src/PingHelper`)
 
@@ -193,7 +196,7 @@ Nothing leaves the PC until you pair it. After pairing, each sync sends gamingen
 While a game runs, it also sends the game, when it started and stopped (play sessions), and once a second a live
 ping sample: the game, the ping, the address and port of the server it measured, packet rates, and whether ExitLag
 is routing the game. To measure that ping, it pings the game server. For servers that don't answer, it may also:
-- send them a Steam server query,
+- send them a Steam server query, or one byte to a closed port next to the game's,
 - ping the routers on the way to them,
 - echo the AWS GameLift beacons the game itself pinged,
 - download AWS's public address list (ip-ranges.amazonaws.com) and connect to that AWS region's public endpoint,
