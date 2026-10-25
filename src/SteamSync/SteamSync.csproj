@@ -22,6 +22,7 @@
   <ItemGroup>
     <EmbeddedResource Include="appsettings.json" LogicalName="SteamSync.appsettings.json" />
     <EmbeddedResource Include="app.ico" LogicalName="SteamSync.app.ico" />
+    <EmbeddedResource Include="game-profiles.json" LogicalName="SteamSync.game-profiles.json" />
   </ItemGroup>
 
   <ItemGroup>
