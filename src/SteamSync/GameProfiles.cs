@@ -5,8 +5,10 @@ using System.Text.Json;
 namespace SteamSync;
 
 /// <summary>
-/// What a game profile says about some of a game's servers: where they really are (Region, for people) and a host in
-/// that region whose TCP handshake LivePing times instead of the server (Target, port 443).
+/// What a game profile says about some of a game's servers: where they really are (Region, for people) and what
+/// LivePing times instead of the server (Target): a host (TCP handshake on port 443), an https gcping service, or
+/// "region": the endpoint of whichever cloud region the server is in (CloudRegions), for a game whose servers sit
+/// straight in a cloud's regions (ARC Raiders: Google Cloud). Servers are CIDR prefixes, or "*" for all of the game's.
 /// </summary>
 internal sealed record GameProfile(string Name, string[] Keys, string[] Servers, string Region, string Target, string? Note);
 
@@ -65,9 +67,10 @@ internal sealed class GameProfiles
         }
     }
 
-    /// <summary>Whether the address is in "a.b.c.d/n" (or is "a.b.c.d").</summary>
+    /// <summary>Whether the address is in "a.b.c.d/n" (or is "a.b.c.d", or the prefix is "*").</summary>
     private static bool InPrefix(IPAddress ip, string prefix)
     {
+        if (prefix == "*") return true;
         var slash = prefix.IndexOf('/');
         if (!IPAddress.TryParse(slash < 0 ? prefix : prefix[..slash], out var net)) return false;
         var a = ip.GetAddressBytes();

@@ -32,7 +32,7 @@ internal static class Program
         }
 
         // Diagnostics: SteamSync.exe --cloud-region <ip> out.txt writes which cloud region the address is in and five
-        // timings of that region's endpoint (live ping's estimate for servers that drop ping), and exits.
+        // timings of that region's endpoint (what a game profile with that target would read), and exits.
         if (args is ["--cloud-region", var regionIp, var regionOut] && System.Net.IPAddress.TryParse(regionIp, out var address))
         {
             using var cloud = new CloudRegions();

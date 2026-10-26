@@ -10,8 +10,8 @@ internal sealed record CdnNetwork(int Asn, string Name);
 /// Whether a game server's address belongs to an anycast/CDN network (Cloudflare and the like). Such an address is
 /// answered by the network's nearest edge, not by the server: AION 2's 193.202.112.61 is Cloudflare (AS13335), so
 /// ping, and even the game's own TCP RTT (Cloudflare ends TCP at the edge), read 22 ms from Sydney while the server is
-/// in the US. LivePing then shows those numbers as a lower bound (cdn_edge), unless a game profile says where the
-/// server really is (GameProfiles).
+/// in the US. LivePing doesn't show those numbers: only a game profile that says where the servers really are
+/// (GameProfiles) gives such a server's ping, else it's not_configured.
 /// <para>
 /// The address's network (ASN) comes from Team Cymru's IP-to-ASN DNS service (a TXT lookup of
 /// d.c.b.a.origin.asn.cymru.com), because these CDNs also announce customers' own prefixes (Cloudflare Spectrum's

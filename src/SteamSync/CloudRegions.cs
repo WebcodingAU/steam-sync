@@ -5,9 +5,9 @@ using System.Text.Json;
 
 namespace SteamSync;
 
-/// <summary>A cloud region a server sits in, and the public endpoint in that region that LivePing times instead.
-/// Code "GLOBAL" (no endpoint) is an AWS address AWS doesn't tie to a region (anycast or accelerator style), so there
-/// is nothing in its region to time: Hunger Playtest's servers (54.115.0.0/16) are in such a block.</summary>
+/// <summary>A cloud region a server sits in, and a public endpoint in that region that can be timed (a game profile's
+/// target can be one). Code "GLOBAL" (no endpoint) is an address its cloud doesn't tie to a region (anycast or
+/// accelerator style): Hunger Playtest's servers (54.115.0.0/16) are in such a block.</summary>
 internal sealed record CloudRegion(string Provider, string Code, string? Name, string? Endpoint)
 {
     public bool IsGlobal => Code == "GLOBAL";
@@ -15,9 +15,9 @@ internal sealed record CloudRegion(string Provider, string Code, string? Name, s
 
 /// <summary>
 /// For game servers that don't answer ping (AWS blocks ICMP by default, e.g. Hunger Playtest's servers): which cloud
-/// region the server is in, and how long a TCP handshake to that region's public API endpoint takes. That endpoint
-/// sits in the same region as the server, so the handshake time (one round trip) is a fair estimate of the server's
-/// ping. LivePing labels it as an estimate.
+/// region the server is in, so live ping can say what a game profile for it needs (live ping no longer estimates from
+/// the region on its own: real measurements and profiles only), and the time to a region endpoint, which game
+/// profiles use as their target: a TCP handshake to an AWS region's API endpoint, or a gcping request (below).
 /// <para>
 /// AWS: its address ranges are public (ip-ranges.json, with a region per prefix). The file is about 3 MB, so it is
 /// fetched only the first time a server stops answering ping, and kept in %LocalAppData%\SteamSync\aws-ip-ranges.json
@@ -203,7 +203,7 @@ internal sealed class CloudRegions : IDisposable
         var tmp = cache + ".tmp";
         await File.WriteAllTextAsync(tmp, json);
         File.Move(tmp, cache, overwrite: true);
-        Log.Info($"Downloaded {what} (for live ping estimates)");
+        Log.Info($"Downloaded {what} (for live ping)");
         return json;
     }
 
@@ -242,13 +242,13 @@ internal sealed class CloudRegions : IDisposable
             }
             catch (Exception ex) when (ex is HttpRequestException or JsonException or IOException or TaskCanceledException)
             {
-                Log.Error("Could not load gcping's region list; Google Cloud servers get no estimate for now", ex);
+                Log.Error("Could not load gcping's region list; Google Cloud regions have no endpoint to time for now", ex);
             }
             lock (_gate) (_gcp4, _gcp6, _gcpEndpoints) = (g4, g6, endpoints);
         }
         catch (Exception ex)
         {
-            Log.Error("Could not load Google Cloud's address ranges; live ping can't estimate Google Cloud servers for now", ex);
+            Log.Error("Could not load Google Cloud's address ranges; live ping can't name Google Cloud regions for now", ex);
         }
 
         try
@@ -275,7 +275,7 @@ internal sealed class CloudRegions : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Error("Could not load AWS's address ranges; live ping can't estimate AWS servers for now", ex);
+            Log.Error("Could not load AWS's address ranges; live ping can't name AWS regions for now", ex);
             lock (_gate) _loadFailedAt = DateTimeOffset.UtcNow;
         }
     }
