@@ -9,7 +9,7 @@ namespace SteamSync;
 /// <summary>One play session as record_play_sessions takes it (snake_case on the wire).</summary>
 internal sealed record PlaySession(Guid SessionId, string GameKey, string Name, DateTimeOffset StartedAt, DateTimeOffset EndedAt, bool Running);
 
-/// <summary>A game running at the last check, with the processes that matched it (for LivePing).</summary>
+/// <summary>A game running at the last check, with the processes that matched it.</summary>
 internal sealed record RunningGame(string Key, string Name, IReadOnlyList<int> Pids);
 
 /// <summary>
@@ -99,8 +99,6 @@ internal sealed class PlayTracker : IDisposable
     /// <summary>The games running at the last check (once a second), oldest session first. Empty before pairing.</summary>
     public IReadOnlyList<RunningGame> Running { get; private set; } = [];
 
-    /// <summary>The games running right now, without recording anything (SteamSync.exe --live-ping).</summary>
-    public IReadOnlyList<RunningGame> DetectNow() => RunningGames().Values.ToList();
 
     /// <summary>The games to watch, from each sync's scan. Building the exe-name fallback reads the game folders, so this
     /// runs on the sync's worker thread, never the UI's.</summary>
