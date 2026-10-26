@@ -28,8 +28,9 @@ namespace SteamSync;
 /// its own relay, so the system tables never show the real game server. The helper (1.1.0+) still sees where the
 /// game's connection was headed before ExitLag redirected it (PingHelperClient.LatestRedirects); then the game server
 /// itself is measured by the normal internet route (method exitlag_server), with ExitLag's relay measured alongside.
-/// Without that (older helper, or a connection made before the helper started) only the relay is known: the sample is
-/// not_configured, with the relay's ping in relay.
+/// Without that (older helper, or a connection made before the helper started), or when the game server it sees isn't
+/// configured, ExitLag's relay is the figure (method exitlag_relay; probe not_configured when the server was seen):
+/// the first leg of ExitLag's route, which the user preferred to a bare "Not configured".
 /// </para>
 /// <para>
 /// Anycast/CDN servers (CdnNetworks: AION 2 is behind Cloudflare) answer from the nearest edge, so anything sent to them
@@ -228,17 +229,21 @@ internal sealed class LivePing : IDisposable
                 flow = flows?.FirstOrDefault(f => f.Pid == real.Pid && f.LocalPort == real.LocalPort);
                 probe = serverTask!.Result;
                 (ip, port, proto, serverPid, ping) = (real.Ip, real.Port, flow is { Udp: true } ? "udp" : "tcp", real.Pid, probe.Ms);
-                method = probe.Probe == "not_configured" ? "not_configured" : "exitlag_server";
+                method = "exitlag_server";
+                // The game server isn't configured: ExitLag's relay is the figure instead (the user's call), the first leg
+                // of ExitLag's route. A relay that misses a ping counts as loss rather than dropping to not_configured.
+                if (probe.Probe == "not_configured")
+                    (method, ping) = relay is null ? ("not_configured", null) : ("exitlag_relay", relay.Ping);
                 note = "ExitLag is routing this game. This is the ping to the game server by your normal internet route; "
                     + "ExitLag's own route to it may be a little faster."
                     + (relay?.Ping is { } relayPing ? $" ExitLag's relay is {Math.Round(relayPing)} ms away." : "");
             }
             else if (relay is not null)
             {
-                // Only ExitLag's first leg is known: not the game's ping, so not shown as one (relay has it).
-                (method, flow) = ("not_configured", relay.Flow);
-                note = "Not configured: ExitLag is routing this game and the game server behind it can't be seen, only ExitLag's relay "
-                    + "(the first leg)."
+                // Only ExitLag's first leg is known: its relay is the figure (the user's call), like an unconfigured server.
+                (method, flow, ping) = ("exitlag_relay", relay.Flow, relay.Ping);
+                note = "ExitLag is routing this game and the game server behind it can't be seen, so this is the ping to ExitLag's "
+                    + "relay (the first leg of its route)."
                     + (PingHelperClient.State == HelperState.Outdated ? " Update the ping helper (tray menu) to see the game server itself."
                         : flows is not null ? " Reconnect in the game (relog) so the ping helper can see which server it uses." : "");
             }
@@ -312,6 +317,7 @@ internal sealed class LivePing : IDisposable
             note = viaExitLag
                 ? $"ExitLag is routing this game. {how}" + (probe!.Probe switch
                 {
+                    "not_configured" when method == "exitlag_relay" => " Until then, this is the ping to ExitLag's relay (the first leg of its route).",
                     "icmp" or "not_configured" => "",
                     "profile_estimate" => " ExitLag's own route there may be a little faster.",
                     _ => " By your normal route; ExitLag's own may be a little faster.",
@@ -334,7 +340,7 @@ internal sealed class LivePing : IDisposable
         double? jitter = null;
         if (values.Count >= 2)
             jitter = values.Zip(values.Skip(1), (a, b) => Math.Abs(b - a)).Average();
-        var pinged = method is "icmp" or "exitlag_server" or "steam_query" or "udp_unreachable" or "profile_estimate";
+        var pinged = method is "icmp" or "exitlag_server" or "exitlag_relay" or "steam_query" or "udp_unreachable" or "profile_estimate";
         if (pinged && _window.Count >= 5 && _window.TakeLast(5).All(v => v is null))
             note ??= "This server doesn't answer ping (ICMP), so its ping can't be measured this way.";
 
