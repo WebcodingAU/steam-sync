@@ -31,6 +31,24 @@ internal static class Program
             return 0;
         }
 
+        // Diagnostics: SteamSync.exe --system-stats out.jsonl [seconds] [pid...] writes the PC's load as a beta build
+        // sends it, once a second (default 10 s), and exits. The pids stand in for a game's processes.
+        if (args.Length >= 2 && args[0] == "--system-stats")
+        {
+            var seconds = args.Length >= 3 && int.TryParse(args[2], out var s) ? s : 10;
+            var pids = args.Skip(3).Select(a => int.TryParse(a, out var p) ? p : 0).Where(p => p > 0).ToList();
+            using var stats = new SystemStats();
+            using var output = new StreamWriter(args[1]);
+            for (var i = 0; i <= seconds; i++, Thread.Sleep(1000))
+            {
+                var line = stats.Sample(pids).ToJsonString();
+                if (i == 0) continue; // the first sample only starts the counters
+                output.WriteLine(line);
+                output.Flush();
+            }
+            return 0;
+        }
+
         // The site's Play button: Windows runs SteamSync.exe --play gamingenjoyer://play/<key>. Handled here, before the
         // one-copy check, so it works whether or not the tray app is running; this process starts the game and exits.
         if (args is ["--play", var link])

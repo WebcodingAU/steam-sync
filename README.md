@@ -103,6 +103,14 @@ against the exes in each game folder. Crash reporters, updaters, installers and 
 - Steam games are reported too, but the site only uses them for "Playing now": Steam counts their time.
 - Nothing is recorded before the PC is paired.
 
+## PC load (beta builds only)
+
+While a game runs, a beta build (a version with `-beta` in it) sends the PC's load once a second (`PcLoad.cs`,
+`SystemStats.cs`): CPU, GPU (busiest engine), memory load, an approximate responsiveness and the game's own CPU,
+the numbers Process Lasso graphs. It goes through `report_live_ping` (the live ping table) as a sample with a
+`system` object and `method` `pc_load`, and `null` when the game stops. Stable builds never start it.
+`SteamSync.exe --system-stats out.jsonl [seconds] [pid...]` writes the samples without sending them.
+
 ## Old ping helper
 
 Live ping (0.4.0-beta.6 to beta.17) has been removed. Its ping helper was a Windows service in
@@ -140,7 +148,8 @@ Nothing leaves the PC until you pair it. After pairing, each sync sends gamingen
 - the installed Steam games (app IDs) and the detected non-Steam games (name, launcher, launch ID
   and install folder).
 
-While a game runs, it also sends the game and when it started and stopped (play sessions).
+While a game runs, it also sends the game and when it started and stopped (play sessions). Beta builds also send,
+once a second while a game runs, how busy the PC is (CPU, graphics card and memory use).
 
 The app also checks the [releases repo](https://github.com/WebcodingAU/gaming-enjoyer-releases) on
 GitHub for updates, and the Library window loads gamingenjoyer.com. Nothing else is sent anywhere.
