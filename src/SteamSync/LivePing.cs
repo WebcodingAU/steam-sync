@@ -198,10 +198,17 @@ internal sealed class LivePing : IDisposable
 
         // ExitLag routes the game when the game's TCP goes to a port ExitLag listens on (its local proxy). Its UDP
         // routing can't be seen the same way, so a game with no traffic of its own while ExitLag's relay is busy counts too.
+        // So does a UDP game whose packets ExitLag takes below the socket (its NDIS filter, ARC Raiders): the game still
+        // seems to send straight to its server, but each packet is sent again through ExitLag's relay, so ExitLag's UDP
+        // out keeps up with the game's in the same second (when it routes nothing, ExitLag sends a few packets a second).
         var exitLagPorts = tcp.Where(r => r.Listening && exitLag.Contains(r.Pid)).Select(r => r.LocalPort).ToHashSet();
+        var busiest = gameFlows.FirstOrDefault();
+        var udpCarried = exitLag.Length > 0 && busiest is { Udp: true, PacketsOut: >= 10 }
+            && exitLagFlows.Where(f => f.Udp).Sum(f => f.PacketsOut) >= busiest.PacketsOut * 0.7;
         var viaExitLag = exitLag.Length > 0
             && (tcp.Any(r => pids.Contains(r.Pid) && !r.Listening && IPAddress.IsLoopback(r.Remote) && exitLagPorts.Contains(r.RemotePort))
-                || (flows is not null && gameFlows.Count == 0 && exitLagFlows.Sum(f => f.Packets) >= 20));
+                || (flows is not null && gameFlows.Count == 0 && exitLagFlows.Sum(f => f.Packets) >= 20)
+                || udpCarried);
 
         string method;
         IPAddress? ip = null;
@@ -216,9 +223,9 @@ internal sealed class LivePing : IDisposable
 
         if (viaExitLag)
         {
-            // The relay (first leg) and, when the helper saw where the game's connection was really headed, the game
-            // server itself, measured at the same time.
-            var real = RealServer(pids, flows);
+            // The relay (first leg) and, when the helper saw where the game's connection was really headed (or, for UDP
+            // ExitLag carries below the socket, where the game sends it), the game server itself, measured at the same time.
+            var real = RealServer(pids, flows) ?? (udpCarried ? new HelperRedirect(busiest!.Pid, busiest.LocalPort, busiest.Ip, busiest.RemotePort) : null);
             var relayTask = MeasureRelayAsync(exitLagFlows, exitLag, tcp);
             var realUdp = real is not null && flows?.FirstOrDefault(f => f.Pid == real.Pid && f.LocalPort == real.LocalPort) is { Udp: true };
             var serverTask = real is null ? null : MeasureServerAsync(game.Key, real.Ip, real.Port, steamGame, realUdp);
@@ -449,6 +456,7 @@ internal sealed class LivePing : IDisposable
             },
             ["flow"] = flow is null ? null : Traffic([flow]),
             ["game_traffic"] = gameTraffic is null ? null : Traffic(gameTraffic),
+            ["exitlag_traffic"] = exitLagFlows.Count == 0 ? null : Traffic(exitLagFlows),
             ["tcp_rtt"] = rtt is null ? null : new JsonObject
             {
                 ["smoothed_ms"] = Round(rtt.SmoothedMs),
