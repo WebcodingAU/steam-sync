@@ -10,7 +10,8 @@ namespace SteamSync;
 /// <para>
 /// CPU is "% Processor Utility" (what Task Manager and Process Lasso show, frequency included, capped at 100). GPU is
 /// the busiest engine of any GPU, each engine's use summed over its processes, the way Task Manager does it. Memory
-/// load is Windows' own figure (GlobalMemoryStatusEx).
+/// load is Windows' own figure (GlobalMemoryStatusEx). The CPU's speed is Task Manager's too (base clock times
+/// "% Processor Performance"); the GPU's clock comes from NVIDIA's driver (GpuClock), so other GPUs have none.
 /// </para>
 /// <para>
 /// Responsiveness is Process Lasso's own formula, which isn't published, so this is an approximation from how many
@@ -29,7 +30,7 @@ internal sealed class SystemStats : IDisposable
 
     private readonly object _lock = new();
     private readonly System.Threading.Timer _queueTimer;
-    private IntPtr _query, _cpu, _gpu, _queueQuery, _queue;
+    private IntPtr _query, _cpu, _cpuPerf, _cpuBase, _gpu, _queueQuery, _queue;
     private bool _running, _disposed;
     private long _lastSampleAt;
     private double _queueSum, _queueMax;
@@ -53,11 +54,13 @@ internal sealed class SystemStats : IDisposable
             if (started) StartLocked();
 
             // Just started: CPU and GPU are rates, so the first numbers come with the next sample.
-            double? cpu = null, gpu = null;
+            double? cpu = null, gpu = null, cpuGhz = null;
             string? gpuEngine = null;
             if (!started && _query != IntPtr.Zero && PdhCollectQueryData(_query) == 0)
             {
                 cpu = Value(_cpu) is { } c ? Math.Min(100, c) : null;
+                // The CPU's speed now, like Task Manager's "Speed": its base clock times how fast it runs against it.
+                if (Value(_cpuBase) is { } baseMhz and > 0 && Value(_cpuPerf) is { } perf) cpuGhz = baseMhz * perf / 100 / 1000;
                 (gpu, gpuEngine) = BusiestEngine();
             }
 
@@ -75,6 +78,8 @@ internal sealed class SystemStats : IDisposable
             return new JsonObject
             {
                 ["cpu_pct"] = Round(cpu),
+                ["cpu_ghz"] = cpuGhz is { } ghz ? Math.Round(ghz, 2) : null,
+                ["gpu_mhz"] = GpuClock.GraphicsMhz(),
                 ["gpu_pct"] = Round(gpu),
                 ["gpu_engine"] = gpuEngine,
                 ["mem_pct"] = haveMemory ? (int)memory.MemoryLoad : null,
@@ -95,6 +100,8 @@ internal sealed class SystemStats : IDisposable
         if (_query != IntPtr.Zero)
         {
             if (PdhAddEnglishCounter(_query, @"\Processor Information(_Total)\% Processor Utility", IntPtr.Zero, out _cpu) != 0) _cpu = IntPtr.Zero;
+            if (PdhAddEnglishCounter(_query, @"\Processor Information(_Total)\% Processor Performance", IntPtr.Zero, out _cpuPerf) != 0) _cpuPerf = IntPtr.Zero;
+            if (PdhAddEnglishCounter(_query, @"\Processor Information(_Total)\Processor Frequency", IntPtr.Zero, out _cpuBase) != 0) _cpuBase = IntPtr.Zero;
             if (PdhAddEnglishCounter(_query, @"\GPU Engine(*)\Utilization Percentage", IntPtr.Zero, out _gpu) != 0) _gpu = IntPtr.Zero;
             PdhCollectQueryData(_query); // rates need two reads: this is the first
         }
@@ -112,7 +119,7 @@ internal sealed class SystemStats : IDisposable
         _queueTimer.Change(Timeout.Infinite, Timeout.Infinite);
         if (_query != IntPtr.Zero) PdhCloseQuery(_query);
         if (_queueQuery != IntPtr.Zero) PdhCloseQuery(_queueQuery);
-        _query = _cpu = _gpu = _queueQuery = _queue = IntPtr.Zero;
+        _query = _cpu = _cpuPerf = _cpuBase = _gpu = _queueQuery = _queue = IntPtr.Zero;
         _queueSum = _queueMax = 0;
         _queueCount = 0;
         _running = false;
@@ -252,4 +259,48 @@ internal sealed class SystemStats : IDisposable
 
     [DllImport("kernel32.dll")]
     private static extern bool GlobalMemoryStatusEx(ref MemoryStatusEx status);
+}
+
+/// <summary>
+/// The GPU's graphics clock in MHz, from NVIDIA's management library (nvml.dll, installed in System32 with every NVIDIA
+/// driver). The first NVIDIA GPU; null without one, or when the library can't be loaded (then it isn't tried again).
+/// </summary>
+internal static class GpuClock
+{
+    private const int NvmlClockGraphics = 0;
+    private static bool _tried, _failed;
+    private static IntPtr _device;
+
+    public static int? GraphicsMhz()
+    {
+        if (_failed) return null;
+        try
+        {
+            if (!_tried)
+            {
+                _tried = true;
+                if (nvmlInit_v2() != 0 || nvmlDeviceGetHandleByIndex_v2(0, out _device) != 0)
+                {
+                    _failed = true;
+                    return null;
+                }
+                Log.Info("GPU clock: reading it from NVIDIA's driver");
+            }
+            return nvmlDeviceGetClockInfo(_device, NvmlClockGraphics, out var mhz) == 0 ? (int)mhz : null;
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
+        {
+            _failed = true; // no NVIDIA driver: no clock
+            return null;
+        }
+    }
+
+    [DllImport("nvml.dll")]
+    private static extern int nvmlInit_v2();
+
+    [DllImport("nvml.dll")]
+    private static extern int nvmlDeviceGetHandleByIndex_v2(uint index, out IntPtr device);
+
+    [DllImport("nvml.dll")]
+    private static extern int nvmlDeviceGetClockInfo(IntPtr device, int type, out uint clock);
 }
