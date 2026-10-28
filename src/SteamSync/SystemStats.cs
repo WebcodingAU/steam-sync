@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 using System.Text.Json.Nodes;
 
@@ -11,7 +12,8 @@ namespace SteamSync;
 /// CPU is "% Processor Utility" (what Task Manager and Process Lasso show, frequency included, capped at 100). GPU is
 /// the busiest engine of any GPU, each engine's use summed over its processes, the way Task Manager does it. Memory
 /// load is Windows' own figure (GlobalMemoryStatusEx). The CPU's speed is Task Manager's too (base clock times
-/// "% Processor Performance"); the GPU's clock comes from NVIDIA's driver (GpuClock), so other GPUs have none.
+/// "% Processor Performance"); the GPU's clock comes from NVIDIA's driver (GpuClock), so other GPUs have none. The
+/// game's FPS comes from RivaTuner, when it runs (FrameRate).
 /// </para>
 /// <para>
 /// Responsiveness is Process Lasso's own formula, which isn't published, so this is an approximation from how many
@@ -90,6 +92,7 @@ internal sealed class SystemStats : IDisposable
                 ["ready_queue_max"] = Round(queueMax),
                 ["cores"] = cores,
                 ["game_cpu_pct"] = Round(GameCpu(gamePids, cores)),
+                ["fps"] = FrameRate.Read(gamePids) is { } fps ? Math.Round(fps) : null, // from RivaTuner (FrameRate): null without it
             };
         }
     }
@@ -303,4 +306,49 @@ internal static class GpuClock
 
     [DllImport("nvml.dll")]
     private static extern int nvmlDeviceGetClockInfo(IntPtr device, int type, out uint clock);
+}
+
+/// <summary>
+/// The game's frame rate from RivaTuner Statistics Server (installed with MSI Afterburner), which counts every frame
+/// of each process it hooks and publishes it in its shared memory ("RTSSSharedMemoryV2", readable without admin
+/// rights). Per process: frames over RTSS's own window (about a second), so FPS = frames / that window. (Its
+/// dwFrameTime isn't used: it sat at the same 4.22 ms for AION 2 at 102 fps and for ExitLag's window.) Null without
+/// RTSS, when it doesn't hook the game, or when the game's entry stopped updating (minimised, loading) for 3 s. With
+/// several of the game's processes hooked, the one drawing the most frames.
+/// </summary>
+internal static class FrameRate
+{
+    private const uint Signature = 0x52545353; // "RTSS"
+    private const int NameSize = 260;           // MAX_PATH
+    // RTSS_SHARED_MEMORY_APP_ENTRY (v2.x): dwProcessID, szName[MAX_PATH], dwFlags, dwTime0, dwTime1, dwFrames, ...
+    private const int Time0 = 4 + NameSize + 4, Time1 = Time0 + 4, Frames = Time1 + 4;
+
+    public static double? Read(IReadOnlyCollection<int> pids)
+    {
+        if (pids.Count == 0) return null;
+        try
+        {
+            using var map = MemoryMappedFile.OpenExisting("RTSSSharedMemoryV2", MemoryMappedFileRights.Read);
+            using var view = map.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+            if (view.ReadUInt32(0) != Signature || view.ReadUInt32(4) < 0x00020000) return null;
+            uint entrySize = view.ReadUInt32(8), arrayOffset = view.ReadUInt32(12), count = view.ReadUInt32(16);
+            var now = (uint)Environment.TickCount; // RTSS's times are GetTickCount milliseconds
+            double? best = null;
+            for (uint i = 0; i < count; i++)
+            {
+                long entry = arrayOffset + i * (long)entrySize;
+                if (entry + Frames + 4 > view.Capacity) break;
+                if (!pids.Contains((int)view.ReadUInt32(entry))) continue;
+                uint t0 = view.ReadUInt32(entry + Time0), t1 = view.ReadUInt32(entry + Time1), frames = view.ReadUInt32(entry + Frames);
+                if (t1 <= t0 || now - t1 > 3000) continue; // nothing counted lately
+                var fps = 1000.0 * frames / (t1 - t0);
+                if (best is null || fps > best) best = fps;
+            }
+            return best;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or IOException or UnauthorizedAccessException)
+        {
+            return null; // RTSS isn't running
+        }
+    }
 }

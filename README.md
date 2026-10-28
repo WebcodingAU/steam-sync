@@ -108,7 +108,8 @@ against the exes in each game folder. Crash reporters, updaters, installers and 
 While a game runs, a beta build (a version with `-beta` in it) sends the PC's load once a second (`PcLoad.cs`,
 `SystemStats.cs`): CPU and its speed, GPU (busiest engine) and its clock (NVIDIA only, via nvml.dll), memory load and use,
 an approximate responsiveness and the game's own CPU,
-the numbers Process Lasso graphs. It goes through `report_live_ping` (the live ping table) as a sample with a
+the numbers Process Lasso graphs, plus the game's FPS (`fps`) when RivaTuner Statistics Server (MSI Afterburner) runs
+and hooks the game: read from its shared memory, no admin needed, `null` otherwise. It goes through `report_live_ping` (the live ping table) as a sample with a
 `system` object and `method` `pc_load`, and `null` when the game stops. Stable builds never start it.
 `SteamSync.exe --system-stats out.jsonl [seconds] [pid...]` writes the samples without sending them.
 
