@@ -10,6 +10,8 @@ internal sealed class TrayApp : ApplicationContext
     private readonly SyncService _sync;
     private readonly PlayTracker _play;
     private readonly PcLoad _pcLoad;            // beta builds only
+    private readonly GameRelay _relay;          // only shown once WireGuard for Windows is installed
+    private readonly ToolStripMenuItem _relayItem = new("Game relay");
     private readonly SynchronizationContext _ui;
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _statusItem = new() { Enabled = false };
@@ -47,6 +49,9 @@ internal sealed class TrayApp : ApplicationContext
         _play = new PlayTracker(config);
         _sync.Scanned += _play.UpdateGames;
         _pcLoad = new PcLoad(config, _play);
+        _relay = new GameRelay(_play);
+        _relayItem.DropDownItems.Add("…"); // rebuilt each time it opens (BuildRelayMenu); this only shows the arrow
+        _relayItem.DropDownOpening += (_, _) => BuildRelayMenu();
 
         _syncNowItem.Click += async (_, _) => await _sync.SyncNowAsync();
         _pairItem.Click += (_, _) => TogglePairing();
@@ -72,6 +77,7 @@ internal sealed class TrayApp : ApplicationContext
             _pairItem,
             _startupItem,
             _betaItem,
+            _relayItem,
             _oldHelperItem,
             new ToolStripSeparator(),
             new ToolStripMenuItem($"Open {new Uri(config.WebsiteUrl).Host} in browser", null, (_, _) => OpenUrl(config.WebsiteUrl)),
@@ -82,8 +88,13 @@ internal sealed class TrayApp : ApplicationContext
         ]);
         _tray = new NotifyIcon { ContextMenuStrip = menu, Visible = true };
         _oldHelperItem.Click += async (_, _) => await RemoveOldHelperAsync();
-        menu.Opening += (_, _) => _oldHelperItem.Visible = OldPingHelper.IsInstalled;
+        menu.Opening += (_, _) =>
+        {
+            _oldHelperItem.Visible = OldPingHelper.IsInstalled;
+            _relayItem.Visible = GameRelay.IsSetUp || GameRelay.CanSetUp;
+        };
         _oldHelperItem.Visible = OldPingHelper.IsInstalled;
+        _relayItem.Visible = GameRelay.IsSetUp || GameRelay.CanSetUp;
 
         _updateItem.Click += (_, _) => _updater.RestartToUpdate();
         _updater.UpdateReady += version => _ui.Post(_ =>
@@ -100,6 +111,7 @@ internal sealed class TrayApp : ApplicationContext
         _sync.Start();
         _play.Start();
         _pcLoad.Start();
+        _relay.Start();
         _updater.Start();
 
         StartWithWindows.RefreshPathIfEnabled();
@@ -184,6 +196,66 @@ internal sealed class TrayApp : ApplicationContext
         }
     }
 
+    /// <summary>
+    /// The Game relay submenu: the setup until it has run, then the relay's status, a tick per game (running games
+    /// and every game with relay settings), Compare ping for the running game, and relay.json for typed-in ranges.
+    /// </summary>
+    private void BuildRelayMenu()
+    {
+        var items = _relayItem.DropDownItems;
+        items.Clear();
+        if (!GameRelay.IsSetUp)
+        {
+            items.Add(new ToolStripMenuItem("Set up game relay…", null, async (_, _) => await SetUpRelayAsync())
+            {
+                ToolTipText = "Pick your relay's WireGuard client config. Asks for administrator rights once, to install the tunnel.",
+            });
+            return;
+        }
+
+        items.Add(new ToolStripMenuItem(_relay.Status) { Enabled = false });
+        if (_relay.Pending) items.Add(new ToolStripMenuItem("Changes apply when your game closes") { Enabled = false });
+        items.Add(new ToolStripSeparator());
+        var games = _relay.Games();
+        if (games.Count == 0) items.Add(new ToolStripMenuItem("Start a game to switch it on here") { Enabled = false });
+        foreach (var (key, name, enabled, ranges, running) in games)
+        {
+            var label = $"{name}{(running ? " (running)" : "")} — {(ranges == 0 ? "no servers learned yet" : $"{ranges} range{(ranges == 1 ? "" : "s")}")}";
+            var item = new ToolStripMenuItem(label) { Checked = enabled, CheckOnClick = true };
+            item.CheckedChanged += (_, _) => _relay.SetEnabled(key, name, item.Checked);
+            items.Add(item);
+        }
+        items.Add(new ToolStripSeparator());
+        items.Add(new ToolStripMenuItem("Compare ping (relay vs direct)", null, async (_, _) =>
+        {
+            var result = await _relay.CompareAsync();
+            MessageBox.Show(result, $"{AppInfo.Name} — game relay", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }) { Enabled = _play.Running.Count > 0 });
+        items.Add(new ToolStripMenuItem("Edit relay ranges (relay.json)", null, (_, _) => OpenUrl(GameRelay.SettingsFile))
+        {
+            Enabled = File.Exists(GameRelay.SettingsFile),
+        });
+    }
+
+    private async Task SetUpRelayAsync()
+    {
+        using var pick = new OpenFileDialog
+        {
+            Title = "Your relay's WireGuard client config",
+            Filter = "WireGuard config (*.conf)|*.conf|All files (*.*)|*.*",
+        };
+        if (pick.ShowDialog() != DialogResult.OK) return;
+        var problem = await GameRelay.RunSetupElevatedAsync(pick.FileName);
+        if (problem == "") return; // UAC prompt declined
+        if (problem is not null)
+        {
+            MessageBox.Show(problem, AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        _relay.Start();
+        _tray.ShowBalloonTip(5000, AppInfo.Name, "Game relay set up. Start a game, then switch it on in the Game relay menu.", ToolTipIcon.Info);
+    }
+
     private static void OpenUrl(string target)
     {
         try { Process.Start(new ProcessStartInfo(target) { UseShellExecute = true }); }
@@ -200,6 +272,7 @@ internal sealed class TrayApp : ApplicationContext
         _tray.Visible = false;
         _tray.Dispose();
         _pcLoad.Dispose();
+        _relay.Dispose();
         _play.Dispose();
         _sync.Dispose();
         base.ExitThreadCore();
