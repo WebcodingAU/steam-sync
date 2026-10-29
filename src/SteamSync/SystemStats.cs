@@ -13,7 +13,8 @@ namespace SteamSync;
 /// the busiest engine of any GPU, each engine's use summed over its processes, the way Task Manager does it. Memory
 /// load is Windows' own figure (GlobalMemoryStatusEx). The CPU's speed is Task Manager's too (base clock times
 /// "% Processor Performance"); the GPU's clock comes from NVIDIA's driver (GpuClock), so other GPUs have none. The
-/// game's FPS comes from RivaTuner, when it runs (FrameRate).
+/// game's FPS is counted from Windows' own present events (FrameCounter), or read from RivaTuner when this PC can't
+/// run that trace (FrameRate).
 /// </para>
 /// <para>
 /// Responsiveness is Process Lasso's own formula, which isn't published, so this is an approximation from how many
@@ -32,6 +33,7 @@ internal sealed class SystemStats : IDisposable
 
     private readonly object _lock = new();
     private readonly System.Threading.Timer _queueTimer;
+    private readonly FrameCounter _frames = new();
     private IntPtr _query, _cpu, _cpuPerf, _cpuBase, _gpu, _queueQuery, _queue;
     private bool _running, _disposed;
     private long _lastSampleAt;
@@ -92,7 +94,7 @@ internal sealed class SystemStats : IDisposable
                 ["ready_queue_max"] = Round(queueMax),
                 ["cores"] = cores,
                 ["game_cpu_pct"] = Round(GameCpu(gamePids, cores)),
-                ["fps"] = FrameRate.Read(gamePids) is { } fps ? Math.Round(fps) : null, // from RivaTuner (FrameRate): null without it
+                ["fps"] = (_frames.Read(gamePids) ?? FrameRate.Read(gamePids)) is { } fps ? Math.Round(fps) : null,
             };
         }
     }
@@ -225,6 +227,7 @@ internal sealed class SystemStats : IDisposable
             _disposed = true;
         }
         _queueTimer.Dispose();
+        _frames.Dispose();
     }
 
     private const uint PdhFmtDouble = 0x200, PdhFmtNoCap100 = 0x8000, PdhMoreData = 0x800007D2;
@@ -309,7 +312,8 @@ internal static class GpuClock
 }
 
 /// <summary>
-/// The game's frame rate from RivaTuner Statistics Server (installed with MSI Afterburner), which counts every frame
+/// The fallback for FrameCounter, on PCs where this user can't start a trace: the game's frame rate from RivaTuner
+/// Statistics Server (installed with MSI Afterburner), which counts every frame
 /// of each process it hooks and publishes it in its shared memory ("RTSSSharedMemoryV2", readable without admin
 /// rights). Per process: frames over RTSS's own window (about a second), so FPS = frames / that window. (Its
 /// dwFrameTime isn't used: it sat at the same 4.22 ms for AION 2 at 102 fps and for ExitLag's window.) Null without
