@@ -12,6 +12,8 @@ internal sealed class TrayApp : ApplicationContext
     private readonly PcLoad _pcLoad;            // beta builds only
     private readonly GameRelay _relay;          // menu shown in beta builds that carry the relay helper, or once set up
     private readonly ToolStripMenuItem _relayItem = new("Game relay");
+    private readonly Equalizer? _eq = Equalizer.Find(); // menu shown only when Equalizer APO is installed
+    private readonly ToolStripMenuItem _eqItem = new("Equalizer");
     private readonly SynchronizationContext _ui;
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _statusItem = new() { Enabled = false };
@@ -52,6 +54,9 @@ internal sealed class TrayApp : ApplicationContext
         _pcLoad = new PcLoad(config, _play, _relay);
         _relayItem.DropDownItems.Add("…"); // rebuilt each time it opens (BuildRelayMenu); this only shows the arrow
         _relayItem.DropDownOpening += (_, _) => BuildRelayMenu();
+        _eqItem.DropDownItems.Add("…"); // rebuilt each time it opens (BuildEqualizerMenu)
+        _eqItem.DropDownOpening += (_, _) => BuildEqualizerMenu();
+        _eqItem.Visible = _eq is not null;
 
         _syncNowItem.Click += async (_, _) => await _sync.SyncNowAsync();
         _pairItem.Click += (_, _) => TogglePairing();
@@ -78,6 +83,7 @@ internal sealed class TrayApp : ApplicationContext
             _startupItem,
             _betaItem,
             _relayItem,
+            _eqItem,
             _oldHelperItem,
             new ToolStripSeparator(),
             new ToolStripMenuItem($"Open {new Uri(config.WebsiteUrl).Host} in browser", null, (_, _) => OpenUrl(config.WebsiteUrl)),
@@ -92,6 +98,7 @@ internal sealed class TrayApp : ApplicationContext
         {
             _oldHelperItem.Visible = OldPingHelper.IsInstalled;
             _relayItem.Visible = GameRelay.IsSetUp || GameRelay.CanSetUp;
+            if (_eq is not null) _eqItem.Text = EqualizerLabel(_eq.Read());
         };
         _oldHelperItem.Visible = OldPingHelper.IsInstalled;
         _relayItem.Visible = GameRelay.IsSetUp || GameRelay.CanSetUp;
@@ -268,6 +275,93 @@ internal sealed class TrayApp : ApplicationContext
                     AppInfo.Name, MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
                 await RelayAdminAsync(GameRelay.RemoveAsync(), "Game relay removed.");
         }));
+    }
+
+    private static string EqualizerLabel(Equalizer.EqState s) =>
+        s.OtherApp ? "Equalizer (Peace)" : s.On ? $"Equalizer: on — {s.Preset}" : "Equalizer: off";
+
+    /// <summary>
+    /// The Equalizer submenu: the on/off switch, a radio list of presets (picking one switches it on), importing Peace's
+    /// current settings as a preset, and which connected devices Equalizer APO is installed on (where it's heard).
+    /// </summary>
+    private void BuildEqualizerMenu()
+    {
+        var eq = _eq!;
+        var items = _eqItem.DropDownItems;
+        items.Clear();
+        eq.RestoreBuiltInPresets();
+        var state = eq.Read();
+        var presets = eq.Presets();
+        // Off remembers its preset; the first switch-on falls back to the first preset, or to Peace's settings.
+        var preset = state.Preset is { } p && presets.Contains(p) ? p : presets.FirstOrDefault();
+
+        var on = new ToolStripMenuItem("On")
+        {
+            Checked = state.On && !state.OtherApp,
+            Enabled = preset is not null || eq.CanImportPeace,
+            Font = new Font(_eqItem.Font, FontStyle.Bold),
+        };
+        on.Click += (_, _) => EqualizerAction(() => eq.Set(!on.Checked, preset ?? eq.ImportPeace()));
+        items.Add(on);
+        if (state.OtherApp)
+            items.Add(new ToolStripMenuItem("Peace is in control: switching on here takes over") { Enabled = false });
+        else if (Equalizer.PeaceRunning)
+            items.Add(new ToolStripMenuItem("Close Peace, or it can undo this") { Enabled = false });
+
+        items.Add(new ToolStripSeparator());
+        if (presets.Count == 0) items.Add(new ToolStripMenuItem("No presets yet") { Enabled = false });
+        foreach (var name in presets)
+            items.Add(new ToolStripMenuItem(name, null, (_, _) => EqualizerAction(() => eq.Set(true, name)))
+            {
+                Checked = !state.OtherApp && name == state.Preset,
+                ToolTipText = state.On ? "Picking it again also picks up edits to its file" : "Switches the equalizer on with this preset",
+            });
+
+        items.Add(new ToolStripSeparator());
+        var clip = new ToolStripMenuItem(state.PreventClipping && state.Preamp < 0 ? $"Prevent clipping ({state.Preamp:0.0} dB)" : "Prevent clipping")
+        {
+            Checked = state.PreventClipping,
+            Enabled = preset is not null && !state.OtherApp,
+            ToolTipText = "Lowers the volume by the preset's loudest boost, so loud sounds aren't distorted. Worked out again each time a preset is picked.",
+        };
+        clip.Click += (_, _) => EqualizerAction(() => eq.Set(state.On, preset!, preventClipping: !clip.Checked));
+        items.Add(clip);
+        if (eq.CanImportPeace)
+            items.Add(new ToolStripMenuItem("Import Peace's current settings", null, (_, _) => EqualizerAction(() =>
+            {
+                var name = eq.ImportPeace();
+                _tray.ShowBalloonTip(4000, AppInfo.Name, $"Peace's settings are now the preset \"{name}\".", ToolTipIcon.Info);
+            }))
+            {
+                ToolTipText = "Saves what Peace is applying right now as a preset named after its selected configuration (replacing one of that name).",
+            });
+        items.Add(new ToolStripMenuItem("Open presets folder", null, (_, _) =>
+        {
+            Directory.CreateDirectory(eq.PresetDir);
+            OpenUrl(eq.PresetDir);
+        })
+        {
+            ToolTipText = "Each preset is an Equalizer APO config file (.txt). Add or edit them here.",
+        });
+
+        items.Add(new ToolStripSeparator());
+        var devices = Equalizer.Devices();
+        foreach (var device in devices) items.Add(new ToolStripMenuItem($"Heard on {device}") { Enabled = false });
+        if (devices.Count == 0)
+            items.Add(new ToolStripMenuItem("Not installed on any connected device…", null, (_, _) => eq.OpenDeviceSelector())
+            {
+                ToolTipText = "Windows may see your headphones' device as new (another USB port, say). Tick it in Equalizer APO's Device Selector and restart when asked.",
+            });
+    }
+
+    private static void EqualizerAction(Action action)
+    {
+        try { action(); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Log.Error("Equalizer change failed", ex);
+            MessageBox.Show($"The equalizer couldn't be changed: {ex.Message}", AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
     }
 
     private async Task SetUpRelayAsync()
