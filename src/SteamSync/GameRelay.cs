@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using Microsoft.Win32;
 
 namespace SteamSync;
@@ -21,7 +22,7 @@ namespace SteamSync;
 /// \\.\pipe\GamingEnjoyer.Relay (RelayClient): "up" with the ranges to route, "down", "status".
 /// </para>
 /// <para>
-/// What goes through it: for each game switched on in the tray's Game relay menu, its ranges. Ranges are learned:
+/// What goes through it: every game's ranges, except the games unticked in the tray's Game relay menu. Ranges are learned:
 /// while a game runs, every public IPv4 server its own processes hold a TCP connection to for a minute or more (game
 /// sessions, not short web requests) adds that address's /24. Ranges can also be typed into relay.json by hand
 /// (UDP-only games, whose peers can't be seen without admin rights). Changes are applied only while no game is
@@ -129,12 +130,12 @@ internal sealed class GameRelay : IDisposable
     /// <summary>
     /// The running game's live ping while it goes through the relay, for the PC load sample (the site's ping pill):
     /// ping_ms, jitter_ms, loss_pct, window, ping_method, server {ip, port, proto} and relay {endpoint, ms, backup,
-    /// paths_ok}. Null when no switched-on game is running or its server doesn't go through the relay.
+    /// paths_ok}. Null when no relayed game is running or its server doesn't go through the relay.
     /// </summary>
     public JsonObject? PingSample => _ping?.DeepClone() as JsonObject;
 
     /// <summary>
-    /// Once a second while a switched-on game runs with the tunnel up: its longest-standing TCP server inside the
+    /// Once a second while a relayed game runs with the tunnel up: its longest-standing TCP server inside the
     /// relayed ranges, timed by Windows' own RTT for that connection (tcp_rtt; the game's real traffic through the
     /// relay), or by ICMP when there's no RTT sample (icmp; the echo takes the same route). Loss comes from ICMP when the
     /// server answers it at all, jitter from how much successive figures differ. The relay leg (this PC to the relay)
@@ -221,14 +222,15 @@ internal sealed class GameRelay : IDisposable
         }
     }
 
-    private bool Enabled(string key) => _settings.Games.TryGetValue(key, out var g) && g.Enabled;
+    // Every game goes through the relay unless it's been unticked (excluded) in the menu.
+    private bool Enabled(string key) => !_settings.Games.TryGetValue(key, out var g) || g.Enabled;
     private int RangeCount(string key) => _settings.Games.TryGetValue(key, out var g) ? g.Ranges.Union(g.Learned).Count() : 0;
 
     public void SetEnabled(string key, string name, bool enabled)
     {
         lock (_gate)
         {
-            Game(key, name).Enabled = enabled;
+            Game(key, name).Excluded = !enabled;
             SaveSettings();
             Log.Info($"Relay {(enabled ? "on" : "off")} for {name}");
         }
@@ -296,7 +298,7 @@ internal sealed class GameRelay : IDisposable
         if (changed) lock (_gate) SaveSettings();
     }
 
-    /// <summary>The switched-on games' ranges, sorted.</summary>
+    /// <summary>The relayed games' ranges, sorted.</summary>
     private List<string> DesiredRanges()
     {
         lock (_gate)
@@ -304,8 +306,8 @@ internal sealed class GameRelay : IDisposable
                 .Where(r => Cidr.TryParse(r, out _)).Distinct().OrderBy(r => r, StringComparer.Ordinal).ToList();
     }
 
-    /// <summary>Makes the helper route exactly the switched-on games' ranges, or takes the tunnel down when no game
-    /// is switched on. Only called while no game runs.</summary>
+    /// <summary>Makes the helper route exactly the relayed games' ranges, or takes the tunnel down when no relayed
+    /// game has servers learned yet. Only called while no game runs.</summary>
     private async Task ApplyAsync()
     {
         var ranges = DesiredRanges();
@@ -316,7 +318,7 @@ internal sealed class GameRelay : IDisposable
                 var down = await RelayClient.SendAsync(new JsonObject { ["cmd"] = "down" });
                 if (down is not null) { _applied = null; Remember(down); }
             }
-            SetStatus("Relay: off (no game switched on)");
+            SetStatus("Relay: off (no game servers learned yet)");
             return;
         }
         if (DateTimeOffset.UtcNow < _downUntil || (_applied is not null && _applied.SequenceEqual(ranges))) return;
@@ -350,7 +352,11 @@ internal sealed class GameRelay : IDisposable
         long? age = (long?)reply["handshake_age_s"];
         var fresh = age is { } a && a < StaleHandshake.TotalSeconds;
         string games;
-        lock (_gate) games = string.Join(", ", _settings.Games.Values.Where(g => g.Enabled).Select(g => g.Name));
+        lock (_gate)
+        {
+            var on = _settings.Games.Values.Where(g => g.Enabled && g.Ranges.Union(g.Learned).Any()).Select(g => g.Name).ToList();
+            games = on.Count <= 3 ? string.Join(", ", on) : $"{on.Count} games";
+        }
         if (fresh || DateTimeOffset.UtcNow - _upSince < StaleHandshake)
         {
             var relay = (string?)reply["relay"];
@@ -562,11 +568,14 @@ internal sealed class RelaySettings
     public bool Duplicate { get; set; }
 }
 
-/// <summary>One game's relay settings in relay.json: switched on or not, ranges typed in by hand, ranges learned.</summary>
+/// <summary>One game's relay settings in relay.json: kept off the relay or not, ranges typed in by hand, ranges learned.
+/// Games are relayed by default; betas before 0.4.1-beta.7 stored "enabled" instead, which is ignored now (every game
+/// got an entry with enabled false as soon as it ran, so false never meant the user switched it off).</summary>
 internal sealed class RelayGame
 {
     public string Name { get; set; } = "";
-    public bool Enabled { get; set; }
+    public bool Excluded { get; set; }
+    [JsonIgnore] public bool Enabled => !Excluded;
     public List<string> Ranges { get; set; } = [];
     public List<string> Learned { get; set; } = [];
 }

@@ -198,7 +198,8 @@ internal sealed class TrayApp : ApplicationContext
 
     /// <summary>
     /// The Game relay submenu: the setup until it has run, then the relay's status, a tick per game (running games
-    /// and every game with relay settings), Compare ping for the running game, and relay.json for typed-in ranges.
+    /// and every game with relay settings; ticked by default, untick to keep a game off the relay), Compare ping for
+    /// the running game, and relay.json for typed-in ranges.
     /// </summary>
     private void BuildRelayMenu()
     {
@@ -219,7 +220,8 @@ internal sealed class TrayApp : ApplicationContext
         if (_relay.Pending) items.Add(new ToolStripMenuItem("Changes apply when your game closes") { Enabled = false });
         items.Add(new ToolStripSeparator());
         var games = _relay.Games();
-        if (games.Count == 0) items.Add(new ToolStripMenuItem("Start a game to switch it on here") { Enabled = false });
+        if (games.Count == 0) items.Add(new ToolStripMenuItem("Every game goes through the relay; start one to see it here") { Enabled = false });
+        else items.Add(new ToolStripMenuItem("Untick a game to keep it off the relay") { Enabled = false });
         foreach (var (key, name, enabled, ranges, running) in games)
         {
             var label = $"{name}{(running ? " (running)" : "")} — {(ranges == 0 ? "no servers learned yet" : $"{ranges} range{(ranges == 1 ? "" : "s")}")}";
@@ -267,7 +269,7 @@ internal sealed class TrayApp : ApplicationContext
             Filter = "WireGuard config (*.conf)|*.conf|All files (*.*)|*.*",
         };
         if (pick.ShowDialog() != DialogResult.OK) return;
-        if (await RelayAdminAsync(GameRelay.SetUpAsync(pick.FileName), "Game relay set up. Start a game, then switch it on in the Game relay menu."))
+        if (await RelayAdminAsync(GameRelay.SetUpAsync(pick.FileName), "Game relay set up. Every game goes through it from its second launch; untick one in the Game relay menu to keep it off."))
             _relay.Start();
     }
 
