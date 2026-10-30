@@ -157,7 +157,8 @@ internal sealed class GameRelay : IDisposable
     /// <summary>
     /// The running game's live ping while it goes through the relay, for the PC load sample (the site's ping pill):
     /// ping_ms, jitter_ms, loss_pct, window, ping_method, server {ip, port, proto} and relay {endpoint, ms, backup,
-    /// paths_ok}. Null when no relayed game is running or its server doesn't go through the relay.
+    /// paths_ok}. relay.routed is false when the game's server is timed on the direct path because it doesn't go through
+    /// the relay (yet). Null when no game is running or no game server is seen.
     /// </summary>
     public JsonObject? PingSample => _ping?.DeepClone() as JsonObject;
 
@@ -175,17 +176,26 @@ internal sealed class GameRelay : IDisposable
         {
             var applied = _applied;
             var game = _play.Running.FirstOrDefault(g => Enabled(g.Key));
-            if (game is null || applied is null) { _ping = null; return; }
+            if (game is null) { _ping = null; return; }
 
-            var carried = applied.Select(r => Cidr.TryParse(r, out var c) ? c : (Cidr?)null).OfType<Cidr>().ToList();
+            var carried = (applied ?? []).Select(r => Cidr.TryParse(r, out var c) ? c : (Cidr?)null).OfType<Cidr>().ToList();
             var pids = game.Pids.ToHashSet();
+            var tcp = TcpTable.Established();
+            var udpPeers = _udp.Read(pids);
             // Game servers rather than its web requests: not 80/443 when there's a choice. A game whose server is UDP
             // (Tarkov's raids) has none of those: then its busiest live UDP server through the relay, timed by ICMP.
-            var server = TcpTable.Established().Where(r => pids.Contains(r.Pid) && carried.Any(c => c.Contains(r.Remote)))
+            var server = tcp.Where(r => pids.Contains(r.Pid) && carried.Any(c => c.Contains(r.Remote)))
                 .OrderBy(r => r.RemotePort is 80 or 443).FirstOrDefault();
             var (remote, port, proto) = (server.Remote, server.RemotePort, "tcp");
-            if (remote == 0 && _udp.Read(pids).FirstOrDefault(p => p.Quiet < TimeSpan.FromSeconds(5) && carried.Any(c => c.Contains(p.Remote))) is { Remote: not 0 } udp)
+            if (remote == 0 && udpPeers.FirstOrDefault(p => p.Quiet < TimeSpan.FromSeconds(5) && carried.Any(c => c.Contains(p.Remote))) is { Remote: not 0 } udp)
                 (remote, port, proto) = (udp.Remote, udp.Port, "udp");
+            // Not through the relay (not learned yet, or a raid server held direct until its raid ends): the game's live
+            // server is still timed, on the direct path, so the site shows its ping marked "direct".
+            var routed = remote != 0;
+            if (!routed && udpPeers.FirstOrDefault(p => p.Quiet < TimeSpan.FromSeconds(5) && IsGameFlow(p)) is { Remote: not 0 } direct)
+                (remote, port, proto) = (direct.Remote, direct.Port, "udp");
+            if (!routed && remote == 0 && tcp.FirstOrDefault(r => pids.Contains(r.Pid) && IsPublic(r.Remote) && !NotLearnedPorts.Contains(r.RemotePort) && !IsLauncher(r.Pid)) is { Remote: not 0 } row)
+                (server, remote, port, proto) = (row, row.Remote, row.RemotePort, "tcp");
             if (remote == 0) { _ping = null; return; }
 
             var address = new IPAddress(remote);
@@ -229,6 +239,8 @@ internal sealed class GameRelay : IDisposable
                 ["profile"] = profile is null ? null : new JsonObject { ["name"] = profile.Name, ["region"] = profile.Region, ["target"] = profile.Target },
                 ["relay"] = new JsonObject
                 {
+                    // False when the server above is timed on the direct path (not relayed, or held direct for now).
+                    ["routed"] = routed,
                     ["endpoint"] = _relayEndpoint,
                     ["ms"] = relayMs,
                     ["backup"] = _settings.Duplicate && _helperDuplicate == true,
@@ -413,6 +425,15 @@ internal sealed class GameRelay : IDisposable
     /// <summary>Web (80, 443, Cloudflare's other HTTP/HTTPS ports, 8080/8443) and Google push (5228-5230): never game servers.</summary>
     private static readonly HashSet<int> NotLearnedPorts = [80, 443, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8080, 8443, 8880, 5228, 5229, 5230];
 
+    /// <summary>Whether a UDP flow looks like a game server's: public, not a service or launcher, and at least 2 batches a
+    /// second both ways since it was first seen.</summary>
+    private bool IsGameFlow(UdpPeers.Peer peer)
+    {
+        var seconds = Math.Max(1, peer.Age.TotalSeconds);
+        return IsPublic(peer.Remote) && !NotLearnedPorts.Contains(peer.Port) && !UdpServicePorts.Contains(peer.Port) && !IsLauncher(peer.Pid)
+            && peer.Sent >= 2 * seconds && peer.Received >= 2 * seconds;
+    }
+
     /// <summary>UDP services that are never a game server: DNS, NTP, NetBIOS, SSDP, STUN, mDNS, LLMNR.</summary>
     private static readonly HashSet<int> UdpServicePorts = [53, 123, 137, 138, 1900, 3478, 3479, 5353, 5355, 19302];
 
@@ -422,13 +443,16 @@ internal sealed class GameRelay : IDisposable
     /// its connections are notifications and web, not the game). Remembered per pid until no game runs.</summary>
     private bool IsLauncher(int pid)
     {
-        if (_launchers.TryGetValue(pid, out var known)) return known;
-        string name;
-        try { using var p = Process.GetProcessById(pid); name = p.ProcessName; }
-        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException) { return false; }
-        return _launchers[pid] = name.EndsWith("Launcher", StringComparison.OrdinalIgnoreCase)
-            || name is "Battle.net" or "Agent" or "RiotClientServices" or "EADesktop" or "Origin" or "UbisoftConnect" or "upc"
-                or "steam" or "steamwebhelper" or "GalaxyClient";
+        lock (_launchers) // the ping timer asks too
+        {
+            if (_launchers.TryGetValue(pid, out var known)) return known;
+            string name;
+            try { using var p = Process.GetProcessById(pid); name = p.ProcessName; }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException) { return false; }
+            return _launchers[pid] = name.EndsWith("Launcher", StringComparison.OrdinalIgnoreCase)
+                || name is "Battle.net" or "Agent" or "RiotClientServices" or "EADesktop" or "Origin" or "UbisoftConnect" or "upc"
+                    or "steam" or "steamwebhelper" or "GalaxyClient";
+        }
     }
 
     /// <summary>Adds the /24 of every public server the running games have held a TCP connection to for a minute.</summary>
@@ -484,7 +508,7 @@ internal sealed class GameRelay : IDisposable
         }
         else _liveUdp = [];
         foreach (var gone in _firstSeen.Keys.Where(k => !seen.Contains(k)).ToList()) _firstSeen.Remove(gone);
-        if (running.Count == 0) _launchers.Clear(); // pids get reused
+        if (running.Count == 0) lock (_launchers) _launchers.Clear(); // pids get reused
         if (changed) lock (_gate) SaveSettings();
     }
 
