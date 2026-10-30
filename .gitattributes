@@ -1,3 +1,5 @@
 * text=auto
 *.cs text eol=crlf
 *.csproj text eol=crlf
+# Shell scripts run on the Linux relay server (piped to bash): always LF.
+*.sh text eol=lf
