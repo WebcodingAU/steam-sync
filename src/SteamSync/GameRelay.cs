@@ -23,11 +23,15 @@ namespace SteamSync;
 /// </para>
 /// <para>
 /// What goes through it: every game's ranges, except the games unticked in the tray's Game relay menu. Ranges are learned:
-/// while a game runs, every public IPv4 server its own processes hold a TCP connection to for a minute or more (game
-/// sessions, not short web requests) adds that address's /24. Ranges can also be typed into relay.json by hand
-/// (UDP-only games, whose peers can't be seen without admin rights). Changes are applied only while no game is
-/// running: moving a live connection between the direct path and the relay changes the address the server sees,
-/// which drops it.
+/// while a game runs, every public IPv4 server its own processes hold a TCP connection to for 20 seconds or more (a
+/// minute when switching mid-game is off; game sessions, not short web requests) adds that address's /24. Ranges can
+/// also be typed into relay.json by hand (UDP-only games, whose peers can't be seen without admin rights).
+/// </para>
+/// <para>
+/// When changes apply: moving a live connection between the direct path and the relay changes the address the server
+/// sees, which drops it. With "Switch mid-game" on (the default, RelaySettings.SwitchMidGame) a newly learned server goes
+/// through the relay straight away, like ExitLag: the game loses that connection once and, if it reconnects by itself,
+/// carries on through the relay. Off, changes wait until no game is running, so a game's first session stays direct.
 /// </para>
 /// <para>
 /// While the tunnel is up its WireGuard handshake is watched (the helper's status; WireGuard renews it every two
@@ -41,6 +45,7 @@ internal sealed class GameRelay : IDisposable
     private const string HelperExeName = "GamingEnjoyerRelay.exe";
     private static readonly TimeSpan Tick = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan LearnAfter = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan LearnAfterMidGame = TimeSpan.FromSeconds(20); // switching mid-game: switch early in the session
     private static readonly TimeSpan HealthEvery = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan StaleHandshake = TimeSpan.FromMinutes(3);
     private static readonly TimeSpan RetryDownAfter = TimeSpan.FromMinutes(5);
@@ -75,6 +80,10 @@ internal sealed class GameRelay : IDisposable
 
     /// <summary>"Use phone as backup": every packet over every connection (the helper's Duplicator).</summary>
     public bool Duplicate => _settings.Duplicate;
+
+    /// <summary>"Switch mid-game": a newly learned server goes through the relay at once (one brief disconnect), rather
+    /// than when the game closes.</summary>
+    public bool SwitchMidGame => _settings.SwitchMidGame;
 
     /// <summary>While duplication is on, one line per connection for the menu: name, and when it last brought a reply.</summary>
     public IReadOnlyList<string> PathLines { get; private set; } = [];
@@ -251,8 +260,8 @@ internal sealed class GameRelay : IDisposable
         {
             var running = _play.Running;
             Learn(running);
-            if (running.Count == 0) await ApplyAsync();
-            Pending = running.Count > 0 && !DesiredRanges().SequenceEqual(_applied ?? []);
+            if (running.Count == 0 || _settings.SwitchMidGame) await ApplyAsync();
+            Pending = running.Count > 0 && !_settings.SwitchMidGame && !DesiredRanges().SequenceEqual(_applied ?? []);
             await SyncDuplicateAsync();
             await CheckHealthAsync(running.Count > 0);
         }
@@ -282,7 +291,7 @@ internal sealed class GameRelay : IDisposable
                 var key = (row.Pid, row.Remote, row.RemotePort);
                 seen.Add(key);
                 if (!_firstSeen.TryGetValue(key, out var first)) _firstSeen[key] = first = now;
-                if (now - first < LearnAfter) continue;
+                if (now - first < (_settings.SwitchMidGame ? LearnAfterMidGame : LearnAfter)) continue;
                 lock (_gate)
                 {
                     var g = Game(game.Key, game.Name);
@@ -307,7 +316,7 @@ internal sealed class GameRelay : IDisposable
     }
 
     /// <summary>Makes the helper route exactly the relayed games' ranges, or takes the tunnel down when no relayed
-    /// game has servers learned yet. Only called while no game runs.</summary>
+    /// game has servers learned yet. Called while no game runs, or at any time with "Switch mid-game" on.</summary>
     private async Task ApplyAsync()
     {
         var ranges = DesiredRanges();
@@ -340,7 +349,7 @@ internal sealed class GameRelay : IDisposable
         {
             if (DesiredRanges().Count > 0)
                 SetStatus(DateTimeOffset.UtcNow < _downUntil ? "Relay: the relay isn't answering; trying again in a few minutes"
-                    : gameRunning ? "Relay: off until your game closes" : Status);
+                    : gameRunning && !_settings.SwitchMidGame ? "Relay: off until your game closes" : Status);
             return;
         }
         if (DateTimeOffset.UtcNow - _lastHealth < HealthEvery) return;
@@ -393,6 +402,17 @@ internal sealed class GameRelay : IDisposable
 
     /// <summary>Switches "use phone as backup" now (it's safe mid-game: WireGuard just roams to the new path, the
     /// connections inside the tunnel don't change).</summary>
+    public void SetSwitchMidGame(bool on)
+    {
+        lock (_gate)
+        {
+            _settings.SwitchMidGame = on;
+            SaveSettings();
+        }
+        Log.Info($"Relay: switch mid-game {(on ? "on" : "off")}");
+        _ = TickAsync(); // on: anything waiting for the game to close applies now
+    }
+
     public void SetDuplicate(bool on)
     {
         lock (_gate)
@@ -566,6 +586,7 @@ internal sealed class RelaySettings
 {
     public Dictionary<string, RelayGame> Games { get; set; } = new(StringComparer.Ordinal);
     public bool Duplicate { get; set; }
+    public bool SwitchMidGame { get; set; } = true; // relay.json from before 0.4.1-beta.8 has none: on
 }
 
 /// <summary>One game's relay settings in relay.json: kept off the relay or not, ranges typed in by hand, ranges learned.

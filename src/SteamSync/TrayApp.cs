@@ -230,6 +230,15 @@ internal sealed class TrayApp : ApplicationContext
             items.Add(item);
         }
         items.Add(new ToolStripSeparator());
+        var midGame = new ToolStripMenuItem("Switch mid-game (one brief disconnect)")
+        {
+            Checked = _relay.SwitchMidGame,
+            CheckOnClick = true,
+            ToolTipText = "A game server the relay hasn't seen before goes through it as soon as it's learned, like ExitLag: the game drops that "
+                + "connection once and most games reconnect by themselves. Off: new servers go through the relay from the game's next launch.",
+        };
+        midGame.CheckedChanged += (_, _) => _relay.SetSwitchMidGame(midGame.Checked);
+        items.Add(midGame);
         var backup = new ToolStripMenuItem("Use phone as backup (send every packet twice)")
         {
             Checked = _relay.Duplicate,
@@ -269,7 +278,7 @@ internal sealed class TrayApp : ApplicationContext
             Filter = "WireGuard config (*.conf)|*.conf|All files (*.*)|*.*",
         };
         if (pick.ShowDialog() != DialogResult.OK) return;
-        if (await RelayAdminAsync(GameRelay.SetUpAsync(pick.FileName), "Game relay set up. Every game goes through it from its second launch; untick one in the Game relay menu to keep it off."))
+        if (await RelayAdminAsync(GameRelay.SetUpAsync(pick.FileName), "Game relay set up. Every game goes through it: the first time, a game disconnects once briefly while it switches over. Untick one in the Game relay menu to keep it off."))
             _relay.Start();
     }
 
