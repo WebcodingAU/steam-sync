@@ -101,6 +101,9 @@ internal sealed class GameRelay : IDisposable
     private string? _pingFor;                            // game key + server the windows belong to
     private readonly GameProfiles _profiles = new();
     private (string Host, IPAddress? Address, DateTime ResolvedAt) _profileTarget = ("", null, DateTime.MinValue);
+    private static readonly TimeSpan EstimateEvery = TimeSpan.FromSeconds(5), EstimateHold = TimeSpan.FromSeconds(30);
+    private (double Ms, DateTime At)? _estimate;         // the profile target's last answer
+    private DateTime _estimateNext = DateTime.MinValue;
     private volatile JsonObject? _ping;
     private int _pingTicking;
     private string? _relayTunnelAddress, _relayEndpoint; // from the helper's replies
@@ -177,6 +180,8 @@ internal sealed class GameRelay : IDisposable
                 _pingFor = key;
                 _pings.Clear();
                 _icmpAnswers.Clear();
+                _estimate = null;
+                _estimateNext = DateTime.MinValue;
             }
 
             var rtt = TcpTable.Rtt(server);
@@ -186,9 +191,10 @@ internal sealed class GameRelay : IDisposable
             // the servers' real region is the figure then, and the edge's stays alongside.
             var edge = rtt ?? icmp;
             var profile = _profiles.Find(game.Key, address);
-            double? estimate = profile is not null && ProfileTarget(profile.Target) is { } target ? Probe.Icmp(target, source: null, tries: 1, timeoutMs: 900) : null;
+            var (estimate, fresh) = profile is null ? (null, false) : ProfileEstimate(profile);
             var ping = profile is null ? edge : estimate;
-            if (ping is { } p) Push(_pings, p);
+            // A held estimate repeats between measurements; only new ones go into the jitter window.
+            if (ping is { } p && (profile is null || fresh)) Push(_pings, p);
             var relayMs = _relayTunnelAddress is { } relay ? Probe.Icmp(IPAddress.Parse(relay), source: null, tries: 1, timeoutMs: 500) : null;
 
             var values = _pings.ToArray();
@@ -223,6 +229,29 @@ internal sealed class GameRelay : IDisposable
         {
             Volatile.Write(ref _pingTicking, 0);
         }
+    }
+
+    /// <summary>
+    /// The time to a game profile's target: measured every 5 seconds (ICMP, then the faster of two TCP handshakes on 443
+    /// when the ping isn't answered) and held for up to 30 seconds. Cloud hosts rate-limit ping: Oracle's Phoenix servers drop every
+    /// third ping at one a second, and a tray app pinging every second stopped getting answers at all (0.4.1-beta.11).
+    /// Fresh is true when this call measured it.
+    /// </summary>
+    private (double? Ms, bool Fresh) ProfileEstimate(GameProfile profile)
+    {
+        var now = DateTime.UtcNow;
+        var fresh = false;
+        if (now >= _estimateNext)
+        {
+            _estimateNext = now + EstimateEvery;
+            if (ProfileTarget(profile.Target) is { } target
+                && (Probe.Icmp(target, source: null, tries: 1, timeoutMs: 900) ?? Probe.TcpHandshake(target, 443)) is { } ms)
+            {
+                _estimate = (ms, now);
+                fresh = true;
+            }
+        }
+        return (_estimate is { } e && now - e.At < EstimateHold ? e.Ms : null, fresh);
     }
 
     /// <summary>A game profile's target host as an IPv4 address, looked up every 10 minutes (a minute after a failed lookup).</summary>
@@ -761,6 +790,16 @@ internal static class Probe
         int? best = null;
         for (var i = 0; i < 3; i++)
             if (await TcpHandshakeAsync(target, port, source) is { } t && (best is null || t < best)) best = t;
+        return best;
+    }
+
+    /// <summary>The faster of two TCP handshakes in milliseconds, or null, waiting for them (for the relay's ping timer
+    /// thread). One alone can read high: the first handshake to an address is slow (AION 2's Phoenix target: 463 ms vs ~180).</summary>
+    public static int? TcpHandshake(IPAddress target, int port)
+    {
+        int? best = null;
+        for (var i = 0; i < 2; i++)
+            if (TcpHandshakeAsync(target, port, source: null).GetAwaiter().GetResult() is { } t && (best is null || t < best)) best = t;
         return best;
     }
 
