@@ -25,9 +25,11 @@ namespace SteamSync;
 /// <para>
 /// What goes through it: every game's ranges, except the games unticked in the tray's Game relay menu. Ranges are learned:
 /// while a game runs, every public IPv4 server its own processes hold a TCP connection to for 20 seconds or more (a
-/// minute when switching mid-game is off; game sessions, not short web requests) adds that address's /24. Web ports (80
-/// and 443) aren't learned: those are the game's web, login and store requests, and mostly go to shared content networks
-/// (Cloudflare, Akamai, CloudFront), whose /24s also carry unrelated sites, this app's own sync to Supabase among them. Ranges can
+/// minute when switching mid-game is off; game sessions, not short web requests) adds that address's /24. Web and push
+/// ports (NotLearnedPorts) aren't learned: those are the game's web, login, store and notification connections, and mostly
+/// go to shared networks (Cloudflare, Akamai, CloudFront, Google), whose /24s also carry unrelated sites, this app's own
+/// sync to Supabase among them. Neither are launchers' connections (BsgLauncher's Cloudflare and Google push channels
+/// were Tarkov's only learned "servers", while its raids are UDP). Ranges can
 /// also be typed into relay.json by hand (UDP-only games, whose peers can't be seen without admin rights).
 /// </para>
 /// <para>
@@ -400,6 +402,24 @@ internal sealed class GameRelay : IDisposable
         }
     }
 
+    /// <summary>Web (80, 443, Cloudflare's other HTTP/HTTPS ports, 8080/8443) and Google push (5228-5230): never game servers.</summary>
+    private static readonly HashSet<int> NotLearnedPorts = [80, 443, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8080, 8443, 8880, 5228, 5229, 5230];
+
+    private readonly Dictionary<int, bool> _launchers = [];
+
+    /// <summary>Whether the process is a game launcher or store client (counted in the game's session for play time, but
+    /// its connections are notifications and web, not the game). Remembered per pid until no game runs.</summary>
+    private bool IsLauncher(int pid)
+    {
+        if (_launchers.TryGetValue(pid, out var known)) return known;
+        string name;
+        try { using var p = Process.GetProcessById(pid); name = p.ProcessName; }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException) { return false; }
+        return _launchers[pid] = name.EndsWith("Launcher", StringComparison.OrdinalIgnoreCase)
+            || name is "Battle.net" or "Agent" or "RiotClientServices" or "EADesktop" or "Origin" or "UbisoftConnect" or "upc"
+                or "steam" or "steamwebhelper" or "GalaxyClient";
+    }
+
     /// <summary>Adds the /24 of every public server the running games have held a TCP connection to for a minute.</summary>
     private void Learn(IReadOnlyList<RunningGame> running)
     {
@@ -412,7 +432,7 @@ internal sealed class GameRelay : IDisposable
             foreach (var g in running) foreach (var pid in g.Pids) byPid.TryAdd(pid, g);
             foreach (var row in TcpTable.Established())
             {
-                if (!byPid.TryGetValue(row.Pid, out var game) || !IsPublic(row.Remote) || row.RemotePort is 80 or 443) continue;
+                if (!byPid.TryGetValue(row.Pid, out var game) || !IsPublic(row.Remote) || NotLearnedPorts.Contains(row.RemotePort) || IsLauncher(row.Pid)) continue;
                 var key = (row.Pid, row.Remote, row.RemotePort);
                 seen.Add(key);
                 if (!_firstSeen.TryGetValue(key, out var first)) _firstSeen[key] = first = now;
@@ -429,6 +449,7 @@ internal sealed class GameRelay : IDisposable
             }
         }
         foreach (var gone in _firstSeen.Keys.Where(k => !seen.Contains(k)).ToList()) _firstSeen.Remove(gone);
+        if (running.Count == 0) _launchers.Clear(); // pids get reused
         if (changed) lock (_gate) SaveSettings();
     }
 
@@ -616,12 +637,13 @@ internal sealed class GameRelay : IDisposable
             var settings = JsonSerializer.Deserialize<RelaySettings>(File.ReadAllText(SettingsFile), Json) ?? new();
             if (settings.LearnedVersion < RelaySettings.CurrentLearnedVersion)
             {
-                // Learned before web ports were skipped: mostly content networks' /24s. Forget them once; each game's
-                // real servers are learned again within its first 20 seconds of play. Typed-in ranges stay.
+                // Learned before web, push and launcher connections were skipped: mostly content networks' and Google's
+                // /24s. Forget them once; each game's real servers are learned again within its first 20 seconds of play.
+                // Typed-in ranges stay.
                 foreach (var g in settings.Games.Values) g.Learned.Clear();
                 settings.LearnedVersion = RelaySettings.CurrentLearnedVersion;
                 File.WriteAllText(SettingsFile, JsonSerializer.Serialize(settings, Json));
-                Log.Info("Relay: cleared learned ranges once (web ports are no longer learned)");
+                Log.Info("Relay: cleared learned ranges once (web, push and launcher connections are no longer learned)");
             }
             return settings;
         }
@@ -725,9 +747,10 @@ internal sealed class RelaySettings
     public Dictionary<string, RelayGame> Games { get; set; } = new(StringComparer.Ordinal);
     public bool Duplicate { get; set; }
     public bool SwitchMidGame { get; set; } = true; // relay.json from before 0.4.1-beta.8 has none: on
-    /// <summary>2 once learned ranges were cleared of web-port servers (LoadSettings); older relay.json has none (0).</summary>
+    /// <summary>The learning rules learned ranges were kept under (LoadSettings clears them when older): 2 skipped web
+    /// ports (0.4.1-beta.11), 3 also push ports and launchers. Older relay.json has none (0).</summary>
     public int LearnedVersion { get; set; }
-    public const int CurrentLearnedVersion = 2;
+    public const int CurrentLearnedVersion = 3;
 }
 
 /// <summary>One game's relay settings in relay.json: kept off the relay or not, ranges typed in by hand, ranges learned.
