@@ -69,6 +69,17 @@ internal sealed class GameRelay : IDisposable
     /// <summary>The installed helper's version, from its last status reply.</summary>
     public string? HelperVersion { get; private set; }
 
+    /// <summary>The relay config has packet duplication set up ([GamingEnjoyer] section), from the helper's replies.</summary>
+    public bool DuplicateAvailable { get; private set; }
+
+    /// <summary>"Use phone as backup": every packet over every connection (the helper's Duplicator).</summary>
+    public bool Duplicate => _settings.Duplicate;
+
+    /// <summary>While duplication is on, one line per connection for the menu: name, and when it last brought a reply.</summary>
+    public IReadOnlyList<string> PathLines { get; private set; } = [];
+
+    private bool? _helperDuplicate;          // what the helper last said; null = not asked yet
+
     public GameRelay(PlayTracker play)
     {
         _play = play;
@@ -143,6 +154,7 @@ internal sealed class GameRelay : IDisposable
             Learn(running);
             if (running.Count == 0) await ApplyAsync();
             Pending = running.Count > 0 && !DesiredRanges().SequenceEqual(_applied ?? []);
+            await SyncDuplicateAsync();
             await CheckHealthAsync(running.Count > 0);
         }
         catch (Exception ex)
@@ -259,7 +271,43 @@ internal sealed class GameRelay : IDisposable
         }
     }
 
-    private void Remember(JsonObject reply) => HelperVersion = (string?)reply["version"] ?? HelperVersion;
+    private void Remember(JsonObject reply)
+    {
+        HelperVersion = (string?)reply["version"] ?? HelperVersion;
+        DuplicateAvailable = (bool?)reply["duplicate_available"] ?? false;
+        _helperDuplicate = (bool?)reply["duplicate"];
+        PathLines = (reply["paths"] as JsonArray ?? []).OfType<JsonObject>().Select(p =>
+        {
+            var name = (string?)p["name"] ?? "?";
+            var quiet = (long?)p["quiet_s"];
+            var state = quiet is null ? "no reply yet" : quiet <= 30 ? $"✓ reply {quiet} s ago" : $"⚠ no reply for {quiet} s";
+            return $"{((bool?)p["phone"] == true ? "📱 " : "")}{name}: {state}";
+        }).ToList();
+    }
+
+    /// <summary>Switches "use phone as backup" now (it's safe mid-game: WireGuard just roams to the new path, the
+    /// connections inside the tunnel don't change).</summary>
+    public void SetDuplicate(bool on)
+    {
+        lock (_gate)
+        {
+            _settings.Duplicate = on;
+            SaveSettings();
+        }
+        Log.Info($"Relay: phone backup {(on ? "on" : "off")}");
+        _ = TickAsync();
+    }
+
+    /// <summary>Tells the helper about "use phone as backup" when it differs from what the helper last said.</summary>
+    private async Task SyncDuplicateAsync()
+    {
+        if (_helperDuplicate == _settings.Duplicate || (_settings.Duplicate && _helperDuplicate is not null && !DuplicateAvailable)) return;
+        var reply = await RelayClient.SendAsync(new JsonObject { ["cmd"] = "duplicate", ["on"] = _settings.Duplicate });
+        if (reply is null) return;
+        Remember(reply);
+        if ((string?)reply["error"] is { } error) Log.Error($"Relay: phone backup: {error}");
+        else Log.Info($"Relay: phone backup is {(_settings.Duplicate ? "on" : "off")} in the helper");
+    }
 
     /// <summary>
     /// Ping to the running game's servers through the relay and directly, for the tray's "Compare ping". Through the
@@ -407,6 +455,7 @@ internal static class RelayClient
 internal sealed class RelaySettings
 {
     public Dictionary<string, RelayGame> Games { get; set; } = new(StringComparer.Ordinal);
+    public bool Duplicate { get; set; }
 }
 
 /// <summary>One game's relay settings in relay.json: switched on or not, ranges typed in by hand, ranges learned.</summary>

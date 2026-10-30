@@ -13,8 +13,11 @@ namespace RelayHelper;
 /// <item><c>{"cmd":"status"}</c></item>
 /// <item><c>{"cmd":"up","ranges":["66.40.178.0/24", ...]}</c>: route exactly these ranges through the relay</item>
 /// <item><c>{"cmd":"down"}</c></item>
+/// <item><c>{"cmd":"duplicate","on":true}</c>: packet duplication over every connection (Duplicator), when the relay
+/// config has a [GamingEnjoyer] DuplicateEndpoint</item>
 /// </list>
-/// Every reply: ok, error, version, up, routes, handshake_age_s, rx, tx, relay, endpoint. Open to people signed in at
+/// Every reply: ok, error, version, up, routes, handshake_age_s, rx, tx, relay, endpoint, duplicate_available,
+/// duplicate, paths (per connection: name, phone, sent, received, quiet_s). Open to people signed in at
 /// this PC (INTERACTIVE; the tray app runs as the signed-in user), closed to the network. Ranges are checked here:
 /// public IPv4 only, /8 or narrower, never the relay's own address (that would loop the tunnel into itself).
 /// </summary>
@@ -27,6 +30,8 @@ internal sealed class PipeServer : IDisposable
     private readonly RelayConfig _config;
     private readonly string _version;
     private readonly CancellationTokenSource _stop = new();
+    private readonly object _duplicateGate = new();
+    private Duplicator? _duplicator;
     private int _clients;
 
     public PipeServer(Tunnel tunnel, string version)
@@ -119,18 +124,30 @@ internal sealed class PipeServer : IDisposable
                 case "down":
                     _tunnel.Down();
                     break;
+                case "duplicate":
+                    SetDuplicate((bool?)request["on"] ?? false);
+                    break;
                 default:
                     throw new FormatException("unknown cmd");
             }
         }
-        catch (Exception ex) when (ex is FormatException or System.Text.Json.JsonException or InvalidOperationException)
+        catch (Exception ex) when (ex is FormatException or System.Text.Json.JsonException or InvalidOperationException or System.Net.Sockets.SocketException)
         {
             error = ex.Message;
         }
 
         var (up, routes, handshake, rx, tx) = _tunnel.Status();
+        var paths = new JsonArray();
+        lock (_duplicateGate)
+        {
+            foreach (var (name, phone, sent, received, quiet) in _duplicator?.Paths() ?? [])
+                paths.Add((JsonNode)new JsonObject { ["name"] = name, ["phone"] = phone, ["sent"] = sent, ["received"] = received, ["quiet_s"] = quiet });
+        }
         return new JsonObject
         {
+            ["duplicate_available"] = _config.DuplicateEndpoint is not null,
+            ["duplicate"] = _duplicator is not null,
+            ["paths"] = paths,
             ["ok"] = error is null,
             ["error"] = error,
             ["version"] = _version,
@@ -173,5 +190,38 @@ internal sealed class PipeServer : IDisposable
         return (uint)(b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3]);
     }
 
-    public void Dispose() => _stop.Cancel();
+    /// <summary>Turns duplication on (duplicator first, then WireGuard pointed at it) or off (WireGuard back to the
+    /// relay first, then the duplicator closed), so no packet is sent to a socket that isn't there.</summary>
+    private void SetDuplicate(bool on)
+    {
+        lock (_duplicateGate)
+        {
+            if (on == (_duplicator is not null)) return;
+            if (on)
+            {
+                if (_config.DuplicateEndpoint is not { } endpoint || _config.DuplicateToken is not { } token)
+                    throw new InvalidOperationException("the relay config has no DuplicateEndpoint");
+                var duplicator = new Duplicator(endpoint, token);
+                duplicator.Start();
+                _tunnel.SetEndpoint(duplicator.LocalEndPoint);
+                _duplicator = duplicator;
+            }
+            else
+            {
+                _tunnel.SetEndpoint(_config.Endpoint);
+                _duplicator!.Dispose();
+                _duplicator = null;
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        _stop.Cancel();
+        lock (_duplicateGate)
+        {
+            _duplicator?.Dispose();
+            _duplicator = null;
+        }
+    }
 }

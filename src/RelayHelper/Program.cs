@@ -54,6 +54,8 @@ internal static class Program
             case "--version":
                 Console.WriteLine(Version);
                 return 0;
+            case "duplicate-test" when args.Length > 1:
+                return DuplicateTest(args[1]);
             default:
                 Console.Error.WriteLine($"Unknown command: {args[0]}");
                 return 2;
@@ -75,6 +77,34 @@ internal static class Program
         using var done = new ManualResetEventSlim();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; done.Set(); };
         done.Wait();
+        return 0;
+    }
+
+    /// <summary>
+    /// duplicate-test &lt;client.conf&gt; (no admin needed): runs the Duplicator for a few seconds with a stand-in for
+    /// WireGuard that sends 5 numbered test packets, and prints which connections it used and what came back. The relay
+    /// front-end passes them to WireGuard, which drops them (they aren't WireGuard packets), so no replies are expected.
+    /// </summary>
+    private static int DuplicateTest(string clientConfig)
+    {
+        var config = RelayConfig.Parse(File.ReadAllText(clientConfig));
+        if (config.DuplicateEndpoint is null || config.DuplicateToken is null)
+        {
+            Console.Error.WriteLine("That config has no [GamingEnjoyer] DuplicateEndpoint.");
+            return 2;
+        }
+        using var duplicator = new Duplicator(config.DuplicateEndpoint, config.DuplicateToken);
+        duplicator.Start();
+        using var wireGuard = new System.Net.Sockets.UdpClient(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+        for (var i = 1; i <= 5; i++)
+        {
+            var packet = System.Text.Encoding.ASCII.GetBytes($"ge-duplicate-test-{i}");
+            wireGuard.Send(packet, packet.Length, duplicator.LocalEndPoint);
+            Thread.Sleep(200);
+        }
+        Thread.Sleep(1000);
+        foreach (var (name, phone, sent, received, _) in duplicator.Paths())
+            Console.WriteLine($"{name}{(phone ? " (phone)" : "")}: sent {sent}, received {received}");
         return 0;
     }
 

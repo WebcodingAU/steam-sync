@@ -228,6 +228,20 @@ internal sealed class TrayApp : ApplicationContext
             items.Add(item);
         }
         items.Add(new ToolStripSeparator());
+        var backup = new ToolStripMenuItem("Use phone as backup (send every packet twice)")
+        {
+            Checked = _relay.Duplicate,
+            CheckOnClick = true,
+            Enabled = _relay.DuplicateAvailable || _relay.Duplicate,
+            ToolTipText = _relay.DuplicateAvailable
+                ? "Sends each relayed packet over every connection (Starlink and a USB-tethered phone), so a packet one drops still arrives. Only relayed game traffic uses mobile data."
+                : "Your relay config has no packet duplication set up ([GamingEnjoyer] DuplicateEndpoint).",
+        };
+        backup.CheckedChanged += (_, _) => _relay.SetDuplicate(backup.Checked);
+        items.Add(backup);
+        if (_relay.Duplicate)
+            foreach (var line in _relay.PathLines) items.Add(new ToolStripMenuItem("    " + line) { Enabled = false });
+        items.Add(new ToolStripSeparator());
         items.Add(new ToolStripMenuItem("Compare ping (relay vs direct)", null, async (_, _) =>
         {
             var result = await _relay.CompareAsync();

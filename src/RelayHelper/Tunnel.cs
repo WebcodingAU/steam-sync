@@ -9,10 +9,13 @@ namespace RelayHelper;
 /// <summary>
 /// The relay's WireGuard client config, read from %ProgramData%\GamingEnjoyer\relay\relay.conf (the usual
 /// wg-quick format). Its AllowedIPs only names the relay's own tunnel address: which game ranges go through is
-/// decided by the tray app at run time (Tunnel.Up).
+/// decided by the tray app at run time (Tunnel.Up). An extra [GamingEnjoyer] section, which only this helper reads,
+/// turns on packet duplication (Duplicator): DuplicateEndpoint (the relay's ge-relay-dup front-end) and
+/// DuplicateToken (16 bytes, hex).
 /// </summary>
 internal sealed record RelayConfig(byte[] PrivateKey, IPAddress Address, int Mtu, byte[] PeerPublicKey, byte[]? PresharedKey,
-    IPEndPoint Endpoint, string EndpointText, ushort Keepalive, IPAddress RelayAddress)
+    IPEndPoint Endpoint, string EndpointText, ushort Keepalive, IPAddress RelayAddress,
+    IPEndPoint? DuplicateEndpoint = null, byte[]? DuplicateToken = null)
 {
     public static RelayConfig Parse(string text)
     {
@@ -50,6 +53,17 @@ internal sealed record RelayConfig(byte[] PrivateKey, IPAddress Address, int Mtu
             relay = new IPAddress([b[0], b[1], b[2], 1]);
         }
 
+        IPEndPoint? duplicateEndpoint = null;
+        byte[]? duplicateToken = null;
+        if (values.TryGetValue("gamingenjoyer.DuplicateEndpoint", out var dup))
+        {
+            if (!IPEndPoint.TryParse(dup, out duplicateEndpoint) || duplicateEndpoint.Port == 0 || duplicateEndpoint.AddressFamily != AddressFamily.InterNetwork)
+                throw new FormatException("The relay config's DuplicateEndpoint needs an IPv4 address and port.");
+            try { duplicateToken = Convert.FromHexString(Need("gamingenjoyer.DuplicateToken")); }
+            catch (FormatException) { duplicateToken = null; }
+            if (duplicateToken is not { Length: 16 }) throw new FormatException("The relay config's DuplicateToken needs 16 bytes in hex.");
+        }
+
         return new RelayConfig(
             Key(Need("interface.PrivateKey"), "PrivateKey"),
             tunnelAddress,
@@ -59,7 +73,9 @@ internal sealed record RelayConfig(byte[] PrivateKey, IPAddress Address, int Mtu
             new IPEndPoint(endpointIp, port),
             endpointText,
             values.TryGetValue("peer.PersistentKeepalive", out var ka) && ushort.TryParse(ka, out var k) ? k : (ushort)25,
-            relay);
+            relay,
+            duplicateEndpoint,
+            duplicateToken);
     }
 
     private static byte[] Key(string base64, string name)
@@ -260,8 +276,35 @@ internal sealed unsafe class Tunnel : IDisposable
         }
     }
 
+    /// <summary>
+    /// Points the peer at another endpoint without touching its keys or AllowedIPs: the relay itself, or the
+    /// Duplicator's local socket while duplication is on. The session carries on (WireGuard roams); connections
+    /// inside the tunnel don't notice.
+    /// </summary>
+    public void SetEndpoint(IPEndPoint target)
+    {
+        lock (_gate)
+        {
+            var buffer = new byte[InterfaceSize + PeerSize];
+            fixed (byte* p = buffer)
+            {
+                *(uint*)(p + InterfacePeersCount) = 1;
+                var peer = p + InterfaceSize;
+                *(uint*)(peer + PeerFlags) = PeerHasPublicKey | PeerHasEndpoint | PeerUpdateOnly;
+                Marshal.Copy(_config.PeerPublicKey, 0, (IntPtr)(peer + PeerPublicKey), 32);
+                var endpoint = peer + PeerEndpoint;
+                *(ushort*)endpoint = 2; // AF_INET
+                BinaryPrimitives.WriteUInt16BigEndian(new Span<byte>(endpoint + 2, 2), (ushort)target.Port);
+                target.Address.GetAddressBytes().CopyTo(new Span<byte>(endpoint + 4, 4));
+                if (_setConfig(_adapter, p, (uint)buffer.Length) == 0)
+                    throw new InvalidOperationException($"WireGuardSetConfiguration (endpoint) failed ({Marshal.GetLastSystemError()})");
+            }
+            Log.Write($"Endpoint now {target}");
+        }
+    }
+
     /// <summary>Runs netsh (from System32), retrying while it fails. Null on success, else its output.</summary>
-    private static string? Netsh(int retries, params string[] args)
+    internal static string? Netsh(int retries, params string[] args)
     {
         for (var attempt = 0; ; attempt++)
         {
