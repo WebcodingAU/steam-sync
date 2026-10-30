@@ -58,25 +58,6 @@ internal static class Program
             return 0;
         }
 
-        // The game relay's one-off setup (GameRelay.Setup). The tray starts it elevated as --relay-setup <client.conf>
-        // <user sid> <result file>; run by hand with just the config, it asks for elevation itself.
-        if (args is ["--relay-setup", var relayConfig, var userSid, var resultFile])
-        {
-            string? problem;
-            try { problem = GameRelay.Setup(Path.GetFullPath(relayConfig), userSid); }
-            catch (Exception ex) { problem = ex.Message; }
-            File.WriteAllText(resultFile, problem ?? "");
-            return problem is null ? 0 : 1;
-        }
-        if (args is ["--relay-setup", var config])
-        {
-            var problem = GameRelay.RunSetupElevatedAsync(Path.GetFullPath(config)).GetAwaiter().GetResult();
-            if (problem != "")
-                MessageBox.Show(problem ?? "Game relay set up. Switch games on in the tray's Game relay menu.", AppInfo.Name,
-                    MessageBoxButtons.OK, problem is null ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
-            return problem is null ? 0 : 1;
-        }
-
         // Any launch by a person (Start menu, the exe, first run after install) opens the Library; only start-with-
         // Windows and post-update restarts pass --background. A second launch asks the running app to show its
         // window, so there is only ever one copy of the app and one browser engine.

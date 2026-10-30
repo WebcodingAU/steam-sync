@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The relay helper: a small Windows service (LocalSystem) that runs the game relay's WireGuard tunnel with
+       WireGuard's own wireguard.dll (wireguard-nt), so no WireGuard app is needed. It ships inside the Gaming Enjoyer
+       package; the tray app installs it into Program Files when the relay is set up (one UAC prompt). See Program.cs. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>GamingEnjoyerRelay</AssemblyName>
+    <RootNamespace>RelayHelper</RootNamespace>
+    <!-- Its own version: the tray app compares it with the installed copy to offer an update. Bump on any change. -->
+    <Version>1.0.0</Version>
+    <Product>Gaming Enjoyer</Product>
+    <AssemblyTitle>Gaming Enjoyer relay helper</AssemblyTitle>
+    <Company>gamingenjoyer.com</Company>
+    <ApplicationIcon>..\SteamSync\app.ico</ApplicationIcon>
+    <!-- One exe that runs from Program Files on its own, with no .NET install: self-contained, trimmed and compressed.
+         Everything it calls is plain P/Invoke and JsonNode, so trimming is safe. -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <PublishTrimmed>true</PublishTrimmed>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <!-- wireguard-nt, WireGuard LLC's signed prebuilt wireguard.dll (driver included). Downloaded at build time from
+       download.wireguard.com and checked against this hash, not kept in the repo. Its license allows shipping it
+       unmodified next to software that only uses wireguard.h's API, so it is copied as is (never bundled into the
+       single-file exe) with its LICENSE.txt. -->
+  <PropertyGroup>
+    <WireGuardNtVersion>1.1</WireGuardNtVersion>
+    <WireGuardNtSha256>dceb30a9bc4be48cce0f74160fc88a585a2c2627366e8f846fc6658f9038dace</WireGuardNtSha256>
+    <WireGuardNtDir>$(MSBuildProjectDirectory)\obj\wireguard-nt-$(WireGuardNtVersion)</WireGuardNtDir>
+  </PropertyGroup>
+
+  <Target Name="FetchWireGuardNt" BeforeTargets="AssignTargetPaths" Condition="!Exists('$(WireGuardNtDir)\wireguard-nt\bin\amd64\wireguard.dll')">
+    <DownloadFile SourceUrl="https://download.wireguard.com/wireguard-nt/wireguard-nt-$(WireGuardNtVersion).zip" DestinationFolder="$(WireGuardNtDir)" />
+    <VerifyFileHash File="$(WireGuardNtDir)\wireguard-nt-$(WireGuardNtVersion).zip" Hash="$(WireGuardNtSha256)" Algorithm="SHA256" />
+    <Unzip SourceFiles="$(WireGuardNtDir)\wireguard-nt-$(WireGuardNtVersion).zip" DestinationFolder="$(WireGuardNtDir)" />
+  </Target>
+
+  <ItemGroup>
+    <None Include="$(WireGuardNtDir)\wireguard-nt\bin\amd64\wireguard.dll" Link="wireguard.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <None Include="$(WireGuardNtDir)\wireguard-nt\LICENSE.txt" Link="wireguard-nt-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+  </ItemGroup>
+
+</Project>

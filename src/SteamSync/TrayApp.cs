@@ -10,7 +10,7 @@ internal sealed class TrayApp : ApplicationContext
     private readonly SyncService _sync;
     private readonly PlayTracker _play;
     private readonly PcLoad _pcLoad;            // beta builds only
-    private readonly GameRelay _relay;          // only shown once WireGuard for Windows is installed
+    private readonly GameRelay _relay;          // menu shown in beta builds that carry the relay helper, or once set up
     private readonly ToolStripMenuItem _relayItem = new("Game relay");
     private readonly SynchronizationContext _ui;
     private readonly NotifyIcon _tray;
@@ -208,12 +208,14 @@ internal sealed class TrayApp : ApplicationContext
         {
             items.Add(new ToolStripMenuItem("Set up game relay…", null, async (_, _) => await SetUpRelayAsync())
             {
-                ToolTipText = "Pick your relay's WireGuard client config. Asks for administrator rights once, to install the tunnel.",
+                ToolTipText = "Pick your relay's WireGuard client config. Asks for administrator rights once, to install the relay helper.",
             });
             return;
         }
 
         items.Add(new ToolStripMenuItem(_relay.Status) { Enabled = false });
+        if (_relay.HelperOutdated)
+            items.Add(new ToolStripMenuItem("Update relay helper…", null, async (_, _) => await RelayAdminAsync(GameRelay.UpdateHelperAsync(), "Relay helper updated.")));
         if (_relay.Pending) items.Add(new ToolStripMenuItem("Changes apply when your game closes") { Enabled = false });
         items.Add(new ToolStripSeparator());
         var games = _relay.Games();
@@ -235,6 +237,12 @@ internal sealed class TrayApp : ApplicationContext
         {
             Enabled = File.Exists(GameRelay.SettingsFile),
         });
+        items.Add(new ToolStripMenuItem("Remove game relay…", null, async (_, _) =>
+        {
+            if (MessageBox.Show("Remove the game relay from this PC? Its tunnel, the relay helper service and the stored relay config are removed (asks for administrator rights).",
+                    AppInfo.Name, MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                await RelayAdminAsync(GameRelay.RemoveAsync(), "Game relay removed.");
+        }));
     }
 
     private async Task SetUpRelayAsync()
@@ -245,15 +253,27 @@ internal sealed class TrayApp : ApplicationContext
             Filter = "WireGuard config (*.conf)|*.conf|All files (*.*)|*.*",
         };
         if (pick.ShowDialog() != DialogResult.OK) return;
-        var problem = await GameRelay.RunSetupElevatedAsync(pick.FileName);
-        if (problem == "") return; // UAC prompt declined
-        if (problem is not null)
+        if (await RelayAdminAsync(GameRelay.SetUpAsync(pick.FileName), "Game relay set up. Start a game, then switch it on in the Game relay menu."))
+            _relay.Start();
+    }
+
+    /// <summary>Waits for one of the relay's admin steps; shows what went wrong, or the balloon when it worked.</summary>
+    private async Task<bool> RelayAdminAsync(Task<string?> step, string done)
+    {
+        _relayItem.Enabled = false;
+        try
         {
-            MessageBox.Show(problem, AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
+            var problem = await step;
+            if (problem == "") return false; // UAC prompt declined
+            if (problem is not null)
+            {
+                MessageBox.Show(problem, AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+            _tray.ShowBalloonTip(5000, AppInfo.Name, done, ToolTipIcon.Info);
+            return true;
         }
-        _relay.Start();
-        _tray.ShowBalloonTip(5000, AppInfo.Name, "Game relay set up. Start a game, then switch it on in the Game relay menu.", ToolTipIcon.Info);
+        finally { _relayItem.Enabled = true; }
     }
 
     private static void OpenUrl(string target)
