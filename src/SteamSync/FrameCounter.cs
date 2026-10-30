@@ -9,8 +9,9 @@ namespace SteamSync;
 /// <para>
 /// Each frame a game shows is one present call. DXGI (Direct3D 10/11/12) logs Present (event 42) or
 /// PresentMultiplaneOverlay (55) in the game's process, D3D9 logs Present (1), and the kernel (DxgKrnl) logs Present
-/// (184) or PresentHistoryDetailed (215) for every API, Vulkan and OpenGL included. Per process, the frame count is
-/// the larger of the API's and the kernel's (they match one to one for DXGI games), and the frame rate is frames over
+/// (184) or PresentHistoryDetailed (215) for every API, Vulkan and OpenGL included. A flip-model game logs both kernel
+/// events for every frame (AION 2: 42, 184 and 215 once each), so each event is counted on its own and, per process,
+/// the frame count is the largest of the three (adding the kernel's two together doubled it), and the frame rate is frames over
 /// the time between the first and last present seen since the previous read, from the events' own timestamps, so
 /// ETW's delivery delay doesn't skew it. With several of the game's processes presenting, the one drawing the most.
 /// </para>
@@ -44,11 +45,13 @@ internal sealed unsafe class FrameCounter : IDisposable
     private long _lastReadAt, _retryAt;
     private bool _disposed;
 
-    /// <summary>Presents per process since the last read: by the API (DXGI/D3D9) and by the kernel, with the first and
-    /// last timestamps (QueryPerformanceCounter ticks) of each.</summary>
+    /// <summary>Presents per process since the last read: by the API (DXGI/D3D9) and by each of the kernel's two events,
+    /// with the first and last timestamps (QueryPerformanceCounter ticks) of each.</summary>
     private sealed class Frames
     {
-        public Span Api, Kernel;
+        public Span Api, Kernel, KernelHistory;
+        public double? Fps => (Api.Count >= Kernel.Count && Api.Count >= KernelHistory.Count ? Api
+            : Kernel.Count >= KernelHistory.Count ? Kernel : KernelHistory).Fps;
         public struct Span
         {
             public int Count;
@@ -91,8 +94,7 @@ internal sealed unsafe class FrameCounter : IDisposable
             foreach (var pid in pids)
             {
                 if (!_frames.TryGetValue((uint)pid, out var f)) continue;
-                var fps = f.Api.Count >= f.Kernel.Count ? f.Api.Fps : f.Kernel.Fps;
-                if (fps is { } v && (best is null || v > best)) best = v;
+                if (f.Fps is { } v && (best is null || v > best)) best = v;
             }
             _frames.Clear();
             return best;
@@ -204,17 +206,19 @@ internal sealed unsafe class FrameCounter : IDisposable
 
     private void Handle(EventRecord* record)
     {
-        bool api;
-        if (record->ProviderId == DxgKrnl && record->EventId is KernelPresent or KernelPresentHistory) api = false;
-        else if (record->ProviderId == Dxgi && record->EventId is DxgiPresent or DxgiPresentMpo) api = true;
-        else if (record->ProviderId == D3d9 && record->EventId == D3d9Present) api = true;
+        int which; // 0 API, 1 kernel Present, 2 kernel PresentHistoryDetailed
+        if (record->ProviderId == DxgKrnl && record->EventId == KernelPresent) which = 1;
+        else if (record->ProviderId == DxgKrnl && record->EventId == KernelPresentHistory) which = 2;
+        else if (record->ProviderId == Dxgi && record->EventId is DxgiPresent or DxgiPresentMpo) which = 0;
+        else if (record->ProviderId == D3d9 && record->EventId == D3d9Present) which = 0;
         else return;
 
         lock (_lock)
         {
             if (!_frames.TryGetValue(record->ProcessId, out var f)) _frames[record->ProcessId] = f = new Frames();
-            if (api) f.Api.Add(record->TimeStamp);
-            else f.Kernel.Add(record->TimeStamp);
+            if (which == 0) f.Api.Add(record->TimeStamp);
+            else if (which == 1) f.Kernel.Add(record->TimeStamp);
+            else f.KernelHistory.Add(record->TimeStamp);
         }
     }
 
