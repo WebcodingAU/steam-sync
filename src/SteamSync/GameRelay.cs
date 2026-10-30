@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO.Pipes;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -104,6 +105,10 @@ internal sealed class GameRelay : IDisposable
     private static readonly TimeSpan EstimateEvery = TimeSpan.FromSeconds(5), EstimateHold = TimeSpan.FromSeconds(30);
     private (double Ms, DateTime At)? _estimate;         // the profile target's last answer
     private DateTime _estimateNext = DateTime.MinValue;
+    private const int PathWindow = 60;                   // seconds of per-connection pings (the site's connection table)
+    private readonly Dictionary<string, Queue<int?>> _pathPings = new(StringComparer.Ordinal); // per connection; null = lost
+    private readonly Queue<int?> _bothPings = new();     // the faster answer of the connections each second
+    private (string Name, bool Phone, long? Sent, long? Received, long? QuietS)[] _paths = []; // the helper's last status
     private volatile JsonObject? _ping;
     private int _pingTicking;
     private string? _relayTunnelAddress, _relayEndpoint; // from the helper's replies
@@ -196,6 +201,7 @@ internal sealed class GameRelay : IDisposable
             // A held estimate repeats between measurements; only new ones go into the jitter window.
             if (ping is { } p && (profile is null || fresh)) Push(_pings, p);
             var relayMs = _relayTunnelAddress is { } relay ? Probe.Icmp(IPAddress.Parse(relay), source: null, tries: 1, timeoutMs: 500) : null;
+            var paths = _settings.Duplicate && _helperDuplicate == true ? PathPings() : null;
 
             var values = _pings.ToArray();
             double? jitter = values.Length >= 2 ? values.Zip(values.Skip(1), (a, b) => Math.Abs(b - a)).Average() : null;
@@ -217,6 +223,9 @@ internal sealed class GameRelay : IDisposable
                     ["ms"] = relayMs,
                     ["backup"] = _settings.Duplicate && _helperDuplicate == true,
                     ["paths_ok"] = _settings.Duplicate ? Interlocked.Read(ref _pathsOk) : null,
+                    // With "Use phone as backup": each connection's ping to the relay server, and "both" (see PathPings).
+                    ["paths"] = paths?.Paths,
+                    ["both"] = paths?.Both,
                 },
             };
         }
@@ -230,6 +239,69 @@ internal sealed class GameRelay : IDisposable
             Volatile.Write(ref _pingTicking, 0);
         }
     }
+
+    /// <summary>
+    /// With "Use phone as backup", for the site's connection page: this second's ping to the relay server over each
+    /// connection (ICMP from that adapter's address, so it leaves through it), and over the last minute each one's
+    /// average, median, worst and lost pings. "Both" is the faster answer each second, which is what duplication gets:
+    /// a ping lost on one connection still counts when the other answered. Null without the helper's connection list.
+    /// </summary>
+    private (JsonArray Paths, JsonObject Both)? PathPings()
+    {
+        var paths = _paths;
+        if (paths.Length == 0 || !IPEndPoint.TryParse(_relayEndpoint ?? "", out var endpoint) || IPAddress.IsLoopback(endpoint.Address)) return null;
+
+        var probes = paths.Select(p => Task.Run(() => AdapterAddress(p.Name) is { } source
+            ? Probe.Icmp(endpoint.Address, source, tries: 1, timeoutMs: 900) : null)).ToArray();
+        Task.WaitAll(probes);
+        var rows = new JsonArray();
+        int? best = null;
+        for (var i = 0; i < paths.Length; i++)
+        {
+            var (name, phone, sent, received, quiet) = paths[i];
+            var ms = probes[i].Result;
+            if (ms is { } m && (best is null || m < best)) best = m;
+            if (!_pathPings.TryGetValue(name, out var window)) _pathPings[name] = window = new();
+            PushPath(window, ms);
+            var row = PathSummary(window);
+            row["name"] = name;
+            row["phone"] = phone;
+            row["ms"] = ms;
+            row["sent"] = sent;
+            row["received"] = received;
+            row["quiet_s"] = quiet;
+            rows.Add(row);
+        }
+        PushPath(_bothPings, best);
+        var both = PathSummary(_bothPings);
+        both["ms"] = best;
+        return (rows, both);
+    }
+
+    private static void PushPath(Queue<int?> window, int? ms)
+    {
+        window.Enqueue(ms);
+        while (window.Count > PathWindow) window.Dequeue();
+    }
+
+    /// <summary>A connection's last minute: avg_ms, median_ms, worst_ms of the answered pings, lost of count.</summary>
+    private static JsonObject PathSummary(Queue<int?> window)
+    {
+        var answered = window.OfType<int>().Order().ToArray();
+        return new JsonObject
+        {
+            ["avg_ms"] = answered.Length > 0 ? Math.Round(answered.Average(), 1) : null,
+            ["median_ms"] = answered.Length > 0 ? answered[answered.Length / 2] : null,
+            ["worst_ms"] = answered.Length > 0 ? answered[^1] : null,
+            ["lost"] = window.Count(ms => ms is null),
+            ["count"] = window.Count,
+        };
+    }
+
+    /// <summary>The IPv4 address of the network adapter with this name (the helper names connections by adapter), or null.</summary>
+    private static IPAddress? AdapterAddress(string name) =>
+        NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == name && n.OperationalStatus == OperationalStatus.Up)
+            ?.GetIPProperties().UnicastAddresses.FirstOrDefault(a => a.Address.AddressFamily == AddressFamily.InterNetwork)?.Address;
 
     /// <summary>
     /// The time to a game profile's target: measured every 5 seconds (ICMP, then the faster of two TCP handshakes on 443
@@ -444,6 +516,8 @@ internal sealed class GameRelay : IDisposable
         _relayTunnelAddress = (string?)reply["relay"] ?? _relayTunnelAddress;
         _relayEndpoint = (string?)reply["endpoint"] ?? _relayEndpoint;
         Interlocked.Exchange(ref _pathsOk, (reply["paths"] as JsonArray ?? []).OfType<JsonObject>().Count(p => (long?)p["quiet_s"] is <= 30));
+        _paths = (reply["paths"] as JsonArray ?? []).OfType<JsonObject>()
+            .Select(p => ((string?)p["name"] ?? "?", (bool?)p["phone"] == true, (long?)p["sent"], (long?)p["received"], (long?)p["quiet_s"])).ToArray();
         PathLines = (reply["paths"] as JsonArray ?? []).OfType<JsonObject>().Select(p =>
         {
             var name = (string?)p["name"] ?? "?";
