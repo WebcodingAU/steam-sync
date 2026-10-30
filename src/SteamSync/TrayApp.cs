@@ -206,7 +206,7 @@ internal sealed class TrayApp : ApplicationContext
     /// <summary>
     /// The Game relay submenu: the setup until it has run, then the relay's status, a tick per game (running games
     /// and every game with relay settings; ticked by default, untick to keep a game off the relay), Compare ping for
-    /// the running game, and relay.json for typed-in ranges.
+    /// the running game, relay.json for typed-in ranges, and replacing the relay's client config.
     /// </summary>
     private void BuildRelayMenu()
     {
@@ -253,7 +253,7 @@ internal sealed class TrayApp : ApplicationContext
             Enabled = _relay.DuplicateAvailable || _relay.Duplicate,
             ToolTipText = _relay.DuplicateAvailable
                 ? "Sends each relayed packet over every connection (Starlink and a USB-tethered phone), so a packet one drops still arrives. Only relayed game traffic uses mobile data."
-                : "Your relay config has no packet duplication set up ([GamingEnjoyer] DuplicateEndpoint).",
+                : "Your relay config has no packet duplication set up ([GamingEnjoyer] DuplicateEndpoint). Use \"Replace relay config…\" with a config that has it.",
         };
         backup.CheckedChanged += (_, _) => _relay.SetDuplicate(backup.Checked);
         items.Add(backup);
@@ -268,6 +268,15 @@ internal sealed class TrayApp : ApplicationContext
         items.Add(new ToolStripMenuItem("Edit relay ranges (relay.json)", null, (_, _) => OpenUrl(GameRelay.SettingsFile))
         {
             Enabled = File.Exists(GameRelay.SettingsFile),
+        });
+        items.Add(new ToolStripMenuItem("Replace relay config…", null, async (_, _) =>
+        {
+            if (PickRelayConfig() is { } file)
+                await RelayAdminAsync(GameRelay.SetUpAsync(file), "Relay config replaced. The relay helper restarted with it.");
+        })
+        {
+            ToolTipText = "Pick a new WireGuard client config for the relay (to add packet duplication, say). Installs this app's relay helper with it, "
+                + "asking for administrator rights once. Your games' relay settings are kept.",
         });
         items.Add(new ToolStripMenuItem("Remove game relay…", null, async (_, _) =>
         {
@@ -364,15 +373,20 @@ internal sealed class TrayApp : ApplicationContext
         }
     }
 
-    private async Task SetUpRelayAsync()
+    private static string? PickRelayConfig()
     {
         using var pick = new OpenFileDialog
         {
             Title = "Your relay's WireGuard client config",
             Filter = "WireGuard config (*.conf)|*.conf|All files (*.*)|*.*",
         };
-        if (pick.ShowDialog() != DialogResult.OK) return;
-        if (await RelayAdminAsync(GameRelay.SetUpAsync(pick.FileName), "Game relay set up. Every game goes through it: the first time, a game disconnects once briefly while it switches over. Untick one in the Game relay menu to keep it off."))
+        return pick.ShowDialog() == DialogResult.OK ? pick.FileName : null;
+    }
+
+    private async Task SetUpRelayAsync()
+    {
+        if (PickRelayConfig() is not { } file) return;
+        if (await RelayAdminAsync(GameRelay.SetUpAsync(file),"Game relay set up. Every game goes through it: the first time, a game disconnects once briefly while it switches over. Untick one in the Game relay menu to keep it off."))
             _relay.Start();
     }
 
