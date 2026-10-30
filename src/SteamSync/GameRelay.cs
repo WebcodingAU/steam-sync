@@ -210,7 +210,7 @@ internal sealed class GameRelay : IDisposable
             }
 
             var rtt = proto == "tcp" ? TcpTable.Rtt(server) : null;
-            var icmp = Probe.Icmp(address, source: null, tries: 1, timeoutMs: 900);
+            var icmp = Probe.IcmpRouted(address);
             Push(_icmpAnswers, icmp is not null);
             // Behind a CDN (a game profile covers the server) both only reach the CDN's edge: the profile's target in
             // the servers' real region is the figure then, and the edge's stays alongside.
@@ -220,7 +220,7 @@ internal sealed class GameRelay : IDisposable
             var ping = profile is null ? edge : estimate;
             // A held estimate repeats between measurements; only new ones go into the jitter window.
             if (ping is { } p && (profile is null || fresh)) Push(_pings, p);
-            var relayMs = _relayTunnelAddress is { } relay ? Probe.Icmp(IPAddress.Parse(relay), source: null, tries: 1, timeoutMs: 500) : null;
+            var relayMs = _relayTunnelAddress is { } relay ? Probe.IcmpRouted(IPAddress.Parse(relay), timeoutMs: 500) : null;
             var paths = _settings.Duplicate && _helperDuplicate == true ? PathPings() : null;
 
             var values = _pings.ToArray();
@@ -339,7 +339,7 @@ internal sealed class GameRelay : IDisposable
         {
             _estimateNext = now + EstimateEvery;
             if (ProfileTarget(profile.Target) is { } target
-                && (Probe.Icmp(target, source: null, tries: 1, timeoutMs: 900) ?? Probe.TcpHandshake(target, 443)) is { } ms)
+                && (Probe.IcmpRouted(target) ?? Probe.TcpHandshake(target, 443)) is { } ms)
             {
                 _estimate = (ms, now);
                 fresh = true;
@@ -579,7 +579,7 @@ internal sealed class GameRelay : IDisposable
         if (fresh || DateTimeOffset.UtcNow - _upSince < StaleHandshake)
         {
             var relay = (string?)reply["relay"];
-            var rtt = relay is null ? null : await Task.Run(() => Probe.Icmp(IPAddress.Parse(relay), source: null));
+            var rtt = relay is null ? null : await Task.Run(() => Probe.IcmpRouted(IPAddress.Parse(relay), tries: 3, timeoutMs: 1500));
             SetStatus($"Relay: on for {games}{(rtt is { } ms ? $" · {ms} ms to the relay" : fresh ? "" : " · connecting")}");
             return;
         }
@@ -944,6 +944,30 @@ internal static class Probe
         }
         catch (SocketException) { return null; }
     }
+
+    /// <summary>
+    /// The address of the adapter Windows routes this target through (GetBestInterface): the source to give Icmp. Left
+    /// to choose by itself, IcmpSendEcho2Ex in the installed tray app got no answers from anything reached over Wi-Fi
+    /// (Tarkov's raid server, Oracle's Phoenix host) while the same calls with an adapter's address as the source
+    /// worked in the same process, and while the tunnel's targets answered either way (0.4.1-beta.16).
+    /// </summary>
+    public static IPAddress? RouteSource(IPAddress target)
+    {
+        if (GetBestInterface(BitConverter.ToUInt32(target.GetAddressBytes()), out var index) != 0) return null;
+        try
+        {
+            return NetworkInterface.GetAllNetworkInterfaces()
+                .FirstOrDefault(n => n.Supports(NetworkInterfaceComponent.IPv4) && n.GetIPProperties().GetIPv4Properties()?.Index == index)
+                ?.GetIPProperties().UnicastAddresses.FirstOrDefault(a => a.Address.AddressFamily == AddressFamily.InterNetwork)?.Address;
+        }
+        catch (NetworkInformationException) { return null; }
+    }
+
+    /// <summary>ICMP from the routed adapter's address (RouteSource), the best of a few tries.</summary>
+    public static int? IcmpRouted(IPAddress target, int tries = 1, uint timeoutMs = 900) => Icmp(target, RouteSource(target), tries, timeoutMs);
+
+    [DllImport("iphlpapi.dll")]
+    private static extern int GetBestInterface(uint destAddr, out uint bestIfIndex);
 
     /// <summary>ICMP first, then the best of 3 TCP handshakes to the port. Milliseconds, or null.</summary>
     public static async Task<int?> TimeAsync(IPAddress target, int port, IPAddress? source)
