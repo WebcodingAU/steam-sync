@@ -1,0 +1,10 @@
+[
+  {
+    "name": "AION 2 (North America)",
+    "keys": ["steam:3393110"],
+    "servers": ["193.202.112.0/24"],
+    "region": "US Phoenix",
+    "target": "iaas.us-phoenix-1.oraclecloud.com",
+    "note": "AION 2's servers sit behind Cloudflare, so a ping reaches Cloudflare's nearest edge (Sydney), not the server. ExitLag routes AION 2 to US Phoenix, so this is the time to Oracle Cloud's Phoenix region by your normal route. (objectstorage.us-phoenix-1 now resolves to an Australian cache and doesn't answer.)"
+  }
+]

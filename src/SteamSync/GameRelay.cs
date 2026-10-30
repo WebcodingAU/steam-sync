@@ -24,7 +24,9 @@ namespace SteamSync;
 /// <para>
 /// What goes through it: every game's ranges, except the games unticked in the tray's Game relay menu. Ranges are learned:
 /// while a game runs, every public IPv4 server its own processes hold a TCP connection to for 20 seconds or more (a
-/// minute when switching mid-game is off; game sessions, not short web requests) adds that address's /24. Ranges can
+/// minute when switching mid-game is off; game sessions, not short web requests) adds that address's /24. Web ports (80
+/// and 443) aren't learned: those are the game's web, login and store requests, and mostly go to shared content networks
+/// (Cloudflare, Akamai, CloudFront), whose /24s also carry unrelated sites, this app's own sync to Supabase among them. Ranges can
 /// also be typed into relay.json by hand (UDP-only games, whose peers can't be seen without admin rights).
 /// </para>
 /// <para>
@@ -97,6 +99,8 @@ internal sealed class GameRelay : IDisposable
     private readonly Queue<double> _pings = new();       // the ping figures of the last PingWindow seconds
     private readonly Queue<bool> _icmpAnswers = new();   // whether the server answered each ICMP echo, same window
     private string? _pingFor;                            // game key + server the windows belong to
+    private readonly GameProfiles _profiles = new();
+    private (string Host, IPAddress? Address, DateTime ResolvedAt) _profileTarget = ("", null, DateTime.MinValue);
     private volatile JsonObject? _ping;
     private int _pingTicking;
     private string? _relayTunnelAddress, _relayEndpoint; // from the helper's replies
@@ -178,7 +182,12 @@ internal sealed class GameRelay : IDisposable
             var rtt = TcpTable.Rtt(server);
             var icmp = Probe.Icmp(address, source: null, tries: 1, timeoutMs: 900);
             Push(_icmpAnswers, icmp is not null);
-            var ping = rtt ?? icmp;
+            // Behind a CDN (a game profile covers the server) both only reach the CDN's edge: the profile's target in
+            // the servers' real region is the figure then, and the edge's stays alongside.
+            var edge = rtt ?? icmp;
+            var profile = _profiles.Find(game.Key, address);
+            double? estimate = profile is not null && ProfileTarget(profile.Target) is { } target ? Probe.Icmp(target, source: null, tries: 1, timeoutMs: 900) : null;
+            var ping = profile is null ? edge : estimate;
             if (ping is { } p) Push(_pings, p);
             var relayMs = _relayTunnelAddress is { } relay ? Probe.Icmp(IPAddress.Parse(relay), source: null, tries: 1, timeoutMs: 500) : null;
 
@@ -190,8 +199,12 @@ internal sealed class GameRelay : IDisposable
                 ["jitter_ms"] = jitter is { } j ? Math.Round(j, 1) : null,
                 ["loss_pct"] = _icmpAnswers.Any(a => a) ? Math.Round(_icmpAnswers.Count(a => !a) * 100.0 / _icmpAnswers.Count, 1) : null,
                 ["window"] = values.Length,
-                ["ping_method"] = rtt is not null ? "tcp_rtt" : icmp is not null ? "icmp" : null,
+                ["ping_method"] = profile is not null ? (estimate is not null ? "profile_estimate" : null)
+                    : rtt is not null ? "tcp_rtt" : icmp is not null ? "icmp" : null,
                 ["server"] = new JsonObject { ["ip"] = address.ToString(), ["port"] = server.RemotePort, ["proto"] = "tcp" },
+                // With profile_estimate: the CDN edge's own figure (tcp_rtt or icmp), and where the servers really are.
+                ["edge_ms"] = profile is not null && edge is { } e ? Math.Round(e, 1) : null,
+                ["profile"] = profile is null ? null : new JsonObject { ["name"] = profile.Name, ["region"] = profile.Region, ["target"] = profile.Target },
                 ["relay"] = new JsonObject
                 {
                     ["endpoint"] = _relayEndpoint,
@@ -210,6 +223,17 @@ internal sealed class GameRelay : IDisposable
         {
             Volatile.Write(ref _pingTicking, 0);
         }
+    }
+
+    /// <summary>A game profile's target host as an IPv4 address, looked up every 10 minutes (a minute after a failed lookup).</summary>
+    private IPAddress? ProfileTarget(string host)
+    {
+        var (cached, address, at) = _profileTarget;
+        if (cached == host && DateTime.UtcNow - at < (address is null ? TimeSpan.FromMinutes(1) : TimeSpan.FromMinutes(10))) return address;
+        try { address = Dns.GetHostAddresses(host).FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork); }
+        catch (SocketException) { address = null; }
+        _profileTarget = (host, address, DateTime.UtcNow);
+        return address;
     }
 
     private static void Push<T>(Queue<T> window, T value)
@@ -287,7 +311,7 @@ internal sealed class GameRelay : IDisposable
             foreach (var g in running) foreach (var pid in g.Pids) byPid.TryAdd(pid, g);
             foreach (var row in TcpTable.Established())
             {
-                if (!byPid.TryGetValue(row.Pid, out var game) || !IsPublic(row.Remote)) continue;
+                if (!byPid.TryGetValue(row.Pid, out var game) || !IsPublic(row.Remote) || row.RemotePort is 80 or 443) continue;
                 var key = (row.Pid, row.Remote, row.RemotePort);
                 seen.Add(key);
                 if (!_firstSeen.TryGetValue(key, out var first)) _firstSeen[key] = first = now;
@@ -485,7 +509,18 @@ internal sealed class GameRelay : IDisposable
     {
         try
         {
-            if (File.Exists(SettingsFile)) return JsonSerializer.Deserialize<RelaySettings>(File.ReadAllText(SettingsFile), Json) ?? new();
+            if (!File.Exists(SettingsFile)) return new();
+            var settings = JsonSerializer.Deserialize<RelaySettings>(File.ReadAllText(SettingsFile), Json) ?? new();
+            if (settings.LearnedVersion < RelaySettings.CurrentLearnedVersion)
+            {
+                // Learned before web ports were skipped: mostly content networks' /24s. Forget them once; each game's
+                // real servers are learned again within its first 20 seconds of play. Typed-in ranges stay.
+                foreach (var g in settings.Games.Values) g.Learned.Clear();
+                settings.LearnedVersion = RelaySettings.CurrentLearnedVersion;
+                File.WriteAllText(SettingsFile, JsonSerializer.Serialize(settings, Json));
+                Log.Info("Relay: cleared learned ranges once (web ports are no longer learned)");
+            }
+            return settings;
         }
         catch (Exception ex) when (ex is IOException or JsonException)
         {
@@ -587,6 +622,9 @@ internal sealed class RelaySettings
     public Dictionary<string, RelayGame> Games { get; set; } = new(StringComparer.Ordinal);
     public bool Duplicate { get; set; }
     public bool SwitchMidGame { get; set; } = true; // relay.json from before 0.4.1-beta.8 has none: on
+    /// <summary>2 once learned ranges were cleared of web-port servers (LoadSettings); older relay.json has none (0).</summary>
+    public int LearnedVersion { get; set; }
+    public const int CurrentLearnedVersion = 2;
 }
 
 /// <summary>One game's relay settings in relay.json: kept off the relay or not, ranges typed in by hand, ranges learned.
