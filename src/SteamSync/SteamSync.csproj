@@ -22,6 +22,8 @@
   <ItemGroup>
     <EmbeddedResource Include="appsettings.json" LogicalName="SteamSync.appsettings.json" />
     <EmbeddedResource Include="app.ico" LogicalName="SteamSync.app.ico" />
+    <!-- Built-in equalizer presets (Equalizer APO config files), put back in the presets folder when missing. -->
+    <EmbeddedResource Include="presets\*.txt" LogicalName="SteamSync.presets.%(Filename)%(Extension)" />
   </ItemGroup>
 
   <ItemGroup>
