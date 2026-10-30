@@ -29,7 +29,9 @@ namespace SteamSync;
 /// ports (NotLearnedPorts) aren't learned: those are the game's web, login, store and notification connections, and mostly
 /// go to shared networks (Cloudflare, Akamai, CloudFront, Google), whose /24s also carry unrelated sites, this app's own
 /// sync to Supabase among them. Neither are launchers' connections (BsgLauncher's Cloudflare and Google push channels
-/// were Tarkov's only learned "servers", while its raids are UDP). Ranges can
+/// were Tarkov's only learned "servers"). UDP game servers are learned too (UdpPeers: a steady flow both ways for as long),
+/// such as Tarkov's raid servers; a range found that way joins the relay only once its flow has ended (the next raid),
+/// since moving a live UDP flow would end it. Ranges can
 /// also be typed into relay.json by hand (UDP-only games, whose peers can't be seen without admin rights).
 /// </para>
 /// <para>
@@ -67,6 +69,8 @@ internal sealed class GameRelay : IDisposable
     private readonly object _gate = new();
     private readonly RelaySettings _settings;
     private readonly Dictionary<(int Pid, uint Remote, int Port), DateTimeOffset> _firstSeen = [];
+    private readonly UdpPeers _udp = new();      // the games' UDP servers (raids), which the TCP table can't show
+    private HashSet<string> _liveUdp = [];        // /24s the running games have a live UDP flow with, as of the last Learn
     private List<string>? _applied;          // the ranges last sent with "up"; null = down or not known yet
     private DateTimeOffset _upSince, _lastHealth = DateTimeOffset.MinValue, _downUntil = DateTimeOffset.MinValue;
     private int _ticking;
@@ -175,13 +179,17 @@ internal sealed class GameRelay : IDisposable
 
             var carried = applied.Select(r => Cidr.TryParse(r, out var c) ? c : (Cidr?)null).OfType<Cidr>().ToList();
             var pids = game.Pids.ToHashSet();
-            // Game servers rather than its web requests: not 80/443 when there's a choice.
+            // Game servers rather than its web requests: not 80/443 when there's a choice. A game whose server is UDP
+            // (Tarkov's raids) has none of those: then its busiest live UDP server through the relay, timed by ICMP.
             var server = TcpTable.Established().Where(r => pids.Contains(r.Pid) && carried.Any(c => c.Contains(r.Remote)))
                 .OrderBy(r => r.RemotePort is 80 or 443).FirstOrDefault();
-            if (server.Remote == 0) { _ping = null; return; }
+            var (remote, port, proto) = (server.Remote, server.RemotePort, "tcp");
+            if (remote == 0 && _udp.Read(pids).FirstOrDefault(p => p.Quiet < TimeSpan.FromSeconds(5) && carried.Any(c => c.Contains(p.Remote))) is { Remote: not 0 } udp)
+                (remote, port, proto) = (udp.Remote, udp.Port, "udp");
+            if (remote == 0) { _ping = null; return; }
 
-            var address = new IPAddress(server.Remote);
-            var key = $"{game.Key} {address}:{server.RemotePort}";
+            var address = new IPAddress(remote);
+            var key = $"{game.Key} {address}:{port}";
             if (_pingFor != key)
             {
                 _pingFor = key;
@@ -191,7 +199,7 @@ internal sealed class GameRelay : IDisposable
                 _estimateNext = DateTime.MinValue;
             }
 
-            var rtt = TcpTable.Rtt(server);
+            var rtt = proto == "tcp" ? TcpTable.Rtt(server) : null;
             var icmp = Probe.Icmp(address, source: null, tries: 1, timeoutMs: 900);
             Push(_icmpAnswers, icmp is not null);
             // Behind a CDN (a game profile covers the server) both only reach the CDN's edge: the profile's target in
@@ -215,7 +223,7 @@ internal sealed class GameRelay : IDisposable
                 ["window"] = values.Length,
                 ["ping_method"] = profile is not null ? (estimate is not null ? "profile_estimate" : null)
                     : rtt is not null ? "tcp_rtt" : icmp is not null ? "icmp" : null,
-                ["server"] = new JsonObject { ["ip"] = address.ToString(), ["port"] = server.RemotePort, ["proto"] = "tcp" },
+                ["server"] = new JsonObject { ["ip"] = address.ToString(), ["port"] = port, ["proto"] = proto },
                 // With profile_estimate: the CDN edge's own figure (tcp_rtt or icmp), and where the servers really are.
                 ["edge_ms"] = profile is not null && edge is { } e ? Math.Round(e, 1) : null,
                 ["profile"] = profile is null ? null : new JsonObject { ["name"] = profile.Name, ["region"] = profile.Region, ["target"] = profile.Target },
@@ -405,6 +413,9 @@ internal sealed class GameRelay : IDisposable
     /// <summary>Web (80, 443, Cloudflare's other HTTP/HTTPS ports, 8080/8443) and Google push (5228-5230): never game servers.</summary>
     private static readonly HashSet<int> NotLearnedPorts = [80, 443, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8080, 8443, 8880, 5228, 5229, 5230];
 
+    /// <summary>UDP services that are never a game server: DNS, NTP, NetBIOS, SSDP, STUN, mDNS, LLMNR.</summary>
+    private static readonly HashSet<int> UdpServicePorts = [53, 123, 137, 138, 1900, 3478, 3479, 5353, 5355, 19302];
+
     private readonly Dictionary<int, bool> _launchers = [];
 
     /// <summary>Whether the process is a game launcher or store client (counted in the game's session for play time, but
@@ -447,7 +458,31 @@ internal sealed class GameRelay : IDisposable
                     Log.Info($"Relay: learned {range} for {game.Name} (port {row.RemotePort})");
                 }
             }
+
+            // UDP game servers (Tarkov's raids): a flow with traffic both ways, at least 2 batches a second each way, for as
+            // long as a TCP server has to be held. Short lookups (DNS, STUN, mDNS, time) never get there.
+            var live = new HashSet<string>();
+            foreach (var peer in _udp.Read(byPid.Keys))
+            {
+                if (!byPid.TryGetValue(peer.Pid, out var game) || !IsPublic(peer.Remote) || NotLearnedPorts.Contains(peer.Port)
+                    || UdpServicePorts.Contains(peer.Port) || IsLauncher(peer.Pid)) continue;
+                var range = Slash24(peer.Remote);
+                if (peer.Quiet < TimeSpan.FromSeconds(10)) live.Add(range);
+                var seconds = peer.Age.TotalSeconds;
+                if (peer.Age < (_settings.SwitchMidGame ? LearnAfterMidGame : LearnAfter) || peer.Quiet > TimeSpan.FromSeconds(5)
+                    || peer.Sent < 2 * seconds || peer.Received < 2 * seconds) continue;
+                lock (_gate)
+                {
+                    var g = Game(game.Key, game.Name);
+                    if (g.Learned.Contains(range) || g.Ranges.Contains(range) || g.Learned.Count >= MaxRangesPerGame) continue;
+                    g.Learned.Add(range);
+                    changed = true;
+                    Log.Info($"Relay: learned {range} for {game.Name} (UDP port {peer.Port}; joins the relay once that flow ends)");
+                }
+            }
+            _liveUdp = live;
         }
+        else _liveUdp = [];
         foreach (var gone in _firstSeen.Keys.Where(k => !seen.Contains(k)).ToList()) _firstSeen.Remove(gone);
         if (running.Count == 0) _launchers.Clear(); // pids get reused
         if (changed) lock (_gate) SaveSettings();
@@ -465,7 +500,12 @@ internal sealed class GameRelay : IDisposable
     /// game has servers learned yet. Called while no game runs, or at any time with "Switch mid-game" on.</summary>
     private async Task ApplyAsync()
     {
-        var ranges = DesiredRanges();
+        // A live UDP flow can't move onto or off the relay without breaking (it would end a Tarkov raid, which has no
+        // reconnect like a TCP session): a range with one keeps its current path until that flow goes quiet.
+        var live = _liveUdp;
+        var desired = DesiredRanges();
+        var ranges = desired.Where(r => !live.Contains(r) || (_applied?.Contains(r) ?? false))
+            .Union((_applied ?? []).Where(live.Contains)).Distinct().OrderBy(r => r, StringComparer.Ordinal).ToList();
         if (ranges.Count == 0)
         {
             if (_applied is not null || Status.StartsWith("Relay: starting"))
@@ -473,7 +513,7 @@ internal sealed class GameRelay : IDisposable
                 var down = await RelayClient.SendAsync(new JsonObject { ["cmd"] = "down" });
                 if (down is not null) { _applied = null; Remember(down); }
             }
-            SetStatus("Relay: off (no game servers learned yet)");
+            SetStatus(desired.Count > 0 ? "Relay: off until the game's current server is done (next raid or match)" : "Relay: off (no game servers learned yet)");
             return;
         }
         if (DateTimeOffset.UtcNow < _downUntil || (_applied is not null && _applied.SequenceEqual(ranges))) return;
@@ -662,6 +702,7 @@ internal sealed class GameRelay : IDisposable
 
     public void Dispose()
     {
+        _udp.Dispose();
         _timer.Dispose();
         _pingTimer.Dispose();
     }
