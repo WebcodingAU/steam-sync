@@ -6,7 +6,8 @@ namespace SteamSync;
 /// Beta builds only: while a game runs, the PC's load once a second (SystemStats: CPU, GPU, memory load, an
 /// approximate responsiveness and the game's own CPU), for the site's PC load badge and page. Sent through
 /// report_live_ping, the table live ping used, as a sample with a "system" object and no ping. When the game stops
-/// it sends null, which clears the PC's row. A stable build never starts it.
+/// it sends null, which clears the PC's row. A stable build never starts it. While the game goes through the game
+/// relay, the sample also carries its live ping (GameRelay.PingSample: ping_ms, jitter_ms, loss_pct, server, relay).
 /// </summary>
 internal sealed class PcLoad : IDisposable
 {
@@ -14,16 +15,18 @@ internal sealed class PcLoad : IDisposable
 
     private readonly SupabaseApi? _api;
     private readonly PlayTracker _play;
+    private readonly GameRelay _relay;
     private readonly SystemStats _system = new();
     private readonly System.Threading.Timer _timer;
     private int _ticking, _uploading;
     private bool _live;                     // the site holds a sample from this PC, so a stop must be sent
     private DateTimeOffset _skipUntil = DateTimeOffset.MinValue;
 
-    public PcLoad(AppConfig config, PlayTracker play)
+    public PcLoad(AppConfig config, PlayTracker play, GameRelay relay)
     {
         if (config.IsConfigured) _api = new SupabaseApi(config.SupabaseUrl, config.SupabaseAnonKey);
         _play = play;
+        _relay = relay;
         _timer = new(_ => _ = TickAsync());
     }
 
@@ -58,6 +61,12 @@ internal sealed class PcLoad : IDisposable
                 ["system"] = _system.Sample(game.Pids),
                 ["app_version"] = AppInfo.Version,
             };
+            if (_relay.PingSample is { } ping)
+                foreach (var (name, value) in ping.ToList())
+                {
+                    ping.Remove(name);
+                    sample[name] = value;
+                }
             if (Interlocked.Exchange(ref _uploading, 1) == 1) return; // the last second's upload is still going: skip this one
             _ = Task.Run(async () =>
             {

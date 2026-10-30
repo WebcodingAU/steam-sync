@@ -80,11 +80,24 @@ internal sealed class GameRelay : IDisposable
 
     private bool? _helperDuplicate;          // what the helper last said; null = not asked yet
 
+    // Live ping of the relayed game (PingTick), sent with the PC load sample (PingSample).
+    private static readonly TimeSpan PingEvery = TimeSpan.FromSeconds(1);
+    private const int PingWindow = 30;
+    private readonly System.Threading.Timer _pingTimer;
+    private readonly Queue<double> _pings = new();       // the ping figures of the last PingWindow seconds
+    private readonly Queue<bool> _icmpAnswers = new();   // whether the server answered each ICMP echo, same window
+    private string? _pingFor;                            // game key + server the windows belong to
+    private volatile JsonObject? _ping;
+    private int _pingTicking;
+    private string? _relayTunnelAddress, _relayEndpoint; // from the helper's replies
+    private long _pathsOk;
+
     public GameRelay(PlayTracker play)
     {
         _play = play;
         _settings = LoadSettings();
         _timer = new(_ => _ = TickAsync());
+        _pingTimer = new(_ => PingTick());
     }
 
     /// <summary>The relay helper service is installed (the relay has been set up on this PC).</summary>
@@ -108,7 +121,91 @@ internal sealed class GameRelay : IDisposable
 
     public void Start()
     {
-        if (IsSetUp) _timer.Change(TimeSpan.FromSeconds(3), Tick);
+        if (!IsSetUp) return;
+        _timer.Change(TimeSpan.FromSeconds(3), Tick);
+        _pingTimer.Change(PingEvery, PingEvery);
+    }
+
+    /// <summary>
+    /// The running game's live ping while it goes through the relay, for the PC load sample (the site's ping pill):
+    /// ping_ms, jitter_ms, loss_pct, window, ping_method, server {ip, port, proto} and relay {endpoint, ms, backup,
+    /// paths_ok}. Null when no switched-on game is running or its server doesn't go through the relay.
+    /// </summary>
+    public JsonObject? PingSample => _ping?.DeepClone() as JsonObject;
+
+    /// <summary>
+    /// Once a second while a switched-on game runs with the tunnel up: its longest-standing TCP server inside the
+    /// relayed ranges, timed by Windows' own RTT for that connection (tcp_rtt; the game's real traffic through the
+    /// relay), or by ICMP when there's no RTT sample (icmp; the echo takes the same route). Loss comes from ICMP when the
+    /// server answers it at all, jitter from how much successive figures differ. The relay leg (this PC to the relay)
+    /// is pinged too.
+    /// </summary>
+    private void PingTick()
+    {
+        if (Interlocked.Exchange(ref _pingTicking, 1) == 1) return;
+        try
+        {
+            var applied = _applied;
+            var game = _play.Running.FirstOrDefault(g => Enabled(g.Key));
+            if (game is null || applied is null) { _ping = null; return; }
+
+            var carried = applied.Select(r => Cidr.TryParse(r, out var c) ? c : (Cidr?)null).OfType<Cidr>().ToList();
+            var pids = game.Pids.ToHashSet();
+            // Game servers rather than its web requests: not 80/443 when there's a choice.
+            var server = TcpTable.Established().Where(r => pids.Contains(r.Pid) && carried.Any(c => c.Contains(r.Remote)))
+                .OrderBy(r => r.RemotePort is 80 or 443).FirstOrDefault();
+            if (server.Remote == 0) { _ping = null; return; }
+
+            var address = new IPAddress(server.Remote);
+            var key = $"{game.Key} {address}:{server.RemotePort}";
+            if (_pingFor != key)
+            {
+                _pingFor = key;
+                _pings.Clear();
+                _icmpAnswers.Clear();
+            }
+
+            var rtt = TcpTable.Rtt(server);
+            var icmp = Probe.Icmp(address, source: null, tries: 1, timeoutMs: 900);
+            Push(_icmpAnswers, icmp is not null);
+            var ping = rtt ?? icmp;
+            if (ping is { } p) Push(_pings, p);
+            var relayMs = _relayTunnelAddress is { } relay ? Probe.Icmp(IPAddress.Parse(relay), source: null, tries: 1, timeoutMs: 500) : null;
+
+            var values = _pings.ToArray();
+            double? jitter = values.Length >= 2 ? values.Zip(values.Skip(1), (a, b) => Math.Abs(b - a)).Average() : null;
+            _ping = new JsonObject
+            {
+                ["ping_ms"] = ping is { } v ? Math.Round(v, 1) : null,
+                ["jitter_ms"] = jitter is { } j ? Math.Round(j, 1) : null,
+                ["loss_pct"] = _icmpAnswers.Any(a => a) ? Math.Round(_icmpAnswers.Count(a => !a) * 100.0 / _icmpAnswers.Count, 1) : null,
+                ["window"] = values.Length,
+                ["ping_method"] = rtt is not null ? "tcp_rtt" : icmp is not null ? "icmp" : null,
+                ["server"] = new JsonObject { ["ip"] = address.ToString(), ["port"] = server.RemotePort, ["proto"] = "tcp" },
+                ["relay"] = new JsonObject
+                {
+                    ["endpoint"] = _relayEndpoint,
+                    ["ms"] = relayMs,
+                    ["backup"] = _settings.Duplicate && _helperDuplicate == true,
+                    ["paths_ok"] = _settings.Duplicate ? Interlocked.Read(ref _pathsOk) : null,
+                },
+            };
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Relay ping failed", ex);
+            _ping = null;
+        }
+        finally
+        {
+            Volatile.Write(ref _pingTicking, 0);
+        }
+    }
+
+    private static void Push<T>(Queue<T> window, T value)
+    {
+        window.Enqueue(value);
+        while (window.Count > PingWindow) window.Dequeue();
     }
 
     /// <summary>The games the tray lists: running ones first, then every game with relay settings.</summary>
@@ -276,6 +373,9 @@ internal sealed class GameRelay : IDisposable
         HelperVersion = (string?)reply["version"] ?? HelperVersion;
         DuplicateAvailable = (bool?)reply["duplicate_available"] ?? false;
         _helperDuplicate = (bool?)reply["duplicate"];
+        _relayTunnelAddress = (string?)reply["relay"] ?? _relayTunnelAddress;
+        _relayEndpoint = (string?)reply["endpoint"] ?? _relayEndpoint;
+        Interlocked.Exchange(ref _pathsOk, (reply["paths"] as JsonArray ?? []).OfType<JsonObject>().Count(p => (long?)p["quiet_s"] is <= 30));
         PathLines = (reply["paths"] as JsonArray ?? []).OfType<JsonObject>().Select(p =>
         {
             var name = (string?)p["name"] ?? "?";
@@ -374,7 +474,11 @@ internal sealed class GameRelay : IDisposable
         catch (IOException ex) { Log.Error("Couldn't save relay.json", ex); }
     }
 
-    public void Dispose() => _timer.Dispose();
+    public void Dispose()
+    {
+        _timer.Dispose();
+        _pingTimer.Dispose();
+    }
 
     // ---- installing, updating and removing the helper (each one UAC prompt) ----
 
@@ -489,12 +593,34 @@ internal readonly record struct Cidr(uint Network, uint Mask)
     }
 }
 
-/// <summary>Established IPv4 TCP connections with their owning process (GetExtendedTcpTable; no admin needed).</summary>
+/// <summary>
+/// Established IPv4 TCP connections with their owning process (GetExtendedTcpTable), and Windows' own round-trip time
+/// for one of them (GetPerTcpConnectionEStats, FineRtt). Neither needs admin rights: Windows already collects FineRtt
+/// for every connection, so reading it works for any user. The RTT is the game's own connection, updated whenever it
+/// carries data.
+/// </summary>
 internal static class TcpTable
 {
-    public readonly record struct Row(int Pid, uint Remote, int RemotePort);
+    public readonly record struct Row(int Pid, uint Remote, int RemotePort)
+    {
+        internal uint RawLocalAddr { get; init; }
+        internal uint RawLocalPort { get; init; }
+        internal uint RawRemotePort { get; init; }
+    }
 
-    private const int AfInet = 2, TcpTableOwnerPidConnections = 4, StateEstablished = 5;
+    private const int AfInet = 2, TcpTableOwnerPidConnections = 4, StateEstablished = 5, EstatsFineRtt = 8;
+
+    /// <summary>The connection's smoothed RTT in milliseconds, or null when Windows has no sample for it (yet).</summary>
+    public static unsafe double? Rtt(Row row)
+    {
+        var r = new MibTcpRow { State = StateEstablished, LocalAddr = row.RawLocalAddr, LocalPort = row.RawLocalPort, RemoteAddr = row.Remote, RemotePort = row.RawRemotePort };
+        byte enabled = 0;
+        FineRttRod rod = default;
+        var error = GetPerTcpConnectionEStats(ref r, EstatsFineRtt, (IntPtr)(&enabled), 0, 1, IntPtr.Zero, 0, 0, (IntPtr)(&rod), 0, (uint)sizeof(FineRttRod));
+        if (error != 0 || enabled == 0 || rod.MaxRtt == 0) return null;
+        // SumRtt reads as the current smoothed RTT on Windows 11 (it moves with the connection, it doesn't grow), in µs.
+        return rod.SumRtt / 1000.0;
+    }
 
     public static List<Row> Established()
     {
@@ -513,7 +639,10 @@ internal static class TcpTable
                 {
                     var r = Marshal.PtrToStructure<MibTcpRowOwnerPid>(buffer + 4 + i * rowSize);
                     if (r.State == StateEstablished)
-                        rows.Add(new Row((int)r.Pid, r.RemoteAddr, (int)(((r.RemotePort & 0xFF) << 8) | ((r.RemotePort >> 8) & 0xFF))));
+                        rows.Add(new Row((int)r.Pid, r.RemoteAddr, (int)(((r.RemotePort & 0xFF) << 8) | ((r.RemotePort >> 8) & 0xFF)))
+                        {
+                            RawLocalAddr = r.LocalAddr, RawLocalPort = r.LocalPort, RawRemotePort = r.RemotePort,
+                        });
                 }
                 return rows;
             }
@@ -525,8 +654,18 @@ internal static class TcpTable
     [StructLayout(LayoutKind.Sequential)]
     private struct MibTcpRowOwnerPid { public uint State, LocalAddr, LocalPort, RemoteAddr, RemotePort, Pid; }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MibTcpRow { public uint State, LocalAddr, LocalPort, RemoteAddr, RemotePort; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FineRttRod { public uint RttVar, MaxRtt, MinRtt, SumRtt; }
+
     [DllImport("iphlpapi.dll")]
     private static extern uint GetExtendedTcpTable(IntPtr table, ref int size, bool order, int af, int tableClass, int reserved);
+
+    [DllImport("iphlpapi.dll")]
+    private static extern uint GetPerTcpConnectionEStats(ref MibTcpRow row, int type, IntPtr rw, uint rwVersion, uint rwSize,
+        IntPtr ros, uint rosVersion, uint rosSize, IntPtr rod, uint rodVersion, uint rodSize);
 }
 
 /// <summary>
@@ -571,8 +710,8 @@ internal static class Probe
         catch (Exception ex) when (ex is SocketException or OperationCanceledException) { return null; }
     }
 
-    /// <summary>One ICMP echo (IcmpSendEcho2Ex, best of 3), from the given source address or the routed one.</summary>
-    public static unsafe int? Icmp(IPAddress target, IPAddress? source)
+    /// <summary>ICMP echo (IcmpSendEcho2Ex), the best of a few tries, from the given source address or the routed one.</summary>
+    public static unsafe int? Icmp(IPAddress target, IPAddress? source, int tries = 3, uint timeoutMs = 1500)
     {
         var handle = IcmpCreateFile();
         if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return null;
@@ -583,9 +722,9 @@ internal static class Probe
             var data = stackalloc byte[32];
             var reply = stackalloc byte[256];
             int? best = null;
-            for (var i = 0; i < 3; i++)
+            for (var i = 0; i < tries; i++)
             {
-                if (IcmpSendEcho2Ex(handle, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, src, dest, data, 32, IntPtr.Zero, reply, 256, 1500) == 0) continue;
+                if (IcmpSendEcho2Ex(handle, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, src, dest, data, 32, IntPtr.Zero, reply, 256, timeoutMs) == 0) continue;
                 // ICMP_ECHO_REPLY: Address, Status, RoundTripTime, ... A reply from a router on the way (TTL expired,
                 // unreachable) isn't the target answering.
                 if (*(uint*)(reply + 4) != 0 || *(uint*)reply != dest) continue;

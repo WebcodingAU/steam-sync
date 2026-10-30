@@ -48,8 +48,8 @@ internal sealed class TrayApp : ApplicationContext
         _sync = new SyncService(config);
         _play = new PlayTracker(config);
         _sync.Scanned += _play.UpdateGames;
-        _pcLoad = new PcLoad(config, _play);
         _relay = new GameRelay(_play);
+        _pcLoad = new PcLoad(config, _play, _relay);
         _relayItem.DropDownItems.Add("…"); // rebuilt each time it opens (BuildRelayMenu); this only shows the arrow
         _relayItem.DropDownOpening += (_, _) => BuildRelayMenu();
 
