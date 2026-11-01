@@ -330,7 +330,7 @@ internal sealed class GameRelay : IDisposable
         if (profile?.EdgeToServerMs is not null)
         {
             var leg = Leg("CDN edge", $"Game server ({profile.Region})", hidden.Ms, "estimate");
-            leg["calibrated"] = hidden.From; // "relay" (measured from Sydney), "pc" (Phoenix minus Sydney from here) or "fixed"
+            leg["calibrated"] = hidden.From; // "pc" (the region minus Sydney, from here) or "fixed"
             leg["calibrated_at"] = hidden.At?.ToString("o");
             legs.Add(leg);
             total = edge + hidden.Ms;
@@ -346,36 +346,35 @@ internal sealed class GameRelay : IDisposable
     private DateTime _calibrateNext = DateTime.MinValue;
 
     /// <summary>
-    /// The hidden leg of a profile's route (CDN edge → the servers' region), recalibrated every 2 minutes: 5 pings to the
-    /// profile's target interleaved with 5 to a point in Sydney, median minus median. Through the relay (the target is in
-    /// its routes, DesiredRanges) that's the relay itself to the region, measured from Sydney; otherwise the target from
-    /// here minus the relay server's public address from here. Until one works, the profile's fixed figure.
+    /// The hidden leg of a profile's route (CDN edge → the servers' region), recalibrated every 2 minutes from this PC: 5
+    /// pings to the profile's target interleaved with 5 to the relay server's public address (Sydney, near the edge),
+    /// median minus median, both on the normal path. Not from the relay: the Linode's own transit to the US is far slower
+    /// than the CDN's backbone (Phoenix 327-334 ms from the relay vs ~135 from Sydney over Starlink), and a CDN-fronted
+    /// game's traffic leaves the relay at the CDN's Sydney edge. A reading outside 0.6-1.5x the profile's fixed figure
+    /// (a phone with a reset metric once made it 351) is ignored. Until one is kept, the fixed figure.
     /// </summary>
     private (double Ms, string From, DateTime? At) HiddenLeg(GameProfile profile, int fixedMs)
     {
         var now = DateTime.UtcNow;
-        if (now >= _calibrateNext && ProfileTarget(profile.Target) is { } target)
+        if (now >= _calibrateNext && ProfileTarget(profile.Target) is { } target && IPEndPoint.TryParse(_relayEndpoint ?? "", out var sydney))
         {
             _calibrateNext = now + CalibrateEvery;
-            var tunnel = _relayTunnelAddress is { } t && IPAddress.TryParse(t, out var ip) ? ip : null;
-            var throughRelay = tunnel is not null && Probe.RouteSource(target) is { } source && source.Equals(Probe.RouteSource(tunnel));
-            var near = throughRelay ? tunnel : IPEndPoint.TryParse(_relayEndpoint ?? "", out var ep) ? ep.Address : null;
-            if (!throughRelay && tunnel is not null) _calibrateNext = now + TimeSpan.FromSeconds(20); // the target's route is about to join
-            if (near is not null)
+            var far = new List<int>(); var near = new List<int>();
+            for (var i = 0; i < 5; i++)
             {
-                var far = new List<int>(); var close = new List<int>();
-                for (var i = 0; i < 5; i++)
+                if (Probe.IcmpRouted(target) is { } f) far.Add(f);
+                if (Probe.IcmpRouted(sydney.Address, timeoutMs: 500) is { } n) near.Add(n);
+            }
+            if (far.Count >= 2 && near.Count >= 2)
+            {
+                var ms = Math.Max(0, far.Order().ElementAt(far.Count / 2) - near.Order().ElementAt(near.Count / 2));
+                if (ms < fixedMs * 0.6 || ms > fixedMs * 1.5)
+                    Log.Info($"Relay: ignored {profile.Name}'s hidden leg reading of {ms} ms (expected about {fixedMs})");
+                else
                 {
-                    if (Probe.IcmpRouted(target) is { } f) far.Add(f);
-                    if (Probe.IcmpRouted(near, timeoutMs: 500) is { } c) close.Add(c);
-                }
-                if (far.Count >= 2 && close.Count >= 2)
-                {
-                    var ms = Math.Max(0, far.Order().ElementAt(far.Count / 2) - close.Order().ElementAt(close.Count / 2));
-                    var from = throughRelay ? "relay" : "pc";
-                    if (!_hiddenLegs.TryGetValue(profile.Name, out var old) || Math.Abs(old.Ms - ms) >= 10 || old.From != from)
-                        Log.Info($"Relay: {profile.Name}'s hidden leg ({profile.Region}) calibrated to {ms} ms from {(throughRelay ? "the relay" : "this PC")}");
-                    _hiddenLegs[profile.Name] = (ms, from, now);
+                    if (!_hiddenLegs.TryGetValue(profile.Name, out var old) || Math.Abs(old.Ms - ms) >= 10)
+                        Log.Info($"Relay: {profile.Name}'s hidden leg ({profile.Region}) calibrated to {ms} ms");
+                    _hiddenLegs[profile.Name] = (ms, "pc", now);
                 }
             }
         }
@@ -437,7 +436,7 @@ internal sealed class GameRelay : IDisposable
         if (cached == host && DateTime.UtcNow - at < (address is null ? TimeSpan.FromMinutes(1) : TimeSpan.FromMinutes(10))) return address;
         try
         {
-            // Keep the same address while DNS still lists it (round robin): it's in the relay's routes (DesiredRanges).
+            // Keep the same address while DNS still lists it (round robin), so successive measurements compare.
             var found = Dns.GetHostAddresses(host).Where(a => a.AddressFamily == AddressFamily.InterNetwork).ToList();
             address = cached == host && address is not null && found.Contains(address) ? address : found.FirstOrDefault();
         }
@@ -604,14 +603,8 @@ internal sealed class GameRelay : IDisposable
     {
         lock (_gate)
         {
-            var ranges = _settings.Games.Values.Where(g => g.Enabled).SelectMany(g => g.Ranges.Union(g.Learned)).ToList();
-            // With a relayed game behind a CDN, its profile's target too (one address, nothing else talks to it): pinged
-            // through the relay, it measures the hidden leg from Sydney (HiddenLeg).
-            var (host, address, _) = _profileTarget;
-            if (address is not null && _settings.Games.Any(kv => kv.Value.Enabled && kv.Value.Ranges.Union(kv.Value.Learned).Any()
-                    && _profiles.ForGame(kv.Key).Any(p => p.EdgeToServerMs is not null && p.Target == host)))
-                ranges.Add($"{address}/32");
-            return ranges.Where(r => Cidr.TryParse(r, out _)).Distinct().OrderBy(r => r, StringComparer.Ordinal).ToList();
+            return _settings.Games.Values.Where(g => g.Enabled).SelectMany(g => g.Ranges.Union(g.Learned))
+                .Where(r => Cidr.TryParse(r, out _)).Distinct().OrderBy(r => r, StringComparer.Ordinal).ToList();
         }
     }
 
