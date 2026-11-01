@@ -76,6 +76,7 @@ internal sealed class SystemStats : IDisposable
             _queueCount = 0;
 
             var cores = Environment.ProcessorCount;
+            var fps = _frames.Read(gamePids, out var scaledFps) ?? FrameRate.Read(gamePids);
             var memory = new MemoryStatusEx { Length = (uint)Marshal.SizeOf<MemoryStatusEx>() };
             var haveMemory = GlobalMemoryStatusEx(ref memory);
 
@@ -94,7 +95,10 @@ internal sealed class SystemStats : IDisposable
                 ["ready_queue_max"] = Round(queueMax),
                 ["cores"] = cores,
                 ["game_cpu_pct"] = Round(GameCpu(gamePids, cores)),
-                ["fps"] = (_frames.Read(gamePids) ?? FrameRate.Read(gamePids)) is { } fps ? Math.Round(fps) : null,
+                ["fps"] = fps is { } f ? Math.Round(f) : null,
+                // What reaches the screen when Lossless Scaling scales the game (its frame generation included); fps stays the game's own.
+                ["fps_scaled"] = scaledFps is { } s ? Math.Round(s) : null,
+                ["fps_scaler"] = scaledFps is null ? null : "Lossless Scaling",
             };
         }
     }

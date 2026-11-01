@@ -21,6 +21,11 @@ namespace SteamSync;
 /// starts on the first read and stops when nothing has asked for a few seconds (no game running). The provider and
 /// event ids are filtered in the kernel, so only these few events per frame are delivered.
 /// </para>
+/// <para>
+/// Lossless Scaling's frame generation happens in its own process: it captures the game's window and presents its own
+/// overlay at the generated rate (Guild Wars 2: the game 150, LosslessScaling.exe 293 with LSFG 2×). It only presents while
+/// it's scaling, so while it does and the game presents too, its rate is what reaches the screen (Read's scaled).
+/// </para>
 /// </summary>
 internal sealed unsafe class FrameCounter : IDisposable
 {
@@ -72,9 +77,12 @@ internal sealed unsafe class FrameCounter : IDisposable
     }
 
     /// <summary>The frame rate of the busiest of these processes since the last read, or null (no presents counted,
-    /// the session couldn't start, or it has only just started).</summary>
-    public double? Read(IReadOnlyCollection<int> pids)
+    /// the session couldn't start, or it has only just started). Scaled: Lossless Scaling's frame rate when it's
+    /// presenting too (scaling the game, frame generation included), else null.</summary>
+    public double? Read(IReadOnlyCollection<int> pids, out double? scaled)
     {
+        scaled = null;
+        var scalers = ScalerPids();
         lock (_lock)
         {
             if (_disposed || pids.Count == 0) return null;
@@ -96,9 +104,27 @@ internal sealed unsafe class FrameCounter : IDisposable
                 if (!_frames.TryGetValue((uint)pid, out var f)) continue;
                 if (f.Fps is { } v && (best is null || v > best)) best = v;
             }
+            if (best is not null)
+                foreach (var pid in scalers)
+                    if (_frames.TryGetValue(pid, out var f) && f.Fps is { } v && (scaled is null || v > scaled)) scaled = v;
             _frames.Clear();
             return best;
         }
+    }
+
+    private static readonly TimeSpan ScalersEvery = TimeSpan.FromSeconds(5);
+    private uint[] _scalers = [];
+    private long _scalersAt = long.MinValue;
+
+    /// <summary>Lossless Scaling's processes, looked up every few seconds.</summary>
+    private uint[] ScalerPids()
+    {
+        if (_scalersAt != long.MinValue && Stopwatch.GetElapsedTime(_scalersAt) < ScalersEvery) return _scalers;
+        _scalersAt = Stopwatch.GetTimestamp();
+        var found = Process.GetProcessesByName("LosslessScaling");
+        _scalers = found.Select(p => (uint)p.Id).ToArray();
+        foreach (var p in found) p.Dispose();
+        return _scalers;
     }
 
     private bool StartLocked()
