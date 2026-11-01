@@ -50,7 +50,9 @@ internal sealed class PcLoad : IDisposable
                 return;
             }
 
-            var game = games[0];
+            // The game the relay times (a launcher left open, LOTRO's next to Last Epoch, is a running game without a
+            // server), so the FPS and the ping are the same game's; the relay's games list has every game's ping.
+            var game = games.FirstOrDefault(g => g.Key == _relay.PingGame) ?? games[0];
             var sample = new JsonObject
             {
                 ["v"] = 1,

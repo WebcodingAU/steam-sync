@@ -32,7 +32,8 @@ internal sealed class UnreachableProbe
         public DateTime GaveUpUntil;
     }
 
-    private readonly Dictionary<(IPAddress, int), State> _servers = [];
+    // Concurrent: the relay measures several running games at once (each its own server, so each State has one user).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(IPAddress, int), State> _servers = [];
 
     public bool CanTry(IPAddress ip, int gamePort) =>
         !_servers.TryGetValue((ip, gamePort), out var s) || s.Port is not null || DateTime.UtcNow >= s.GaveUpUntil;
@@ -47,7 +48,7 @@ internal sealed class UnreachableProbe
 
     private async Task<(int? Port, double? Ms)> ProbeAsync(IPAddress ip, int gamePort)
     {
-        if (!_servers.TryGetValue((ip, gamePort), out var s)) _servers[(ip, gamePort)] = s = new State();
+        var s = _servers.GetOrAdd((ip, gamePort), _ => new State());
         var source = SteamSync.Probe.RouteSource(ip);
 
         if (s.Port is { } known)

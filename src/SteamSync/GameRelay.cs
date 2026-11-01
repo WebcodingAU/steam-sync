@@ -103,22 +103,29 @@ internal sealed class GameRelay : IDisposable
     private static readonly TimeSpan PingEvery = TimeSpan.FromSeconds(1);
     private const int PingWindow = 30;
     private readonly System.Threading.Timer _pingTimer;
-    private readonly Queue<double> _pings = new();       // the ping figures of the last PingWindow seconds
-    private readonly Queue<bool> _icmpAnswers = new();   // whether the server answered each ICMP echo (or udp_unreachable), same window
-    private bool _icmpSeen;                              // the server has answered ICMP: no udp_unreachable for it
+    private readonly Dictionary<string, PingState> _pingStates = []; // per running game (key)
     private readonly UnreachableProbe _unreachable = new(); // UDP servers that ignore ICMP (WARDOGS)
-    private string? _pingFor;                            // game key + server the windows belong to
     private readonly GameProfiles _profiles = new();
     private (string Host, IPAddress? Address, DateTime ResolvedAt) _profileTarget = ("", null, DateTime.MinValue);
     private static readonly TimeSpan EstimateEvery = TimeSpan.FromSeconds(5), EstimateHold = TimeSpan.FromSeconds(30);
-    private (double Ms, DateTime At)? _estimate;         // the profile target's last answer
-    private DateTime _estimateNext = DateTime.MinValue;
     private const int PathWindow = 60;                   // seconds of per-connection pings (the site's connection table)
     private readonly Dictionary<string, Queue<int?>> _pathPings = new(StringComparer.Ordinal); // per connection; null = lost
     private readonly Queue<int?> _bothPings = new();     // the faster answer of the connections each second
     private (string Name, bool Phone, long? Sent, long? Received, long? QuietS)[] _paths = []; // the helper's last status
     private volatile JsonObject? _ping;
+    private volatile string? _pingGame;                  // the game key the sample's top-level ping is for
     private int _pingTicking;
+
+    /// <summary>One game's ping windows, reset when its server changes.</summary>
+    private sealed class PingState
+    {
+        public string? For;                              // the server (address:port) the windows belong to
+        public readonly Queue<double> Pings = new();     // the ping figures of the last PingWindow seconds
+        public readonly Queue<bool> Answers = new();     // whether the server answered each ICMP echo (or udp_unreachable), same window
+        public bool IcmpSeen;                            // the server has answered ICMP: no udp_unreachable for it
+        public (double Ms, DateTime At)? Estimate;       // the profile target's last answer
+        public DateTime EstimateNext = DateTime.MinValue;
+    }
     private string? _relayTunnelAddress, _relayEndpoint; // from the helper's replies
     private long _pathsOk;
 
@@ -157,15 +164,20 @@ internal sealed class GameRelay : IDisposable
     }
 
     /// <summary>
-    /// The running game's live ping while it goes through the relay, for the PC load sample (the site's ping pill):
-    /// ping_ms, jitter_ms, loss_pct, window, ping_method, server {ip, port, proto} and relay {endpoint, ms, backup,
-    /// paths_ok}. relay.routed is false when the game's server is timed on the direct path because it doesn't go through
-    /// the relay (yet). Null when no game is running or no game server is seen.
+    /// The running games' live ping, for the PC load sample (the site's ping pill): ping_ms, jitter_ms, loss_pct, window,
+    /// ping_method, server {ip, port, proto}, route and relay {routed, endpoint, ms, backup, paths_ok, paths, both} for
+    /// the main game (PingGame), and games: one entry per running game with a server seen (game_key, game_name, routed
+    /// and the same per-game fields). relay.routed is false when the main game's server is timed on the direct path
+    /// because it doesn't go through the relay (yet). Null when no game is running or no game server is seen.
     /// </summary>
     public JsonObject? PingSample => _ping?.DeepClone() as JsonObject;
 
+    /// <summary>The game PingSample's top-level ping is for: the first running game with a relayed server, else the first
+    /// with any server. Null without one.</summary>
+    public string? PingGame => _pingGame;
+
     /// <summary>
-    /// Once a second while a relayed game runs with the tunnel up: its longest-standing TCP server inside the
+    /// Once a second while relayed games run with the tunnel up, for each game at once (MeasureGame): its longest-standing TCP server inside the
     /// relayed ranges, timed by Windows' own RTT for that connection (tcp_rtt; the game's real traffic through the
     /// relay), or by ICMP when there's no RTT sample (icmp; the echo takes the same route), or for a UDP server that
     /// ignores ICMP by its "port unreachable" next to the game port (udp_unreachable, UnreachableProbe). Loss comes from ICMP when the
@@ -178,109 +190,164 @@ internal sealed class GameRelay : IDisposable
         try
         {
             var applied = _applied;
-            var game = _play.Running.FirstOrDefault(g => Enabled(g.Key));
-            if (game is null) { _ping = null; return; }
+            // Every enabled game that's running: a launcher left open (LOTRO's, next to Last Epoch) counts as a running
+            // game but has no game server, so the game timed is the first with a relayed server, else the first with any.
+            var games = _play.Running.Where(g => Enabled(g.Key)).ToList();
+            foreach (var gone in _pingStates.Keys.Where(k => games.All(g => g.Key != k)).ToList()) _pingStates.Remove(gone);
+            if (games.Count == 0) { Clear(); return; }
 
             var carried = (applied ?? []).Select(r => Cidr.TryParse(r, out var c) ? c : (Cidr?)null).OfType<Cidr>().ToList();
-            var pids = game.Pids.ToHashSet();
             var tcp = TcpTable.Established();
-            var udpPeers = _udp.Read(pids);
-            // Game servers rather than its web requests: not 80/443 when there's a choice. A game whose server is UDP
-            // (Tarkov's raids) has none of those: then its busiest live UDP server through the relay, timed by ICMP.
-            var server = tcp.Where(r => pids.Contains(r.Pid) && carried.Any(c => c.Contains(r.Remote)))
-                .OrderBy(r => r.RemotePort is 80 or 443).FirstOrDefault();
-            var (remote, port, proto) = (server.Remote, server.RemotePort, "tcp");
-            if (remote == 0 && udpPeers.FirstOrDefault(p => p.Quiet < TimeSpan.FromSeconds(5) && carried.Any(c => c.Contains(p.Remote))) is { Remote: not 0 } udp)
-                (remote, port, proto) = (udp.Remote, udp.Port, "udp");
-            // Not through the relay (not learned yet, or a raid server held direct until its raid ends): the game's live
-            // server is still timed, on the direct path, so the site shows its ping marked "direct".
-            var routed = remote != 0;
-            if (!routed && udpPeers.FirstOrDefault(p => p.Quiet < TimeSpan.FromSeconds(5) && IsGameFlow(p)) is { Remote: not 0 } direct)
-                (remote, port, proto) = (direct.Remote, direct.Port, "udp");
-            if (!routed && remote == 0 && tcp.FirstOrDefault(r => pids.Contains(r.Pid) && IsPublic(r.Remote) && !NotLearnedPorts.Contains(r.RemotePort) && !IsLauncher(r.Pid)) is { Remote: not 0 } row)
-                (server, remote, port, proto) = (row, row.Remote, row.RemotePort, "tcp");
-            if (remote == 0) { _ping = null; return; }
+            var allPeers = _udp.Read(games.SelectMany(g => g.Pids).ToHashSet());
+            var found = games.Select(g => (Game: g, Server: FindServer(g))).Where(f => f.Server.Remote != 0).ToList();
+            if (found.Count == 0) { Clear(); return; }
 
-            var address = new IPAddress(remote);
-            var key = $"{game.Key} {address}:{port}";
-            if (_pingFor != key)
+            // Every game at once (a server that ignores ping costs up to a second), and the relay legs meanwhile.
+            var measuring = found.Select(f =>
             {
-                _pingFor = key;
-                _pings.Clear();
-                _icmpAnswers.Clear();
-                _icmpSeen = false;
-                _estimate = null;
-                _estimateNext = DateTime.MinValue;
-            }
-
-            var rtt = proto == "tcp" ? TcpTable.Rtt(server) : null;
-            // A UDP server that ignores ICMP (WARDOGS) is timed by the "port unreachable" its own host sends for a byte to a
-            // closed port next to the game's. Once such a port answers, ICMP isn't waited for any more (it never answered).
-            var unreachableOnly = proto == "udp" && !_icmpSeen && _unreachable.KnownPort(address, port) is not null;
-            var icmp = unreachableOnly ? null : Probe.IcmpRouted(address);
-            if (icmp is not null) _icmpSeen = true;
-            (int? Port, double? Ms) unreachable = proto == "udp" && icmp is null && !_icmpSeen && _unreachable.CanTry(address, port)
-                ? _unreachable.Probe(address, port) : default;
-            Push(_icmpAnswers, icmp is not null || unreachable.Ms is not null);
-            // Behind a CDN (a game profile covers the server) both only reach the CDN's edge: the profile's target in
-            // the servers' real region is the figure then, and the edge's stays alongside.
-            var edge = rtt ?? icmp ?? unreachable.Ms;
-            // For the route, ICMP first: a quiet TCP connection's RTT runs high (delayed acks), and the edge answers ping.
-            var routeEdge = icmp ?? rtt ?? unreachable.Ms;
+                if (!_pingStates.TryGetValue(f.Game.Key, out var state)) _pingStates[f.Game.Key] = state = new PingState();
+                return Task.Run(() => MeasureGame(f.Game, f.Server, state));
+            }).ToArray();
             var relayMs = _relayTunnelAddress is { } relay ? Probe.IcmpRouted(IPAddress.Parse(relay), timeoutMs: 500) : null;
-            var profile = _profiles.Find(game.Key, address);
-            // A profile with an edge → region leg: the live path to the edge plus that leg (calibrated every few minutes,
-            // else the profile's fixed figure), every second: the route's total. Without one, the time to the profile's target.
-            var hidden = profile?.EdgeToServerMs is { } fixedMs ? HiddenLeg(profile, fixedMs) : default;
-            var (estimate, fresh) = profile is null ? (null, false)
-                : profile.EdgeToServerMs is not null ? (routeEdge + hidden.Ms, true)
-                : ProfileEstimate(profile);
-            var ping = profile is null ? edge : estimate;
-            // A held estimate repeats between measurements; only new ones go into the jitter window.
-            if (ping is { } p && (profile is null || fresh)) Push(_pings, p);
             var paths = _settings.Duplicate && _helperDuplicate == true ? PathPings() : null;
-            var route = Route(routed, profile, routeEdge, relayMs, hidden);
+            Task.WaitAll(measuring);
 
-            var values = _pings.ToArray();
-            double? jitter = values.Length >= 2 ? values.Zip(values.Skip(1), (a, b) => Math.Abs(b - a)).Average() : null;
-            _ping = new JsonObject
+            var rows = new JsonArray();
+            JsonObject? main = null;
+            foreach (var (task, (game, server)) in measuring.Zip(found))
             {
-                ["ping_ms"] = ping is { } v ? Math.Round(v, 1) : null,
-                ["jitter_ms"] = jitter is { } j ? Math.Round(j, 1) : null,
-                ["loss_pct"] = _icmpAnswers.Any(a => a) ? Math.Round(_icmpAnswers.Count(a => !a) * 100.0 / _icmpAnswers.Count, 1) : null,
-                ["window"] = values.Length,
-                ["ping_method"] = profile is not null ? (estimate is not null ? "profile_estimate" : null)
-                    : rtt is not null ? "tcp_rtt" : icmp is not null ? "icmp" : unreachable.Ms is not null ? "udp_unreachable" : null,
-                ["server"] = new JsonObject { ["ip"] = address.ToString(), ["port"] = port, ["proto"] = proto },
-                // With udp_unreachable: the closed port that answers and this second's time (null: a miss, counted as loss).
-                ["unreachable"] = unreachable.Port is { } up ? new JsonObject { ["port"] = up, ["ms"] = unreachable.Ms is { } um ? Math.Round(um, 1) : null } : null,
-                // With profile_estimate: the CDN edge's own figure (tcp_rtt or icmp), and where the servers really are.
-                ["edge_ms"] = profile is not null && edge is { } e ? Math.Round(e, 1) : null,
-                ["profile"] = profile is null ? null : new JsonObject { ["name"] = profile.Name, ["region"] = profile.Region, ["target"] = profile.Target },
-                ["route"] = route,
-                ["relay"] = new JsonObject
-                {
-                    // False when the server above is timed on the direct path (not relayed, or held direct for now).
-                    ["routed"] = routed,
-                    ["endpoint"] = _relayEndpoint,
-                    ["ms"] = relayMs,
-                    ["backup"] = _settings.Duplicate && _helperDuplicate == true,
-                    ["paths_ok"] = _settings.Duplicate ? Interlocked.Read(ref _pathsOk) : null,
-                    // With "Use phone as backup": each connection's ping to the relay server, and "both" (see PathPings).
-                    ["paths"] = paths?.Paths,
-                    ["both"] = paths?.Both,
-                },
+                var (row, measured) = task.Result;
+                row["route"] = Route(server.Routed, measured.Profile, measured.RouteEdge, relayMs, measured.Hidden);
+                if (main is null && server.Routed) main = row;
+                rows.Add(row);
+            }
+            main ??= (JsonObject)rows[0]!;
+
+            // The main game's figures at the top level, as before there was a list.
+            var sample = (JsonObject)main.DeepClone();
+            var mainRouted = sample["routed"]!.GetValue<bool>();
+            _pingGame = sample["game_key"]!.GetValue<string>();
+            foreach (var name in new[] { "game_key", "game_name", "routed" }) sample.Remove(name);
+            sample["relay"] = new JsonObject
+            {
+                // False when the main game's server is timed on the direct path (not relayed, or held direct for now).
+                ["routed"] = mainRouted,
+                ["endpoint"] = _relayEndpoint,
+                ["ms"] = relayMs,
+                ["backup"] = _settings.Duplicate && _helperDuplicate == true,
+                ["paths_ok"] = _settings.Duplicate ? Interlocked.Read(ref _pathsOk) : null,
+                // With "Use phone as backup": each connection's ping to the relay server, and "both" (see PathPings).
+                ["paths"] = paths?.Paths,
+                ["both"] = paths?.Both,
             };
+            sample["games"] = rows;
+            _ping = sample;
+
+            // One game's server: through the relay if it has one there, else its live server on the direct path.
+            (TcpTable.Row Row, uint Remote, int Port, string Proto, bool Routed) FindServer(RunningGame game)
+            {
+                var pids = game.Pids.ToHashSet();
+                var udpPeers = allPeers.Where(p => pids.Contains(p.Pid)).ToList();
+                // Game servers rather than its web requests: not 80/443 when there's a choice. A game whose server is UDP
+                // (Tarkov's raids) has none of those: then its busiest live UDP server through the relay, timed by ICMP.
+                var server = tcp.Where(r => pids.Contains(r.Pid) && carried.Any(c => c.Contains(r.Remote)))
+                    .OrderBy(r => r.RemotePort is 80 or 443).FirstOrDefault();
+                var (remote, port, proto) = (server.Remote, server.RemotePort, "tcp");
+                if (remote == 0 && udpPeers.FirstOrDefault(p => p.Quiet < TimeSpan.FromSeconds(5) && carried.Any(c => c.Contains(p.Remote))) is { Remote: not 0 } udp)
+                    (remote, port, proto) = (udp.Remote, udp.Port, "udp");
+                // Not through the relay (not learned yet, or a raid server held direct until its raid ends): the game's live
+                // server is still timed, on the direct path, so the site shows its ping marked "direct".
+                var routed = remote != 0;
+                if (!routed && udpPeers.FirstOrDefault(p => p.Quiet < TimeSpan.FromSeconds(5) && IsGameFlow(p)) is { Remote: not 0 } direct)
+                    (remote, port, proto) = (direct.Remote, direct.Port, "udp");
+                if (!routed && remote == 0 && tcp.FirstOrDefault(r => pids.Contains(r.Pid) && IsPublic(r.Remote) && !NotLearnedPorts.Contains(r.RemotePort) && !IsLauncher(r.Pid)) is { Remote: not 0 } row)
+                    (server, remote, port, proto) = (row, row.Remote, row.RemotePort, "tcp");
+                return (server, remote, port, proto, routed);
+            }
         }
         catch (Exception ex)
         {
             Log.Error("Relay ping failed", ex);
-            _ping = null;
+            Clear();
         }
         finally
         {
             Volatile.Write(ref _pingTicking, 0);
         }
+
+        void Clear()
+        {
+            _ping = null;
+            _pingGame = null;
+        }
+    }
+
+    /// <summary>The route's inputs from MeasureGame (the route itself needs the relay leg, timed alongside).</summary>
+    private sealed record Measured(GameProfile? Profile, double? RouteEdge, (double Ms, string From, DateTime? At) Hidden);
+
+    /// <summary>One game's ping this second: its server timed (tcp_rtt, icmp or udp_unreachable; profile_estimate behind
+    /// a CDN), as its entry in the sample's games list, without the route.</summary>
+    private (JsonObject Row, Measured Measured) MeasureGame(RunningGame game, (TcpTable.Row Row, uint Remote, int Port, string Proto, bool Routed) server, PingState state)
+    {
+        var (row, remote, port, proto, routed) = server;
+        var address = new IPAddress(remote);
+        var key = $"{address}:{port}";
+        if (state.For != key)
+        {
+            state.For = key;
+            state.Pings.Clear();
+            state.Answers.Clear();
+            state.IcmpSeen = false;
+            state.Estimate = null;
+            state.EstimateNext = DateTime.MinValue;
+        }
+
+        var rtt = proto == "tcp" ? TcpTable.Rtt(row) : null;
+        // A UDP server that ignores ICMP (WARDOGS) is timed by the "port unreachable" its own host sends for a byte to a
+        // closed port next to the game's. Once such a port answers, ICMP isn't waited for any more (it never answered).
+        var unreachableOnly = proto == "udp" && !state.IcmpSeen && _unreachable.KnownPort(address, port) is not null;
+        var icmp = unreachableOnly ? null : Probe.IcmpRouted(address);
+        if (icmp is not null) state.IcmpSeen = true;
+        (int? Port, double? Ms) unreachable = proto == "udp" && icmp is null && !state.IcmpSeen && _unreachable.CanTry(address, port)
+            ? _unreachable.Probe(address, port) : default;
+        Push(state.Answers, icmp is not null || unreachable.Ms is not null);
+        // Behind a CDN (a game profile covers the server) both only reach the CDN's edge: the profile's target in
+        // the servers' real region is the figure then, and the edge's stays alongside.
+        var edge = rtt ?? icmp ?? unreachable.Ms;
+        // For the route, ICMP first: a quiet TCP connection's RTT runs high (delayed acks), and the edge answers ping.
+        var routeEdge = icmp ?? rtt ?? unreachable.Ms;
+        var profile = _profiles.Find(game.Key, address);
+        // A profile with an edge → region leg: the live path to the edge plus that leg (calibrated every few minutes,
+        // else the profile's fixed figure), every second: the route's total. Without one, the time to the profile's target.
+        var hidden = profile?.EdgeToServerMs is { } fixedMs ? HiddenLeg(profile, fixedMs) : default;
+        var (estimate, fresh) = profile is null ? (null, false)
+            : profile.EdgeToServerMs is not null ? (routeEdge + hidden.Ms, true)
+            : ProfileEstimate(profile, state);
+        var ping = profile is null ? edge : estimate;
+        // A held estimate repeats between measurements; only new ones go into the jitter window.
+        if (ping is { } p && (profile is null || fresh)) Push(state.Pings, p);
+
+        var values = state.Pings.ToArray();
+        double? jitter = values.Length >= 2 ? values.Zip(values.Skip(1), (a, b) => Math.Abs(b - a)).Average() : null;
+        return (new JsonObject
+        {
+            ["game_key"] = game.Key,
+            ["game_name"] = game.Name,
+            // False when this game's server is timed on the direct path (not relayed, or held direct for now).
+            ["routed"] = routed,
+            ["ping_ms"] = ping is { } v ? Math.Round(v, 1) : null,
+            ["jitter_ms"] = jitter is { } j ? Math.Round(j, 1) : null,
+            ["loss_pct"] = state.Answers.Any(a => a) ? Math.Round(state.Answers.Count(a => !a) * 100.0 / state.Answers.Count, 1) : null,
+            ["window"] = values.Length,
+            ["ping_method"] = profile is not null ? (estimate is not null ? "profile_estimate" : null)
+                : rtt is not null ? "tcp_rtt" : icmp is not null ? "icmp" : unreachable.Ms is not null ? "udp_unreachable" : null,
+            ["server"] = new JsonObject { ["ip"] = address.ToString(), ["port"] = port, ["proto"] = proto },
+            // With udp_unreachable: the closed port that answers and this second's time (null: a miss, counted as loss).
+            ["unreachable"] = unreachable.Port is { } up ? new JsonObject { ["port"] = up, ["ms"] = unreachable.Ms is { } um ? Math.Round(um, 1) : null } : null,
+            // With profile_estimate: the CDN edge's own figure (tcp_rtt or icmp), and where the servers really are.
+            ["edge_ms"] = profile is not null && edge is { } e ? Math.Round(e, 1) : null,
+            ["profile"] = profile is null ? null : new JsonObject { ["name"] = profile.Name, ["region"] = profile.Region, ["target"] = profile.Target },
+        }, new Measured(profile, routeEdge, hidden));
     }
 
     /// <summary>
@@ -367,6 +434,11 @@ internal sealed class GameRelay : IDisposable
     /// </summary>
     private (double Ms, string From, DateTime? At) HiddenLeg(GameProfile profile, int fixedMs)
     {
+        lock (_hiddenLegs) return HiddenLegLocked(profile, fixedMs); // games are measured in parallel
+    }
+
+    private (double Ms, string From, DateTime? At) HiddenLegLocked(GameProfile profile, int fixedMs)
+    {
         var now = DateTime.UtcNow;
         if (now >= _calibrateNext && ProfileTarget(profile.Target) is { } target && IPEndPoint.TryParse(_relayEndpoint ?? "", out var sydney))
         {
@@ -424,25 +496,30 @@ internal sealed class GameRelay : IDisposable
     /// third ping at one a second, and a tray app pinging every second stopped getting answers at all (0.4.1-beta.11).
     /// Fresh is true when this call measured it.
     /// </summary>
-    private (double? Ms, bool Fresh) ProfileEstimate(GameProfile profile)
+    private (double? Ms, bool Fresh) ProfileEstimate(GameProfile profile, PingState state)
     {
         var now = DateTime.UtcNow;
         var fresh = false;
-        if (now >= _estimateNext)
+        if (now >= state.EstimateNext)
         {
-            _estimateNext = now + EstimateEvery;
+            state.EstimateNext = now + EstimateEvery;
             if (ProfileTarget(profile.Target) is { } target
                 && (Probe.IcmpRouted(target) ?? Probe.TcpHandshake(target, 443)) is { } ms)
             {
-                _estimate = (ms, now);
+                state.Estimate = (ms, now);
                 fresh = true;
             }
         }
-        return (_estimate is { } e && now - e.At < EstimateHold ? e.Ms : null, fresh);
+        return (state.Estimate is { } e && now - e.At < EstimateHold ? e.Ms : null, fresh);
     }
 
     /// <summary>A game profile's target host as an IPv4 address, looked up every 10 minutes (a minute after a failed lookup).</summary>
     private IPAddress? ProfileTarget(string host)
+    {
+        lock (_profiles) return ProfileTargetLocked(host); // games are measured in parallel
+    }
+
+    private IPAddress? ProfileTargetLocked(string host)
     {
         var (cached, address, at) = _profileTarget;
         if (cached == host && DateTime.UtcNow - at < (address is null ? TimeSpan.FromMinutes(1) : TimeSpan.FromMinutes(10))) return address;
