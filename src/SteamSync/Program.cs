@@ -41,7 +41,7 @@ internal static class Program
             using var output = new StreamWriter(args[1]);
             for (var i = 0; i <= seconds; i++, Thread.Sleep(1000))
             {
-                var line = stats.Sample(pids).ToJsonString();
+                var line = stats.Sample([pids], 0, out _).ToJsonString();
                 if (i == 0) continue; // the first sample only starts the counters
                 output.WriteLine(line);
                 output.Flush();

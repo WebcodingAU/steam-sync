@@ -24,7 +24,8 @@ namespace SteamSync;
 /// <para>
 /// Lossless Scaling's frame generation happens in its own process: it captures the game's window and presents its own
 /// overlay at the generated rate (Guild Wars 2: the game 150, LosslessScaling.exe 293 with LSFG 2×). It only presents while
-/// it's scaling, so while it does and the game presents too, its rate is what reaches the screen (Read's scaled).
+/// it's scaling, so while it does and the game in front presents too, its rate is what reaches the screen for that
+/// game (Read's Scaled).
 /// </para>
 /// </summary>
 internal sealed unsafe class FrameCounter : IDisposable
@@ -76,39 +77,40 @@ internal sealed unsafe class FrameCounter : IDisposable
         _idleTimer = new(_ => StopIfIdle());
     }
 
-    /// <summary>The frame rate of the busiest of these processes since the last read, or null (no presents counted,
-    /// the session couldn't start, or it has only just started). Scaled: Lossless Scaling's frame rate when it's
-    /// presenting too (scaling the game, frame generation included), else null.</summary>
-    public double? Read(IReadOnlyCollection<int> pids, out double? scaled)
+    /// <summary>For each game (its processes), the frame rate of its busiest process since the last read, or null (no
+    /// presents counted, the session couldn't start, or it has only just started). One read for every running game, since
+    /// a read clears the counts. Scaled: Lossless Scaling's frame rate (frame generation included) while it presents,
+    /// given to the game scaledFor (the one in front: Lossless Scaling scales the focused window) when that game presents
+    /// too, else null.</summary>
+    public (double? Fps, double? Scaled)[] Read(IReadOnlyList<IReadOnlyCollection<int>> games, int scaledFor)
     {
-        scaled = null;
+        var result = new (double? Fps, double? Scaled)[games.Count];
         var scalers = ScalerPids();
         lock (_lock)
         {
-            if (_disposed || pids.Count == 0) return null;
+            if (_disposed || games.All(g => g.Count == 0)) return result;
             _lastReadAt = Stopwatch.GetTimestamp();
             if (_session == 0)
             {
-                if (_lastReadAt < _retryAt) return null;
+                if (_lastReadAt < _retryAt) return result;
                 if (!StartLocked())
                 {
                     _retryAt = _lastReadAt + (long)(RetryAfter.TotalSeconds * Stopwatch.Frequency);
-                    return null;
+                    return result;
                 }
-                return null; // the first frames arrive with the next read
+                return result; // the first frames arrive with the next read
             }
 
-            double? best = null;
-            foreach (var pid in pids)
-            {
-                if (!_frames.TryGetValue((uint)pid, out var f)) continue;
-                if (f.Fps is { } v && (best is null || v > best)) best = v;
-            }
-            if (best is not null)
+            for (var i = 0; i < games.Count; i++)
+                foreach (var pid in games[i])
+                    if (_frames.TryGetValue((uint)pid, out var f) && f.Fps is { } v && (result[i].Fps is null || v > result[i].Fps))
+                        result[i].Fps = v;
+            if (scaledFor >= 0 && scaledFor < games.Count && result[scaledFor].Fps is not null)
                 foreach (var pid in scalers)
-                    if (_frames.TryGetValue(pid, out var f) && f.Fps is { } v && (scaled is null || v > scaled)) scaled = v;
+                    if (_frames.TryGetValue(pid, out var f) && f.Fps is { } v && (result[scaledFor].Scaled is null || v > result[scaledFor].Scaled))
+                        result[scaledFor].Scaled = v;
             _frames.Clear();
-            return best;
+            return result;
         }
     }
 

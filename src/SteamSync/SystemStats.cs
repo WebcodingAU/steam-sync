@@ -47,12 +47,16 @@ internal sealed class SystemStats : IDisposable
         _queueTimer = new(_ => ReadQueue());
     }
 
-    /// <summary>The load since the last call (about a second), as the sample's "system" object.</summary>
-    public JsonObject Sample(IReadOnlyCollection<int> gamePids)
+    /// <summary>The load since the last call (about a second), as the sample's "system" object, with the game cpu and
+    /// FPS of games[foreground] (the one in front). Fps: every game's frame rate (and Lossless Scaling's, for the one in
+    /// front), for the sample's games list.</summary>
+    public JsonObject Sample(IReadOnlyList<IReadOnlyCollection<int>> games, int foreground, out (double? Fps, double? Scaled)[] fps)
     {
         lock (_lock)
         {
+            fps = new (double? Fps, double? Scaled)[games.Count];
             if (_disposed) return new JsonObject();
+            var gamePids = games[foreground];
             _lastSampleAt = Stopwatch.GetTimestamp();
             var started = !_running;
             if (started) StartLocked();
@@ -76,7 +80,9 @@ internal sealed class SystemStats : IDisposable
             _queueCount = 0;
 
             var cores = Environment.ProcessorCount;
-            var fps = _frames.Read(gamePids, out var scaledFps) ?? FrameRate.Read(gamePids);
+            fps = _frames.Read(games, scaledFor: foreground);
+            var (frontFps, scaledFps) = fps[foreground];
+            frontFps ??= FrameRate.Read(gamePids);
             var memory = new MemoryStatusEx { Length = (uint)Marshal.SizeOf<MemoryStatusEx>() };
             var haveMemory = GlobalMemoryStatusEx(ref memory);
 
@@ -95,7 +101,7 @@ internal sealed class SystemStats : IDisposable
                 ["ready_queue_max"] = Round(queueMax),
                 ["cores"] = cores,
                 ["game_cpu_pct"] = Round(GameCpu(gamePids, cores)),
-                ["fps"] = fps is { } f ? Math.Round(f) : null,
+                ["fps"] = frontFps is { } f ? Math.Round(f) : null,
                 // What reaches the screen when Lossless Scaling scales the game (its frame generation included); fps stays the game's own.
                 ["fps_scaled"] = scaledFps is { } s ? Math.Round(s) : null,
                 ["fps_scaler"] = scaledFps is null ? null : "Lossless Scaling",
