@@ -217,18 +217,19 @@ internal sealed class GameRelay : IDisposable
             var edge = rtt ?? icmp;
             // For the route, ICMP first: a quiet TCP connection's RTT runs high (delayed acks), and the edge answers ping.
             var routeEdge = icmp ?? rtt;
+            var relayMs = _relayTunnelAddress is { } relay ? Probe.IcmpRouted(IPAddress.Parse(relay), timeoutMs: 500) : null;
             var profile = _profiles.Find(game.Key, address);
-            // A profile with a fixed edge → region estimate: the live path to the edge plus that leg, every second
-            // (the route's total). Without one, the time to the profile's target.
+            // A profile with an edge → region leg: the live path to the edge plus that leg (calibrated every few minutes,
+            // else the profile's fixed figure), every second: the route's total. Without one, the time to the profile's target.
+            var hidden = profile?.EdgeToServerMs is { } fixedMs ? HiddenLeg(profile, fixedMs) : default;
             var (estimate, fresh) = profile is null ? (null, false)
-                : profile.EdgeToServerMs is { } fixedMs ? (routeEdge + fixedMs, true)
+                : profile.EdgeToServerMs is not null ? (routeEdge + hidden.Ms, true)
                 : ProfileEstimate(profile);
             var ping = profile is null ? edge : estimate;
             // A held estimate repeats between measurements; only new ones go into the jitter window.
             if (ping is { } p && (profile is null || fresh)) Push(_pings, p);
-            var relayMs = _relayTunnelAddress is { } relay ? Probe.IcmpRouted(IPAddress.Parse(relay), timeoutMs: 500) : null;
             var paths = _settings.Duplicate && _helperDuplicate == true ? PathPings() : null;
-            var route = Route(routed, profile, routeEdge, relayMs);
+            var route = Route(routed, profile, routeEdge, relayMs, hidden);
 
             var values = _pings.ToArray();
             double? jitter = values.Length >= 2 ? values.Zip(values.Skip(1), (a, b) => Math.Abs(b - a)).Average() : null;
@@ -315,7 +316,7 @@ internal sealed class GameRelay : IDisposable
     /// a last leg, edge → the servers' region, is the profile's fixed estimate (edgeToServerMs), so the total moves with
     /// the live legs. total_ms is null when a leg is missing this second.
     /// </summary>
-    private static JsonObject Route(bool routed, GameProfile? profile, double? edge, int? relayMs)
+    private static JsonObject Route(bool routed, GameProfile? profile, double? edge, int? relayMs, (double Ms, string From, DateTime? At) hidden)
     {
         var end = profile is null ? "Game server" : "CDN edge";
         var legs = new JsonArray();
@@ -326,15 +327,59 @@ internal sealed class GameRelay : IDisposable
         }
         else legs.Add(Leg("PC", end, edge, "live"));
         var total = edge;
-        if (profile is not null)
+        if (profile?.EdgeToServerMs is not null)
         {
-            legs.Add(Leg("CDN edge", $"Game server ({profile.Region})", profile.EdgeToServerMs, "estimate"));
-            total = profile.EdgeToServerMs is { } fixedMs ? edge + fixedMs : null;
+            var leg = Leg("CDN edge", $"Game server ({profile.Region})", hidden.Ms, "estimate");
+            leg["calibrated"] = hidden.From; // "relay" (measured from Sydney), "pc" (Phoenix minus Sydney from here) or "fixed"
+            leg["calibrated_at"] = hidden.At?.ToString("o");
+            legs.Add(leg);
+            total = edge + hidden.Ms;
         }
         return new JsonObject { ["legs"] = legs, ["total_ms"] = total is { } t ? Math.Round(t, 1) : null };
 
         static JsonObject Leg(string from, string to, double? ms, string kind) =>
             new() { ["from"] = from, ["to"] = to, ["ms"] = ms is { } m ? Math.Round(m, 1) : null, ["kind"] = kind };
+    }
+
+    private static readonly TimeSpan CalibrateEvery = TimeSpan.FromMinutes(2);
+    private readonly Dictionary<string, (double Ms, string From, DateTime At)> _hiddenLegs = []; // per profile name
+    private DateTime _calibrateNext = DateTime.MinValue;
+
+    /// <summary>
+    /// The hidden leg of a profile's route (CDN edge → the servers' region), recalibrated every 2 minutes: 5 pings to the
+    /// profile's target interleaved with 5 to a point in Sydney, median minus median. Through the relay (the target is in
+    /// its routes, DesiredRanges) that's the relay itself to the region, measured from Sydney; otherwise the target from
+    /// here minus the relay server's public address from here. Until one works, the profile's fixed figure.
+    /// </summary>
+    private (double Ms, string From, DateTime? At) HiddenLeg(GameProfile profile, int fixedMs)
+    {
+        var now = DateTime.UtcNow;
+        if (now >= _calibrateNext && ProfileTarget(profile.Target) is { } target)
+        {
+            _calibrateNext = now + CalibrateEvery;
+            var tunnel = _relayTunnelAddress is { } t && IPAddress.TryParse(t, out var ip) ? ip : null;
+            var throughRelay = tunnel is not null && Probe.RouteSource(target) is { } source && source.Equals(Probe.RouteSource(tunnel));
+            var near = throughRelay ? tunnel : IPEndPoint.TryParse(_relayEndpoint ?? "", out var ep) ? ep.Address : null;
+            if (!throughRelay && tunnel is not null) _calibrateNext = now + TimeSpan.FromSeconds(20); // the target's route is about to join
+            if (near is not null)
+            {
+                var far = new List<int>(); var close = new List<int>();
+                for (var i = 0; i < 5; i++)
+                {
+                    if (Probe.IcmpRouted(target) is { } f) far.Add(f);
+                    if (Probe.IcmpRouted(near, timeoutMs: 500) is { } c) close.Add(c);
+                }
+                if (far.Count >= 2 && close.Count >= 2)
+                {
+                    var ms = Math.Max(0, far.Order().ElementAt(far.Count / 2) - close.Order().ElementAt(close.Count / 2));
+                    var from = throughRelay ? "relay" : "pc";
+                    if (!_hiddenLegs.TryGetValue(profile.Name, out var old) || Math.Abs(old.Ms - ms) >= 10 || old.From != from)
+                        Log.Info($"Relay: {profile.Name}'s hidden leg ({profile.Region}) calibrated to {ms} ms from {(throughRelay ? "the relay" : "this PC")}");
+                    _hiddenLegs[profile.Name] = (ms, from, now);
+                }
+            }
+        }
+        return _hiddenLegs.TryGetValue(profile.Name, out var leg) ? (leg.Ms, leg.From, leg.At) : (fixedMs, "fixed", null);
     }
 
     private static void PushPath(Queue<int?> window, int? ms)
@@ -390,7 +435,12 @@ internal sealed class GameRelay : IDisposable
     {
         var (cached, address, at) = _profileTarget;
         if (cached == host && DateTime.UtcNow - at < (address is null ? TimeSpan.FromMinutes(1) : TimeSpan.FromMinutes(10))) return address;
-        try { address = Dns.GetHostAddresses(host).FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork); }
+        try
+        {
+            // Keep the same address while DNS still lists it (round robin): it's in the relay's routes (DesiredRanges).
+            var found = Dns.GetHostAddresses(host).Where(a => a.AddressFamily == AddressFamily.InterNetwork).ToList();
+            address = cached == host && address is not null && found.Contains(address) ? address : found.FirstOrDefault();
+        }
         catch (SocketException) { address = null; }
         _profileTarget = (host, address, DateTime.UtcNow);
         return address;
@@ -553,8 +603,16 @@ internal sealed class GameRelay : IDisposable
     private List<string> DesiredRanges()
     {
         lock (_gate)
-            return _settings.Games.Values.Where(g => g.Enabled).SelectMany(g => g.Ranges.Union(g.Learned))
-                .Where(r => Cidr.TryParse(r, out _)).Distinct().OrderBy(r => r, StringComparer.Ordinal).ToList();
+        {
+            var ranges = _settings.Games.Values.Where(g => g.Enabled).SelectMany(g => g.Ranges.Union(g.Learned)).ToList();
+            // With a relayed game behind a CDN, its profile's target too (one address, nothing else talks to it): pinged
+            // through the relay, it measures the hidden leg from Sydney (HiddenLeg).
+            var (host, address, _) = _profileTarget;
+            if (address is not null && _settings.Games.Any(kv => kv.Value.Enabled && kv.Value.Ranges.Union(kv.Value.Learned).Any()
+                    && _profiles.ForGame(kv.Key).Any(p => p.EdgeToServerMs is not null && p.Target == host)))
+                ranges.Add($"{address}/32");
+            return ranges.Where(r => Cidr.TryParse(r, out _)).Distinct().OrderBy(r => r, StringComparer.Ordinal).ToList();
+        }
     }
 
     /// <summary>Makes the helper route exactly the relayed games' ranges, or takes the tunnel down when no relayed
@@ -983,28 +1041,25 @@ internal static class Probe
     }
 
     /// <summary>
-    /// The address of the adapter Windows routes this target through (GetBestInterface): the source to give Icmp. Left
-    /// to choose by itself, IcmpSendEcho2Ex in the installed tray app got no answers from anything reached over Wi-Fi
-    /// (Tarkov's raid server, Oracle's Phoenix host) while the same calls with an adapter's address as the source
-    /// worked in the same process, and while the tunnel's targets answered either way (0.4.1-beta.16).
+    /// The source address Windows would use for traffic to this target (a connected UDP socket's local address; no packet
+    /// is sent): the source to give Icmp. Left to choose by itself, IcmpSendEcho2Ex in the installed tray app got no
+    /// answers from anything reached over Wi-Fi (Tarkov's raid server, Oracle's Phoenix host) while the same calls with
+    /// an adapter's address as the source worked in the same process (0.4.1-beta.16). GetBestInterface isn't used: it
+    /// ignores interface metrics and picked the tethered phone (metric 9000) for Phoenix, 360 ms over mobile data.
     /// </summary>
     public static IPAddress? RouteSource(IPAddress target)
     {
-        if (GetBestInterface(BitConverter.ToUInt32(target.GetAddressBytes()), out var index) != 0) return null;
         try
         {
-            return NetworkInterface.GetAllNetworkInterfaces()
-                .FirstOrDefault(n => n.Supports(NetworkInterfaceComponent.IPv4) && n.GetIPProperties().GetIPv4Properties()?.Index == index)
-                ?.GetIPProperties().UnicastAddresses.FirstOrDefault(a => a.Address.AddressFamily == AddressFamily.InterNetwork)?.Address;
+            using var s = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            s.Connect(new IPEndPoint(target, 9));
+            return (s.LocalEndPoint as IPEndPoint)?.Address;
         }
-        catch (NetworkInformationException) { return null; }
+        catch (SocketException) { return null; }
     }
 
     /// <summary>ICMP from the routed adapter's address (RouteSource), the best of a few tries.</summary>
     public static int? IcmpRouted(IPAddress target, int tries = 1, uint timeoutMs = 900) => Icmp(target, RouteSource(target), tries, timeoutMs);
-
-    [DllImport("iphlpapi.dll")]
-    private static extern int GetBestInterface(uint destAddr, out uint bestIfIndex);
 
     /// <summary>ICMP first, then the best of 3 TCP handshakes to the port. Milliseconds, or null.</summary>
     public static async Task<int?> TimeAsync(IPAddress target, int port, IPAddress? source)

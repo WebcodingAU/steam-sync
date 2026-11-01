@@ -41,6 +41,13 @@ internal sealed class GameProfiles
             p.Keys.Contains(gameKey, StringComparer.OrdinalIgnoreCase) && p.Servers.Any(s => InPrefix(server, s)));
     }
 
+    /// <summary>This game's profiles, the user's first.</summary>
+    public IReadOnlyList<GameProfile> ForGame(string gameKey)
+    {
+        RefreshUser();
+        return _user.Concat(_builtIn).Where(p => p.Keys.Contains(gameKey, StringComparer.OrdinalIgnoreCase)).ToList();
+    }
+
     private void RefreshUser()
     {
         var at = File.Exists(UserFile) ? File.GetLastWriteTimeUtc(UserFile) : DateTime.MinValue;
