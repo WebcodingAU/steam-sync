@@ -7,8 +7,9 @@ namespace SteamSync;
 /// <summary>
 /// What a game profile says about some of a game's servers: where they really are (Region, for people) and the host
 /// timed instead of the server (Target), one that answers ping in that region. Servers are CIDR prefixes, or "*" for all of the game's.
+/// EdgeToServerMs is the fixed estimate of the hidden leg from the CDN's edge to the servers' region, for the connection page's route.
 /// </summary>
-internal sealed record GameProfile(string Name, string[] Keys, string[] Servers, string Region, string Target, string? Note);
+internal sealed record GameProfile(string Name, string[] Keys, string[] Servers, string Region, string Target, string? Note, int? EdgeToServerMs = null);
 
 /// <summary>
 /// Per-game profiles for servers whose real ping can't be measured from here: a CDN in front of them answers every

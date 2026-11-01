@@ -215,13 +215,20 @@ internal sealed class GameRelay : IDisposable
             // Behind a CDN (a game profile covers the server) both only reach the CDN's edge: the profile's target in
             // the servers' real region is the figure then, and the edge's stays alongside.
             var edge = rtt ?? icmp;
+            // For the route, ICMP first: a quiet TCP connection's RTT runs high (delayed acks), and the edge answers ping.
+            var routeEdge = icmp ?? rtt;
             var profile = _profiles.Find(game.Key, address);
-            var (estimate, fresh) = profile is null ? (null, false) : ProfileEstimate(profile);
+            // A profile with a fixed edge → region estimate: the live path to the edge plus that leg, every second
+            // (the route's total). Without one, the time to the profile's target.
+            var (estimate, fresh) = profile is null ? (null, false)
+                : profile.EdgeToServerMs is { } fixedMs ? (routeEdge + fixedMs, true)
+                : ProfileEstimate(profile);
             var ping = profile is null ? edge : estimate;
             // A held estimate repeats between measurements; only new ones go into the jitter window.
             if (ping is { } p && (profile is null || fresh)) Push(_pings, p);
             var relayMs = _relayTunnelAddress is { } relay ? Probe.IcmpRouted(IPAddress.Parse(relay), timeoutMs: 500) : null;
             var paths = _settings.Duplicate && _helperDuplicate == true ? PathPings() : null;
+            var route = Route(routed, profile, routeEdge, relayMs);
 
             var values = _pings.ToArray();
             double? jitter = values.Length >= 2 ? values.Zip(values.Skip(1), (a, b) => Math.Abs(b - a)).Average() : null;
@@ -237,6 +244,7 @@ internal sealed class GameRelay : IDisposable
                 // With profile_estimate: the CDN edge's own figure (tcp_rtt or icmp), and where the servers really are.
                 ["edge_ms"] = profile is not null && edge is { } e ? Math.Round(e, 1) : null,
                 ["profile"] = profile is null ? null : new JsonObject { ["name"] = profile.Name, ["region"] = profile.Region, ["target"] = profile.Target },
+                ["route"] = route,
                 ["relay"] = new JsonObject
                 {
                     // False when the server above is timed on the direct path (not relayed, or held direct for now).
@@ -298,6 +306,35 @@ internal sealed class GameRelay : IDisposable
         var both = PathSummary(_bothPings);
         both["ms"] = best;
         return (rows, both);
+    }
+
+    /// <summary>
+    /// The game connection leg by leg, for the site's connection page: PC → relay (live, through the tunnel; the
+    /// connections under it are relay.paths), relay → game server (the server's ping through the relay minus the relay's),
+    /// or PC → game server when it goes direct. Behind a CDN (a game profile) the measured legs end at the CDN's edge and
+    /// a last leg, edge → the servers' region, is the profile's fixed estimate (edgeToServerMs), so the total moves with
+    /// the live legs. total_ms is null when a leg is missing this second.
+    /// </summary>
+    private static JsonObject Route(bool routed, GameProfile? profile, double? edge, int? relayMs)
+    {
+        var end = profile is null ? "Game server" : "CDN edge";
+        var legs = new JsonArray();
+        if (routed)
+        {
+            legs.Add(Leg("PC", "Relay", relayMs, "live"));
+            legs.Add(Leg("Relay", end, edge is { } e && relayMs is { } r ? Math.Max(0, e - r) : null, "measured"));
+        }
+        else legs.Add(Leg("PC", end, edge, "live"));
+        var total = edge;
+        if (profile is not null)
+        {
+            legs.Add(Leg("CDN edge", $"Game server ({profile.Region})", profile.EdgeToServerMs, "estimate"));
+            total = profile.EdgeToServerMs is { } fixedMs ? edge + fixedMs : null;
+        }
+        return new JsonObject { ["legs"] = legs, ["total_ms"] = total is { } t ? Math.Round(t, 1) : null };
+
+        static JsonObject Leg(string from, string to, double? ms, string kind) =>
+            new() { ["from"] = from, ["to"] = to, ["ms"] = ms is { } m ? Math.Round(m, 1) : null, ["kind"] = kind };
     }
 
     private static void PushPath(Queue<int?> window, int? ms)
