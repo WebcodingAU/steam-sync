@@ -104,7 +104,9 @@ internal sealed class GameRelay : IDisposable
     private const int PingWindow = 30;
     private readonly System.Threading.Timer _pingTimer;
     private readonly Queue<double> _pings = new();       // the ping figures of the last PingWindow seconds
-    private readonly Queue<bool> _icmpAnswers = new();   // whether the server answered each ICMP echo, same window
+    private readonly Queue<bool> _icmpAnswers = new();   // whether the server answered each ICMP echo (or udp_unreachable), same window
+    private bool _icmpSeen;                              // the server has answered ICMP: no udp_unreachable for it
+    private readonly UnreachableProbe _unreachable = new(); // UDP servers that ignore ICMP (WARDOGS)
     private string? _pingFor;                            // game key + server the windows belong to
     private readonly GameProfiles _profiles = new();
     private (string Host, IPAddress? Address, DateTime ResolvedAt) _profileTarget = ("", null, DateTime.MinValue);
@@ -165,7 +167,8 @@ internal sealed class GameRelay : IDisposable
     /// <summary>
     /// Once a second while a relayed game runs with the tunnel up: its longest-standing TCP server inside the
     /// relayed ranges, timed by Windows' own RTT for that connection (tcp_rtt; the game's real traffic through the
-    /// relay), or by ICMP when there's no RTT sample (icmp; the echo takes the same route). Loss comes from ICMP when the
+    /// relay), or by ICMP when there's no RTT sample (icmp; the echo takes the same route), or for a UDP server that
+    /// ignores ICMP by its "port unreachable" next to the game port (udp_unreachable, UnreachableProbe). Loss comes from ICMP when the
     /// server answers it at all, jitter from how much successive figures differ. The relay leg (this PC to the relay)
     /// is pinged too.
     /// </summary>
@@ -205,18 +208,25 @@ internal sealed class GameRelay : IDisposable
                 _pingFor = key;
                 _pings.Clear();
                 _icmpAnswers.Clear();
+                _icmpSeen = false;
                 _estimate = null;
                 _estimateNext = DateTime.MinValue;
             }
 
             var rtt = proto == "tcp" ? TcpTable.Rtt(server) : null;
-            var icmp = Probe.IcmpRouted(address);
-            Push(_icmpAnswers, icmp is not null);
+            // A UDP server that ignores ICMP (WARDOGS) is timed by the "port unreachable" its own host sends for a byte to a
+            // closed port next to the game's. Once such a port answers, ICMP isn't waited for any more (it never answered).
+            var unreachableOnly = proto == "udp" && !_icmpSeen && _unreachable.KnownPort(address, port) is not null;
+            var icmp = unreachableOnly ? null : Probe.IcmpRouted(address);
+            if (icmp is not null) _icmpSeen = true;
+            (int? Port, double? Ms) unreachable = proto == "udp" && icmp is null && !_icmpSeen && _unreachable.CanTry(address, port)
+                ? _unreachable.Probe(address, port) : default;
+            Push(_icmpAnswers, icmp is not null || unreachable.Ms is not null);
             // Behind a CDN (a game profile covers the server) both only reach the CDN's edge: the profile's target in
             // the servers' real region is the figure then, and the edge's stays alongside.
-            var edge = rtt ?? icmp;
+            var edge = rtt ?? icmp ?? unreachable.Ms;
             // For the route, ICMP first: a quiet TCP connection's RTT runs high (delayed acks), and the edge answers ping.
-            var routeEdge = icmp ?? rtt;
+            var routeEdge = icmp ?? rtt ?? unreachable.Ms;
             var relayMs = _relayTunnelAddress is { } relay ? Probe.IcmpRouted(IPAddress.Parse(relay), timeoutMs: 500) : null;
             var profile = _profiles.Find(game.Key, address);
             // A profile with an edge → region leg: the live path to the edge plus that leg (calibrated every few minutes,
@@ -240,8 +250,10 @@ internal sealed class GameRelay : IDisposable
                 ["loss_pct"] = _icmpAnswers.Any(a => a) ? Math.Round(_icmpAnswers.Count(a => !a) * 100.0 / _icmpAnswers.Count, 1) : null,
                 ["window"] = values.Length,
                 ["ping_method"] = profile is not null ? (estimate is not null ? "profile_estimate" : null)
-                    : rtt is not null ? "tcp_rtt" : icmp is not null ? "icmp" : null,
+                    : rtt is not null ? "tcp_rtt" : icmp is not null ? "icmp" : unreachable.Ms is not null ? "udp_unreachable" : null,
                 ["server"] = new JsonObject { ["ip"] = address.ToString(), ["port"] = port, ["proto"] = proto },
+                // With udp_unreachable: the closed port that answers and this second's time (null: a miss, counted as loss).
+                ["unreachable"] = unreachable.Port is { } up ? new JsonObject { ["port"] = up, ["ms"] = unreachable.Ms is { } um ? Math.Round(um, 1) : null } : null,
                 // With profile_estimate: the CDN edge's own figure (tcp_rtt or icmp), and where the servers really are.
                 ["edge_ms"] = profile is not null && edge is { } e ? Math.Round(e, 1) : null,
                 ["profile"] = profile is null ? null : new JsonObject { ["name"] = profile.Name, ["region"] = profile.Region, ["target"] = profile.Target },
