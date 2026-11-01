@@ -20,7 +20,8 @@ namespace RelayHelper;
 /// Connections are found every 3 s: adapters that are up with an IPv4 address and gateway, except virtual ones (VPNs,
 /// VMs, this relay's own adapter). A tethered phone (Apple Mobile Device Ethernet, Android's Remote NDIS) gets interface
 /// metric 9000 (store=active), so Windows keeps everything else on the main connection and only these copies use
-/// mobile data.
+/// mobile data. It's set again every minute: Windows puts it back to automatic (35, Wi-Fi's own) when the phone reconnects,
+/// and with two equal default routes it spread ordinary traffic over the phone too (Phoenix went over mobile data at 360 ms).
 /// </para>
 /// </summary>
 internal sealed class Duplicator : IDisposable
@@ -35,7 +36,8 @@ internal sealed class Duplicator : IDisposable
     private readonly byte[] _token;
     private readonly object _gate = new();
     private readonly Dictionary<int, Path> _paths = [];
-    private readonly HashSet<int> _metricSet = [];
+    private static readonly TimeSpan MetricEvery = TimeSpan.FromMinutes(1);
+    private readonly Dictionary<int, long> _metricSetAt = []; // phone adapter index → when its metric was last set (TickCount64)
     private readonly Socket _local;
     private readonly System.Threading.Timer _scanTimer;
     private Path[] _snapshot = [];
@@ -177,9 +179,12 @@ internal sealed class Duplicator : IDisposable
             }
             foreach (var (index, (name, local, phone)) in found)
             {
-                if (_paths.ContainsKey(index)) continue;
-                if (phone && _metricSet.Add(index))
+                if (phone && (!_metricSetAt.TryGetValue(index, out var at) || Environment.TickCount64 - at > MetricEvery.TotalMilliseconds))
+                {
                     Tunnel.Netsh(retries: 1, "interface", "ipv4", "set", "interface", $"{index}", "metric=9000", "store=active");
+                    _metricSetAt[index] = Environment.TickCount64;
+                }
+                if (_paths.ContainsKey(index)) continue;
                 var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
                 try
                 {
