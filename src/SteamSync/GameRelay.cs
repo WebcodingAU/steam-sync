@@ -123,7 +123,9 @@ internal sealed class GameRelay : IDisposable
         public readonly Queue<double> Pings = new();     // the ping figures of the last PingWindow seconds
         public readonly Queue<bool> Answers = new();     // whether the server answered each ICMP echo (or udp_unreachable), same window
         public bool IcmpSeen;                            // the server has answered ICMP: no udp_unreachable for it
-        public (double Ms, DateTime At)? Estimate;       // the profile target's last answer
+        public (double Ms, DateTime At)? Estimate;       // the profile target's last answer (under lock: set in the background)
+        public bool EstimateNew;                         // Estimate came in since the last tick read it
+        public Task? Measuring;                          // the profile target's measurement in progress
         public DateTime EstimateNext = DateTime.MinValue;
     }
     private string? _relayTunnelAddress, _relayEndpoint; // from the helper's replies
@@ -202,13 +204,14 @@ internal sealed class GameRelay : IDisposable
             var found = games.Select(g => (Game: g, Server: FindServer(g))).Where(f => f.Server.Remote != 0).ToList();
             if (found.Count == 0) { Clear(); return; }
 
-            // Every game at once (a server that ignores ping costs up to a second), and the relay legs meanwhile.
+            // The relay leg first (a profile's estimate for a silent server builds on it), then every game at once (a server
+            // that ignores ping costs up to a second), and the connections' pings meanwhile.
+            var relayMs = _relayTunnelAddress is { } relay ? Probe.IcmpRouted(IPAddress.Parse(relay), timeoutMs: 500) : null;
             var measuring = found.Select(f =>
             {
                 if (!_pingStates.TryGetValue(f.Game.Key, out var state)) _pingStates[f.Game.Key] = state = new PingState();
-                return Task.Run(() => MeasureGame(f.Game, f.Server, state));
+                return Task.Run(() => MeasureGame(f.Game, f.Server, state, relayMs));
             }).ToArray();
-            var relayMs = _relayTunnelAddress is { } relay ? Probe.IcmpRouted(IPAddress.Parse(relay), timeoutMs: 500) : null;
             var paths = _settings.Duplicate && _helperDuplicate == true ? PathPings() : null;
             Task.WaitAll(measuring);
 
@@ -217,7 +220,7 @@ internal sealed class GameRelay : IDisposable
             foreach (var (task, (game, server)) in measuring.Zip(found))
             {
                 var (row, measured) = task.Result;
-                row["route"] = Route(server.Routed, measured.Profile, measured.RouteEdge, relayMs, measured.Hidden);
+                row["route"] = Route(server.Routed, measured.Profile, measured.RouteEdge, relayMs, measured.Hidden, measured.Estimate);
                 if (main is null && server.Routed) main = row;
                 rows.Add(row);
             }
@@ -283,11 +286,11 @@ internal sealed class GameRelay : IDisposable
     }
 
     /// <summary>The route's inputs from MeasureGame (the route itself needs the relay leg, timed alongside).</summary>
-    private sealed record Measured(GameProfile? Profile, double? RouteEdge, (double Ms, string From, DateTime? At) Hidden);
+    private sealed record Measured(GameProfile? Profile, double? RouteEdge, (double Ms, string From, DateTime? At) Hidden, double? Estimate);
 
     /// <summary>One game's ping this second: its server timed (tcp_rtt, icmp or udp_unreachable; profile_estimate behind
     /// a CDN), as its entry in the sample's games list, without the route.</summary>
-    private (JsonObject Row, Measured Measured) MeasureGame(RunningGame game, (TcpTable.Row Row, uint Remote, int Port, string Proto, bool Routed) server, PingState state)
+    private (JsonObject Row, Measured Measured) MeasureGame(RunningGame game, (TcpTable.Row Row, uint Remote, int Port, string Proto, bool Routed) server, PingState state, int? relayMs)
     {
         var (row, remote, port, proto, routed) = server;
         var address = new IPAddress(remote);
@@ -298,7 +301,7 @@ internal sealed class GameRelay : IDisposable
             state.Pings.Clear();
             state.Answers.Clear();
             state.IcmpSeen = false;
-            state.Estimate = null;
+            lock (state) { state.Estimate = null; state.EstimateNew = false; }
             state.EstimateNext = DateTime.MinValue;
         }
 
@@ -320,8 +323,10 @@ internal sealed class GameRelay : IDisposable
         // A profile with an edge → region leg: the live path to the edge plus that leg (calibrated every few minutes,
         // else the profile's fixed figure), every second: the route's total. Without one, the time to the profile's target.
         var hidden = profile?.EdgeToServerMs is { } fixedMs ? HiddenLeg(profile, fixedMs) : default;
+        // A silent server through the relay (LOTRO): the live relay leg plus the relay server's traced time to it.
         var (estimate, fresh) = profile is null ? (null, false)
             : profile.EdgeToServerMs is not null ? (routeEdge + hidden.Ms, true)
+            : profile.RelayToServerMs is { } relayLeg && routed ? (relayMs + relayLeg, true)
             : ProfileEstimate(profile, state);
         var ping = profile is null ? edge : estimate;
         // A held estimate repeats between measurements; only new ones go into the jitter window.
@@ -347,7 +352,7 @@ internal sealed class GameRelay : IDisposable
             // With profile_estimate: the CDN edge's own figure (tcp_rtt or icmp), and where the servers really are.
             ["edge_ms"] = profile is not null && edge is { } e ? Math.Round(e, 1) : null,
             ["profile"] = profile is null ? null : new JsonObject { ["name"] = profile.Name, ["region"] = profile.Region, ["target"] = profile.Target },
-        }, new Measured(profile, routeEdge, hidden));
+        }, new Measured(profile, routeEdge, hidden, estimate));
     }
 
     /// <summary>
@@ -393,12 +398,29 @@ internal sealed class GameRelay : IDisposable
     /// connections under it are relay.paths), relay → game server (the server's ping through the relay minus the relay's),
     /// or PC → game server when it goes direct. Behind a CDN (a game profile) the measured legs end at the CDN's edge and
     /// a last leg, edge → the servers' region, is the profile's fixed estimate (edgeToServerMs), so the total moves with
-    /// the live legs. total_ms is null when a leg is missing this second.
+    /// the live legs. A server that answers nothing (relayToServerMs, LOTRO): PC → relay live and relay → server the
+    /// profile's traced estimate, or on the direct path PC → server the time to the profile's target. total_ms is null
+    /// when a leg is missing this second.
     /// </summary>
-    private static JsonObject Route(bool routed, GameProfile? profile, double? edge, int? relayMs, (double Ms, string From, DateTime? At) hidden)
+    private static JsonObject Route(bool routed, GameProfile? profile, double? edge, int? relayMs, (double Ms, string From, DateTime? At) hidden,
+        double? estimate)
     {
-        var end = profile is null ? "Game server" : "CDN edge";
         var legs = new JsonArray();
+        if (profile?.RelayToServerMs is { } relayLeg)
+        {
+            var server = $"Game server ({profile.Region})";
+            if (routed)
+            {
+                legs.Add(Leg("PC", "Relay", relayMs, "live"));
+                var leg = Leg("Relay", server, relayLeg, "estimate");
+                leg["calibrated"] = "fixed";
+                legs.Add(leg);
+            }
+            else legs.Add(Leg("PC", server, estimate, "estimate"));
+            return new JsonObject { ["legs"] = legs, ["total_ms"] = estimate is { } est ? Math.Round(est, 1) : null };
+        }
+
+        var end = profile is null ? "Game server" : "CDN edge";
         if (routed)
         {
             legs.Add(Leg("PC", "Relay", relayMs, "live"));
@@ -494,23 +516,28 @@ internal sealed class GameRelay : IDisposable
     /// The time to a game profile's target: measured every 5 seconds (ICMP, then the faster of two TCP handshakes on 443
     /// when the ping isn't answered) and held for up to 30 seconds. Cloud hosts rate-limit ping: Oracle's Phoenix servers drop every
     /// third ping at one a second, and a tray app pinging every second stopped getting answers at all (0.4.1-beta.11).
-    /// Fresh is true when this call measured it.
+    /// Fresh is true when a new figure came in since the last call.
     /// </summary>
     private (double? Ms, bool Fresh) ProfileEstimate(GameProfile profile, PingState state)
     {
         var now = DateTime.UtcNow;
-        var fresh = false;
-        if (now >= state.EstimateNext)
+        // In the background: a target that misses its ping falls back to two TCP handshakes of up to 2 s each, which
+        // would hold up every game's ping this second (LOTRO's router target: 5 s ticks).
+        if (now >= state.EstimateNext && state.Measuring is null or { IsCompleted: true })
         {
             state.EstimateNext = now + EstimateEvery;
-            if (ProfileTarget(profile.Target) is { } target
-                && (Probe.IcmpRouted(target) ?? Probe.TcpHandshake(target, 443)) is { } ms)
+            state.Measuring = Task.Run(() =>
             {
-                state.Estimate = (ms, now);
-                fresh = true;
-            }
+                if (ProfileTarget(profile.Target) is { } target && (Probe.IcmpRouted(target) ?? Probe.TcpHandshake(target, 443)) is { } ms)
+                    lock (state) { state.Estimate = (ms, DateTime.UtcNow); state.EstimateNew = true; }
+            });
         }
-        return (state.Estimate is { } e && now - e.At < EstimateHold ? e.Ms : null, fresh);
+        lock (state)
+        {
+            var fresh = state.EstimateNew;
+            state.EstimateNew = false;
+            return (state.Estimate is { } e && now - e.At < EstimateHold ? e.Ms : null, fresh);
+        }
     }
 
     /// <summary>A game profile's target host as an IPv4 address, looked up every 10 minutes (a minute after a failed lookup).</summary>

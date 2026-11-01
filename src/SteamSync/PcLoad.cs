@@ -9,12 +9,14 @@ namespace SteamSync;
 /// report_live_ping, the table live ping used, as a sample with a "system" object and no ping. When the game stops
 /// it sends null, which clears the PC's row. A stable build never starts it. While the game goes through the game
 /// relay, the sample also carries its live ping (GameRelay.PingSample: ping_ms, jitter_ms, loss_pct, server, relay),
-/// and its games list gets each game's FPS and which one is in front (focused). The sample's game and system FPS are
-/// the game in front.
+/// and its games list gets each game's FPS and which one is in front (focused). The sample's game, system FPS and
+/// top-level ping are the game in front.
 /// </summary>
 internal sealed class PcLoad : IDisposable
 {
     private static readonly TimeSpan Tick = TimeSpan.FromSeconds(1);
+    // A games[] entry's ping fields, copied to the top level for the game in front.
+    private static readonly string[] PerGamePing = ["ping_ms", "jitter_ms", "loss_pct", "window", "ping_method", "server", "unreachable", "edge_ms", "profile", "route"];
 
     private readonly SupabaseApi? _api;
     private readonly PlayTracker _play;
@@ -55,8 +57,8 @@ internal sealed class PcLoad : IDisposable
             }
 
             // The game in front: its window has the focus, else the one that last had it, else the game the relay times
-            // (the main game of its ping). With LOTRO played and Last Epoch in the background, the badge's FPS is LOTRO's;
-            // the top-level ping stays the relay's main game, and the games list has each game's own ping and FPS.
+            // (the main game of its ping). With LOTRO played and Last Epoch in the background, the badge's FPS and ping
+            // are LOTRO's; the games list has each game's own ping and FPS.
             var focused = FocusedGame(games);
             if (focused is not null) _lastFocused = focused.Key;
             var game = focused
@@ -93,6 +95,11 @@ internal sealed class PcLoad : IDisposable
                     row["fps_scaler"] = scaled is null ? null : "Lossless Scaling";
                     if (key == focused?.Key) row["focused"] = true;
                 }
+                // The top-level ping is the game in front's too, like the FPS (none when that game has no server seen),
+                // rather than the relay's main game: one game's FPS next to another's ping read as nonsense.
+                var front = (sample["games"] as JsonArray)?.OfType<JsonObject>().FirstOrDefault(r => r["game_key"]?.GetValue<string>() == game.Key);
+                foreach (var name in PerGamePing) sample[name] = front?[name]?.DeepClone();
+                if (sample["relay"] is JsonObject relay) relay["routed"] = front?["routed"]?.DeepClone();
             }
             if (Interlocked.Exchange(ref _uploading, 1) == 1) return; // the last second's upload is still going: skip this one
             _ = Task.Run(async () =>

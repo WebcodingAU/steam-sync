@@ -7,5 +7,14 @@
     "target": "iaas.us-phoenix-1.oraclecloud.com",
     "edgeToServerMs": 148,
     "note": "AION 2's servers sit behind Cloudflare, so a ping reaches Cloudflare's nearest edge (Sydney), not the server. ExitLag routes AION 2 to US Phoenix, so this is the time to Oracle Cloud's Phoenix region by your normal route. (objectstorage.us-phoenix-1 now resolves to an Australian cache and doesn't answer.) edgeToServerMs: Cloudflare Sydney to Phoenix, measured 2026-11-01 as Phoenix 172 ms from this PC minus ~25 ms to Sydney."
+  },
+  {
+    "name": "LOTRO (North America)",
+    "keys": ["steam:212500"],
+    "servers": ["64.37.178.0/24"],
+    "region": "US San Jose",
+    "target": "ae10.edge1.sjo1.sp.lumen.tech",
+    "relayToServerMs": 187,
+    "note": "LOTRO's world servers (Daybreak, 64.37.178.x, UDP 9014) answer nothing: no ping, no TCP handshake or reset, no port unreachable, and Daybreak's whole network drops ping. Traced 2026-11-02 from the relay server: Telstra, then Lumen in San Jose (ae10.edge1.sjo1, 190 ms), then 8.227.53.26 (Lumen, 186-188 ms), the last router before Daybreak; relayToServerMs is that. Target (direct path): Lumen's San Jose edge, which answers ping (212-221 ms from this PC over Starlink, 174 from the relay)."
   }
 ]
