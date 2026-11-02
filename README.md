@@ -151,7 +151,10 @@ Nothing leaves the PC until you pair it. After pairing, each sync sends gamingen
   and install folder).
 
 While a game runs, it also sends the game and when it started and stopped (play sessions). Beta builds also send,
-once a second while a game runs, how busy the PC is (CPU, graphics card and memory use).
+once a second while a game runs, how busy the PC is (CPU, graphics card and memory use), and with the game relay set
+up, each game's ping. To time a game server that ignores ping, the app may trace the route to it, send it a byte on a
+closed port next to the game's, and download AWS's and Google Cloud's public address lists (ip-ranges.amazonaws.com,
+gstatic.com, gcping.com; kept for a week) to time a public endpoint in the server's cloud region.
 
 The app also checks the [releases repo](https://github.com/WebcodingAU/gaming-enjoyer-releases) on
 GitHub for updates, and the Library window loads gamingenjoyer.com. Nothing else is sent anywhere.

@@ -106,6 +106,10 @@ internal sealed class GameRelay : IDisposable
     private readonly Dictionary<string, PingState> _pingStates = []; // per running game (key)
     private static readonly TimeSpan IcmpQuietFor = TimeSpan.FromSeconds(30), IcmpHold = TimeSpan.FromSeconds(3);
     private readonly UnreachableProbe _unreachable = new(); // UDP servers that ignore ICMP (WARDOGS)
+    private readonly CloudRegions _cloud = new();          // silent servers' cloud regions (cloud_estimate)
+    private readonly object _homeGate = new();
+    private HashSet<uint> _homeHops = [];                  // /24s of this PC's own ISP routers (hop_estimate skips them)
+    private DateTime _homeTracedAt = DateTime.MinValue;
     private readonly GameProfiles _profiles = new();
     private (string Host, IPAddress? Address, DateTime ResolvedAt) _profileTarget = ("", null, DateTime.MinValue);
     private static readonly TimeSpan EstimateEvery = TimeSpan.FromSeconds(5), EstimateHold = TimeSpan.FromSeconds(30);
@@ -224,7 +228,7 @@ internal sealed class GameRelay : IDisposable
             foreach (var (task, (game, server)) in measuring.Zip(found))
             {
                 var (row, measured) = task.Result;
-                row["route"] = Route(server.Routed, measured.Profile, measured.RouteEdge, relayMs, measured.Hidden, measured.Estimate, measured.HopLeg);
+                row["route"] = Route(server.Routed, measured.Profile, measured.RouteEdge, relayMs, measured.Hidden, measured.Estimate, measured.EstimateLeg, measured.Where);
                 if (main is null && server.Routed) main = row;
                 rows.Add(row);
             }
@@ -258,8 +262,14 @@ internal sealed class GameRelay : IDisposable
                 // A live real-time UDP stream through the relay (2+ batches a second each way) is the game's own traffic,
                 // ahead of any TCP connection: Marathon plays over UDP via Valve's Sydney relay (18-28 ms) while it also
                 // holds a TCP connection to Bungie's backend in the US, which showed as a 200 ms ping.
-                if (udpPeers.FirstOrDefault(p => p.Quiet < TimeSpan.FromSeconds(5) && carried.Any(c => c.Contains(p.Remote)) && IsGameFlow(p)) is { Remote: not 0 } stream)
+                // The same when it goes direct: Dark and Darker's match server (15.129.1.229:7787) is learned during the
+                // match but held off the relay until it ends, while its lobby's TCP (52.223.44.23:20202) is relayed and
+                // showed as the ping.
+                var streams = udpPeers.Where(p => p.Quiet < TimeSpan.FromSeconds(5) && IsGameFlow(p)).ToList();
+                if (streams.FirstOrDefault(p => carried.Any(c => c.Contains(p.Remote))) is { Remote: not 0 } stream)
                     return (default, stream.Remote, stream.Port, "udp", true);
+                if (streams.FirstOrDefault() is { Remote: not 0 } directStream)
+                    return (default, directStream.Remote, directStream.Port, "udp", false);
                 // Game servers rather than its web requests: not 80/443 when there's a choice. A game whose server is UDP
                 // (Tarkov's raids) has none of those: then its busiest live UDP server through the relay, timed by ICMP.
                 var server = tcp.Where(r => pids.Contains(r.Pid) && carried.Any(c => c.Contains(r.Remote)))
@@ -297,7 +307,7 @@ internal sealed class GameRelay : IDisposable
 
     /// <summary>The route's inputs from MeasureGame (the route itself needs the relay leg, timed alongside).</summary>
     private sealed record Measured(GameProfile? Profile, double? RouteEdge, (double Ms, string From, DateTime? At) Hidden, double? Estimate,
-        double? HopLeg);
+        double? EstimateLeg, string? Where);
 
     /// <summary>One game's ping this second: its server timed (tcp_rtt, icmp or udp_unreachable; profile_estimate behind
     /// a CDN), as its entry in the sample's games list, without the route.</summary>
@@ -351,8 +361,12 @@ internal sealed class GameRelay : IDisposable
             : ProfileEstimate(profile, state);
         // A server that answers nothing and has no profile (ARC Raiders on Google Cloud: no ping, no port unreachable):
         // the last router on the direct route that answers (hop_estimate), a lower bound.
-        var hop = profile is null && edge is null && !icmpLately && unreachable.Port is null ? HopEstimate(address, routed, relayMs, state) : default;
-        var ping = profile is null ? edge ?? hop.Ms : estimate;
+        var silent = profile is null && edge is null && !icmpLately && unreachable.Port is null;
+        var hop = silent ? HopEstimate(address, routed, relayMs, state) : default;
+        // No router of the server's own network answers (Dark and Darker on AWS: silent right after Starlink): the
+        // server's cloud region (cloud_estimate).
+        var cloud = silent && hop.Ms is null ? CloudEstimate(address, routed, relayMs) : default;
+        var ping = profile is null ? edge ?? hop.Ms ?? cloud.Ms : estimate;
         // A held estimate repeats between measurements; only new ones go into the jitter window.
         if (ping is { } p && (profile is null || fresh)) Push(state.Pings, p);
 
@@ -370,7 +384,7 @@ internal sealed class GameRelay : IDisposable
             ["window"] = values.Length,
             ["ping_method"] = profile is not null ? (estimate is not null ? "profile_estimate" : null)
                 : rtt is not null ? "tcp_rtt" : icmp is not null ? "icmp" : unreachable.Ms is not null ? "udp_unreachable"
-                : hop.Ms is not null ? "hop_estimate" : null,
+                : hop.Ms is not null ? "hop_estimate" : cloud.Ms is not null ? "cloud_estimate" : null,
             // service: set when the address is a relay service in front of the real server (its ping is only to there).
             ["server"] = new JsonObject { ["ip"] = address.ToString(), ["port"] = port, ["proto"] = proto,
                 ["service"] = SteamRelay.Any(c => c.Contains(remote)) ? "Steam Datagram Relay" : null },
@@ -381,7 +395,13 @@ internal sealed class GameRelay : IDisposable
             ["profile"] = profile is null ? null : new JsonObject { ["name"] = profile.Name, ["region"] = profile.Region, ["target"] = profile.Target },
             // With hop_estimate: the router timed instead (its hop count on the direct route) and its own round trip.
             ["hop"] = hop.Ip is null ? null : new JsonObject { ["ip"] = hop.Ip.ToString(), ["ttl"] = hop.Ttl, ["ms"] = hop.HopMs is { } hm ? Math.Round(hm, 1) : null },
-        }, new Measured(profile, routeEdge, hidden, estimate, hop.Ip is null ? null : hop.Leg));
+            // With cloud_estimate: the server's cloud region and the time to its endpoint (on the direct path).
+            ["cloud"] = cloud.Region is not { } cr ? null : new JsonObject
+            {
+                ["provider"] = cr.Provider, ["region"] = cr.Code, ["name"] = cr.Name, ["ms"] = cloud.RegionMs is { } cm ? Math.Round(cm, 1) : null,
+            },
+        }, new Measured(profile, routeEdge, hidden, estimate, hop.Ms is not null ? hop.Leg : cloud.Leg,
+            cloud.Ms is not null && hop.Ms is null ? cloud.Region?.Name ?? cloud.Region?.Code : null));
     }
 
     /// <summary>Valve's networks (AS32590), where Steam Datagram Relay's relays sit: a game played through them (Marathon)
@@ -410,8 +430,13 @@ internal sealed class GameRelay : IDisposable
             state.HopTracedAt = now;
             state.HopTracing = Task.Run(() =>
             {
-                var found = TraceLastHop(server, direct);
-                lock (state) state.Hop = found;
+                var (hops, reached) = TraceHops(server, direct);
+                // The last router must be on the way to the server, not this PC's own ISP's: Dark and Darker's AWS server
+                // went silent right after Starlink's ground station (206.224.66.40), which would read the same for a
+                // server anywhere in the world. Then there's no hop, and the cloud region is timed instead.
+                (IPAddress Ip, byte Ttl)? last = reached || hops.Count == 0 ? null : hops[^1];
+                if (last is { } l && IsHomeHop(l.Ip, direct)) last = null;
+                lock (state) state.Hop = last;
             });
         }
         (IPAddress Ip, byte Ttl)? traced;
@@ -419,29 +444,69 @@ internal sealed class GameRelay : IDisposable
         if (traced is not { } h) return default;
         double? hopMs = Probe.Icmp(h.Ip, direct, tries: 1, timeoutMs: 700) ?? Probe.IcmpTtl(server, direct, h.Ttl).Ms;
         if (hopMs is not { } ms) return (null, null, h.Ip, h.Ttl, null);
-        if (!routed) return (ms, ms, h.Ip, h.Ttl, ms);
-        if (relayMs is null || !IPEndPoint.TryParse(_relayEndpoint ?? "", out var endpoint) || IPAddress.IsLoopback(endpoint.Address)
-            || Probe.Icmp(endpoint.Address, direct, tries: 1, timeoutMs: 500) is not { } relayDirect)
-            return (null, null, h.Ip, h.Ttl, ms);
-        var leg = Math.Max(0, ms - relayDirect);
-        return (relayMs + leg, leg, h.Ip, h.Ttl, ms);
+        var (total, leg) = ThroughRelay(ms, routed, relayMs, direct);
+        return (total, leg, h.Ip, h.Ttl, ms);
     }
 
-    /// <summary>Tracert from this source: the last public router that answers before the route goes silent (4 silent hops
-    /// in a row ends it), or null when none does or the server itself answers.</summary>
-    private static (IPAddress Ip, byte Ttl)? TraceLastHop(IPAddress server, IPAddress source)
+    /// <summary>
+    /// A time measured on the direct path, as the game's ping: on its own when the game goes direct; through the relay,
+    /// the live relay leg plus max(0, that time − the relay server's on the direct path) as the last leg (as AION's
+    /// hidden leg). Nulls when the relay server can't be timed.
+    /// </summary>
+    private (double? Total, double? Leg) ThroughRelay(double directMs, bool routed, int? relayMs, IPAddress direct)
     {
-        (IPAddress Ip, byte Ttl)? last = null;
+        if (!routed) return (directMs, directMs);
+        if (relayMs is null || !IPEndPoint.TryParse(_relayEndpoint ?? "", out var endpoint) || IPAddress.IsLoopback(endpoint.Address)
+            || Probe.Icmp(endpoint.Address, direct, tries: 1, timeoutMs: 500) is not { } relayDirect)
+            return (null, null);
+        var leg = Math.Max(0, directMs - relayDirect);
+        return (relayMs + leg, leg);
+    }
+
+    /// <summary>
+    /// For a silent server without a usable router before it: the time to a public endpoint in its cloud region (AWS's
+    /// API endpoint, Google Cloud's gcping service), from AWS's and Google's published address lists (CloudRegions).
+    /// Dark and Darker's match server 15.129.1.229 is AWS Sydney (ap-southeast-2). Null for other hosts.
+    /// </summary>
+    private (double? Ms, double? Leg, CloudRegion? Region, double? RegionMs) CloudEstimate(IPAddress server, bool routed, int? relayMs)
+    {
+        if (_cloud.Find(server) is not { IsGlobal: false, Endpoint: not null } region || Probe.DefaultSource() is not { } direct) return default;
+        if (_cloud.ProbeAsync(region).GetAwaiter().GetResult() is not { } ms) return (null, null, region, null);
+        var (total, leg) = ThroughRelay(ms, routed, relayMs, direct);
+        return (total, leg, region, ms);
+    }
+
+    /// <summary>Whether the router is this PC's own ISP's: its /24 is on the route to 1.1.1.1 too (traced every 10 minutes).</summary>
+    private bool IsHomeHop(IPAddress hop, IPAddress source)
+    {
+        lock (_homeGate)
+        {
+            if (DateTime.UtcNow - _homeTracedAt > TimeSpan.FromMinutes(10))
+            {
+                _homeHops = TraceHops(IPAddress.Parse("1.1.1.1"), source).Hops.Select(h => Slash24Key(h.Ip)).ToHashSet();
+                _homeTracedAt = DateTime.UtcNow;
+            }
+            return _homeHops.Contains(Slash24Key(hop));
+        }
+
+        static uint Slash24Key(IPAddress ip) => BitConverter.ToUInt32(ip.GetAddressBytes()) & 0x00FFFFFF;
+    }
+
+    /// <summary>Tracert from this source: the public routers that answer on the way (4 silent hops in a row ends it), and
+    /// whether the target itself answered.</summary>
+    private static (List<(IPAddress Ip, byte Ttl)> Hops, bool Reached) TraceHops(IPAddress target, IPAddress source)
+    {
+        var hops = new List<(IPAddress Ip, byte Ttl)>();
         var silent = 0;
         for (byte ttl = 1; ttl <= 24 && silent < 4; ttl++)
         {
-            var (from, _, target) = Probe.IcmpTtl(server, source, ttl);
-            if (target) return null;
+            var (from, _, reached) = Probe.IcmpTtl(target, source, ttl);
+            if (reached) return (hops, true);
             if (from is null) { silent++; continue; }
             silent = 0;
-            if (IsPublic(BitConverter.ToUInt32(from.GetAddressBytes()))) last = (from, ttl);
+            if (IsPublic(BitConverter.ToUInt32(from.GetAddressBytes()))) hops.Add((from, ttl));
         }
-        return last;
+        return (hops, false);
     }
 
     /// <summary>
@@ -492,14 +557,15 @@ internal sealed class GameRelay : IDisposable
     /// when a leg is missing this second.
     /// </summary>
     private static JsonObject Route(bool routed, GameProfile? profile, double? edge, int? relayMs, (double Ms, string From, DateTime? At) hidden,
-        double? estimate, double? hopLeg)
+        double? estimate, double? estimateLeg, string? where)
     {
         var legs = new JsonArray();
-        // A silent server timed by the last router before it (hop_estimate): the last leg is that estimate.
-        if (profile is null && edge is null && hopLeg is { } viaHop)
+        // A silent server timed by the last router before it (hop_estimate) or its cloud region (cloud_estimate, where
+        // names the region): the last leg is that estimate.
+        if (profile is null && edge is null && estimateLeg is { } viaHop)
         {
             if (routed) legs.Add(Leg("PC", "Relay", relayMs, "live"));
-            legs.Add(Leg(routed ? "Relay" : "PC", "Game server", viaHop, "estimate"));
+            legs.Add(Leg(routed ? "Relay" : "PC", where is null ? "Game server" : $"Game server ({where})", viaHop, "estimate"));
             var hopTotal = routed ? relayMs + viaHop : viaHop;
             return new JsonObject { ["legs"] = legs, ["total_ms"] = hopTotal is { } ht ? Math.Round(ht, 1) : null };
         }
@@ -1027,6 +1093,7 @@ internal sealed class GameRelay : IDisposable
 
     public void Dispose()
     {
+        _cloud.Dispose();
         _udp.Dispose();
         _timer.Dispose();
         _pingTimer.Dispose();
