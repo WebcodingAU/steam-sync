@@ -124,6 +124,9 @@ internal sealed class GameRelay : IDisposable
         public readonly Queue<double> Pings = new();     // the ping figures of the last PingWindow seconds
         public readonly Queue<bool> Answers = new();     // whether the server answered each ICMP echo (or udp_unreachable), same window
         public (int Ms, DateTime At)? LastIcmp;          // the server's last ICMP answer: udp_unreachable only when it's old
+        public (IPAddress Ip, byte Ttl)? Hop;            // hop_estimate's router (under lock: traced in the background)
+        public DateTime? HopTracedAt;
+        public Task? HopTracing;
         public (double Ms, DateTime At)? Estimate;       // the profile target's last answer (under lock: set in the background)
         public bool EstimateNew;                         // Estimate came in since the last tick read it
         public Task? Measuring;                          // the profile target's measurement in progress
@@ -221,7 +224,7 @@ internal sealed class GameRelay : IDisposable
             foreach (var (task, (game, server)) in measuring.Zip(found))
             {
                 var (row, measured) = task.Result;
-                row["route"] = Route(server.Routed, measured.Profile, measured.RouteEdge, relayMs, measured.Hidden, measured.Estimate);
+                row["route"] = Route(server.Routed, measured.Profile, measured.RouteEdge, relayMs, measured.Hidden, measured.Estimate, measured.HopLeg);
                 if (main is null && server.Routed) main = row;
                 rows.Add(row);
             }
@@ -287,7 +290,8 @@ internal sealed class GameRelay : IDisposable
     }
 
     /// <summary>The route's inputs from MeasureGame (the route itself needs the relay leg, timed alongside).</summary>
-    private sealed record Measured(GameProfile? Profile, double? RouteEdge, (double Ms, string From, DateTime? At) Hidden, double? Estimate);
+    private sealed record Measured(GameProfile? Profile, double? RouteEdge, (double Ms, string From, DateTime? At) Hidden, double? Estimate,
+        double? HopLeg);
 
     /// <summary>One game's ping this second: its server timed (tcp_rtt, icmp or udp_unreachable; profile_estimate behind
     /// a CDN), as its entry in the sample's games list, without the route.</summary>
@@ -302,7 +306,8 @@ internal sealed class GameRelay : IDisposable
             state.Pings.Clear();
             state.Answers.Clear();
             state.LastIcmp = null;
-            lock (state) { state.Estimate = null; state.EstimateNew = false; }
+            state.HopTracedAt = null;
+            lock (state) { state.Estimate = null; state.EstimateNew = false; state.Hop = null; }
             state.EstimateNext = DateTime.MinValue;
         }
 
@@ -338,7 +343,10 @@ internal sealed class GameRelay : IDisposable
             : profile.EdgeToServerMs is not null ? (routeEdge + hidden.Ms, true)
             : profile.RelayToServerMs is { } relayLeg && routed ? (relayMs + relayLeg, true)
             : ProfileEstimate(profile, state);
-        var ping = profile is null ? edge : estimate;
+        // A server that answers nothing and has no profile (ARC Raiders on Google Cloud: no ping, no port unreachable):
+        // the last router on the direct route that answers (hop_estimate), a lower bound.
+        var hop = profile is null && edge is null && !icmpLately && unreachable.Port is null ? HopEstimate(address, routed, relayMs, state) : default;
+        var ping = profile is null ? edge ?? hop.Ms : estimate;
         // A held estimate repeats between measurements; only new ones go into the jitter window.
         if (ping is { } p && (profile is null || fresh)) Push(state.Pings, p);
 
@@ -355,14 +363,70 @@ internal sealed class GameRelay : IDisposable
             ["loss_pct"] = state.Answers.Any(a => a) ? Math.Round(state.Answers.Count(a => !a) * 100.0 / state.Answers.Count, 1) : null,
             ["window"] = values.Length,
             ["ping_method"] = profile is not null ? (estimate is not null ? "profile_estimate" : null)
-                : rtt is not null ? "tcp_rtt" : icmp is not null ? "icmp" : unreachable.Ms is not null ? "udp_unreachable" : null,
+                : rtt is not null ? "tcp_rtt" : icmp is not null ? "icmp" : unreachable.Ms is not null ? "udp_unreachable"
+                : hop.Ms is not null ? "hop_estimate" : null,
             ["server"] = new JsonObject { ["ip"] = address.ToString(), ["port"] = port, ["proto"] = proto },
             // With udp_unreachable: the closed port that answers and this second's time (null: a miss, counted as loss).
             ["unreachable"] = unreachable.Port is { } up ? new JsonObject { ["port"] = up, ["ms"] = unreachable.Ms is { } um ? Math.Round(um, 1) : null } : null,
             // With profile_estimate: the CDN edge's own figure (tcp_rtt or icmp), and where the servers really are.
             ["edge_ms"] = profile is not null && edge is { } e ? Math.Round(e, 1) : null,
             ["profile"] = profile is null ? null : new JsonObject { ["name"] = profile.Name, ["region"] = profile.Region, ["target"] = profile.Target },
-        }, new Measured(profile, routeEdge, hidden, estimate));
+            // With hop_estimate: the router timed instead (its hop count on the direct route) and its own round trip.
+            ["hop"] = hop.Ip is null ? null : new JsonObject { ["ip"] = hop.Ip.ToString(), ["ttl"] = hop.Ttl, ["ms"] = hop.HopMs is { } hm ? Math.Round(hm, 1) : null },
+        }, new Measured(profile, routeEdge, hidden, estimate, hop.Ip is null ? null : hop.Leg));
+    }
+
+    private static readonly TimeSpan HopRetrace = TimeSpan.FromMinutes(3);
+
+    /// <summary>
+    /// For a server that answers nothing: the last router on the direct route that does (traced tracert style every 3
+    /// minutes in the background, then timed each second by ping, or by the expired echo when it ignores ping). ARC
+    /// Raiders' Google Cloud Sydney server: Google's edge 72.14.213.44 at hop 6, 15-19 ms, with nothing answering past
+    /// it. Direct: the ping is that router's time, a lower bound. Through the relay: the live relay leg plus relay →
+    /// server, taken as the router's time minus the relay server's, both on the direct path from here (as AION's hidden
+    /// leg), since a trace through the tunnel gets no answers past the relay. Leg is the route's last leg.
+    /// </summary>
+    private (double? Ms, double? Leg, IPAddress? Ip, int Ttl, double? HopMs) HopEstimate(IPAddress server, bool routed, int? relayMs, PingState state)
+    {
+        var now = DateTime.UtcNow;
+        if (Probe.DefaultSource() is not { } direct) return default;
+        if ((state.HopTracedAt is not { } at || now - at > HopRetrace) && state.HopTracing is null or { IsCompleted: true })
+        {
+            state.HopTracedAt = now;
+            state.HopTracing = Task.Run(() =>
+            {
+                var found = TraceLastHop(server, direct);
+                lock (state) state.Hop = found;
+            });
+        }
+        (IPAddress Ip, byte Ttl)? traced;
+        lock (state) traced = state.Hop;
+        if (traced is not { } h) return default;
+        double? hopMs = Probe.Icmp(h.Ip, direct, tries: 1, timeoutMs: 700) ?? Probe.IcmpTtl(server, direct, h.Ttl).Ms;
+        if (hopMs is not { } ms) return (null, null, h.Ip, h.Ttl, null);
+        if (!routed) return (ms, ms, h.Ip, h.Ttl, ms);
+        if (relayMs is null || !IPEndPoint.TryParse(_relayEndpoint ?? "", out var endpoint) || IPAddress.IsLoopback(endpoint.Address)
+            || Probe.Icmp(endpoint.Address, direct, tries: 1, timeoutMs: 500) is not { } relayDirect)
+            return (null, null, h.Ip, h.Ttl, ms);
+        var leg = Math.Max(0, ms - relayDirect);
+        return (relayMs + leg, leg, h.Ip, h.Ttl, ms);
+    }
+
+    /// <summary>Tracert from this source: the last public router that answers before the route goes silent (4 silent hops
+    /// in a row ends it), or null when none does or the server itself answers.</summary>
+    private static (IPAddress Ip, byte Ttl)? TraceLastHop(IPAddress server, IPAddress source)
+    {
+        (IPAddress Ip, byte Ttl)? last = null;
+        var silent = 0;
+        for (byte ttl = 1; ttl <= 24 && silent < 4; ttl++)
+        {
+            var (from, _, target) = Probe.IcmpTtl(server, source, ttl);
+            if (target) return null;
+            if (from is null) { silent++; continue; }
+            silent = 0;
+            if (IsPublic(BitConverter.ToUInt32(from.GetAddressBytes()))) last = (from, ttl);
+        }
+        return last;
     }
 
     /// <summary>
@@ -413,9 +477,17 @@ internal sealed class GameRelay : IDisposable
     /// when a leg is missing this second.
     /// </summary>
     private static JsonObject Route(bool routed, GameProfile? profile, double? edge, int? relayMs, (double Ms, string From, DateTime? At) hidden,
-        double? estimate)
+        double? estimate, double? hopLeg)
     {
         var legs = new JsonArray();
+        // A silent server timed by the last router before it (hop_estimate): the last leg is that estimate.
+        if (profile is null && edge is null && hopLeg is { } viaHop)
+        {
+            if (routed) legs.Add(Leg("PC", "Relay", relayMs, "live"));
+            legs.Add(Leg(routed ? "Relay" : "PC", "Game server", viaHop, "estimate"));
+            var hopTotal = routed ? relayMs + viaHop : viaHop;
+            return new JsonObject { ["legs"] = legs, ["total_ms"] = hopTotal is { } ht ? Math.Round(ht, 1) : null };
+        }
         if (profile?.RelayToServerMs is { } relayLeg)
         {
             var server = $"Game server ({profile.Region})";
@@ -1236,6 +1308,33 @@ internal static class Probe
                 if (best is null || ms < best) best = ms;
             }
             return best;
+        }
+        finally { IcmpCloseHandle(handle); }
+    }
+
+    /// <summary>One echo to the target that may only cross ttl routers (tracert style): who answered (the router where it
+    /// expired, or the target itself) and the round trip; From null when nothing answered.</summary>
+    public static unsafe (IPAddress? From, int? Ms, bool Target) IcmpTtl(IPAddress target, IPAddress? source, byte ttl, uint timeoutMs = 700)
+    {
+        var handle = IcmpCreateFile();
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1)) return (null, null, false);
+        try
+        {
+            var dest = BitConverter.ToUInt32(target.GetAddressBytes());
+            var src = source is null ? 0u : BitConverter.ToUInt32(source.GetAddressBytes());
+            var data = stackalloc byte[32];
+            var reply = stackalloc byte[256];
+            new Span<byte>(reply, 256).Clear();
+            // IP_OPTION_INFORMATION (x64): Ttl, Tos, Flags, OptionsSize, then the options pointer.
+            var options = stackalloc byte[16];
+            new Span<byte>(options, 16).Clear();
+            options[0] = ttl;
+            IcmpSendEcho2Ex(handle, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, src, dest, data, 32, (IntPtr)options, reply, 256, timeoutMs);
+            uint address = *(uint*)reply, status = *(uint*)(reply + 4);
+            var ms = (int)*(uint*)(reply + 8);
+            if (status == 0 && address == dest) return (target, ms, true);
+            if (status == 11013 /* IP_TTL_EXPIRED_TRANSIT */ && address != 0) return (new IPAddress(address), ms, false);
+            return (null, null, false);
         }
         finally { IcmpCloseHandle(handle); }
     }
