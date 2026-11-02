@@ -255,6 +255,11 @@ internal sealed class GameRelay : IDisposable
             {
                 var pids = game.Pids.ToHashSet();
                 var udpPeers = allPeers.Where(p => pids.Contains(p.Pid)).ToList();
+                // A live real-time UDP stream through the relay (2+ batches a second each way) is the game's own traffic,
+                // ahead of any TCP connection: Marathon plays over UDP via Valve's Sydney relay (18-28 ms) while it also
+                // holds a TCP connection to Bungie's backend in the US, which showed as a 200 ms ping.
+                if (udpPeers.FirstOrDefault(p => p.Quiet < TimeSpan.FromSeconds(5) && carried.Any(c => c.Contains(p.Remote)) && IsGameFlow(p)) is { Remote: not 0 } stream)
+                    return (default, stream.Remote, stream.Port, "udp", true);
                 // Game servers rather than its web requests: not 80/443 when there's a choice. A game whose server is UDP
                 // (Tarkov's raids) has none of those: then its busiest live UDP server through the relay, timed by ICMP.
                 var server = tcp.Where(r => pids.Contains(r.Pid) && carried.Any(c => c.Contains(r.Remote)))
@@ -263,7 +268,8 @@ internal sealed class GameRelay : IDisposable
                 if (remote == 0 && udpPeers.FirstOrDefault(p => p.Quiet < TimeSpan.FromSeconds(5) && carried.Any(c => c.Contains(p.Remote))) is { Remote: not 0 } udp)
                     (remote, port, proto) = (udp.Remote, udp.Port, "udp");
                 // Not through the relay (not learned yet, or a raid server held direct until its raid ends): the game's live
-                // server is still timed, on the direct path, so the site shows its ping marked "direct".
+                // server is still timed, on the direct path, so the site shows its ping marked "direct". Its UDP stream
+                // comes first here too.
                 var routed = remote != 0;
                 if (!routed && udpPeers.FirstOrDefault(p => p.Quiet < TimeSpan.FromSeconds(5) && IsGameFlow(p)) is { Remote: not 0 } direct)
                     (remote, port, proto) = (direct.Remote, direct.Port, "udp");
@@ -365,7 +371,9 @@ internal sealed class GameRelay : IDisposable
             ["ping_method"] = profile is not null ? (estimate is not null ? "profile_estimate" : null)
                 : rtt is not null ? "tcp_rtt" : icmp is not null ? "icmp" : unreachable.Ms is not null ? "udp_unreachable"
                 : hop.Ms is not null ? "hop_estimate" : null,
-            ["server"] = new JsonObject { ["ip"] = address.ToString(), ["port"] = port, ["proto"] = proto },
+            // service: set when the address is a relay service in front of the real server (its ping is only to there).
+            ["server"] = new JsonObject { ["ip"] = address.ToString(), ["port"] = port, ["proto"] = proto,
+                ["service"] = SteamRelay.Any(c => c.Contains(remote)) ? "Steam Datagram Relay" : null },
             // With udp_unreachable: the closed port that answers and this second's time (null: a miss, counted as loss).
             ["unreachable"] = unreachable.Port is { } up ? new JsonObject { ["port"] = up, ["ms"] = unreachable.Ms is { } um ? Math.Round(um, 1) : null } : null,
             // With profile_estimate: the CDN edge's own figure (tcp_rtt or icmp), and where the servers really are.
@@ -375,6 +383,13 @@ internal sealed class GameRelay : IDisposable
             ["hop"] = hop.Ip is null ? null : new JsonObject { ["ip"] = hop.Ip.ToString(), ["ttl"] = hop.Ttl, ["ms"] = hop.HopMs is { } hm ? Math.Round(hm, 1) : null },
         }, new Measured(profile, routeEdge, hidden, estimate, hop.Ip is null ? null : hop.Leg));
     }
+
+    /// <summary>Valve's networks (AS32590), where Steam Datagram Relay's relays sit: a game played through them (Marathon)
+    /// talks to the nearest relay, which carries the traffic on to the real server over Valve's own network, so the ping
+    /// is only to the relay.</summary>
+    private static readonly Cidr[] SteamRelay = new[] { "103.10.124.0/23", "103.28.54.0/23", "146.66.152.0/21", "155.133.224.0/19",
+        "162.254.192.0/21", "185.25.180.0/22", "192.69.96.0/22", "205.196.6.0/24", "208.64.200.0/22", "208.78.164.0/22", "45.121.184.0/22" }
+        .Select(r => Cidr.TryParse(r, out var c) ? c : default).ToArray();
 
     private static readonly TimeSpan HopRetrace = TimeSpan.FromMinutes(3);
 
