@@ -168,7 +168,8 @@ internal sealed unsafe class UdpPeers : IDisposable
     /// <summary>
     /// Event 1169/1170 v1: Endpoint (8 bytes), NumMessages (4), NumBytes (4), LocalSockAddr's length (4) and the
     /// SOCKADDR, RemoteSockAddr's length (4) and the SOCKADDR, Pid (4), ProcessStartKey (8). The event header's process
-    /// is often System for deliveries, so the payload's Pid is the one used. IPv4 only.
+    /// is often System for deliveries, so the payload's Pid is the one used. IPv4 only, but a dual-stack socket's
+    /// IPv4-mapped address (::ffff:a.b.c.d, Darktide's game server) counts as the IPv4 address it is.
     /// </summary>
     private void Handle(EventRecord* record)
     {
@@ -180,8 +181,13 @@ internal sealed unsafe class UdpPeers : IDisposable
         if (remoteAt + 4 > length) return;
         var remoteLength = *(int*)(d + remoteAt);
         var remote = d + remoteAt + 4;
-        if (remoteLength < 8 || remoteAt + 4 + remoteLength + 4 > length || *(ushort*)remote != 2) return; // AF_INET
-        var key = (*(int*)(remote + remoteLength), *(uint*)(remote + 4), remote[2] << 8 | remote[3]);
+        if (remoteLength < 8 || remoteAt + 4 + remoteLength + 4 > length) return;
+        uint address;
+        if (*(ushort*)remote == 2) address = *(uint*)(remote + 4); // AF_INET
+        else if (*(ushort*)remote == 23 && remoteLength >= 28 && *(ulong*)(remote + 8) == 0 && *(uint*)(remote + 16) == 0xFFFF0000)
+            address = *(uint*)(remote + 20); // AF_INET6, ::ffff:a.b.c.d
+        else return;
+        var key = (*(int*)(remote + remoteLength), address, remote[2] << 8 | remote[3]);
         var now = Stopwatch.GetTimestamp();
         lock (_lock)
         {
