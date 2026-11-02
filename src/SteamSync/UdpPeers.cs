@@ -144,6 +144,14 @@ internal sealed unsafe class UdpPeers : IDisposable
     {
         var handle = _consumer;
         ProcessTrace(&handle, 1, IntPtr.Zero, IntPtr.Zero); // returns once the session stops
+        lock (_lock)
+        {
+            // Stopped by something else (another program starting a session by this name stops ours): forget it, so
+            // the next read starts a new one. Without this the peers stayed empty until the game closed.
+            if (_consumer != handle || _disposed) return;
+            Log.Info("Relay: the UDP trace was stopped from outside; starting it again");
+            StopLocked();
+        }
     }
 
     [UnmanagedCallersOnly]

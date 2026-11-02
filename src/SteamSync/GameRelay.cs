@@ -104,6 +104,7 @@ internal sealed class GameRelay : IDisposable
     private const int PingWindow = 30;
     private readonly System.Threading.Timer _pingTimer;
     private readonly Dictionary<string, PingState> _pingStates = []; // per running game (key)
+    private static readonly TimeSpan IcmpQuietFor = TimeSpan.FromSeconds(30), IcmpHold = TimeSpan.FromSeconds(3);
     private readonly UnreachableProbe _unreachable = new(); // UDP servers that ignore ICMP (WARDOGS)
     private readonly GameProfiles _profiles = new();
     private (string Host, IPAddress? Address, DateTime ResolvedAt) _profileTarget = ("", null, DateTime.MinValue);
@@ -122,7 +123,7 @@ internal sealed class GameRelay : IDisposable
         public string? For;                              // the server (address:port) the windows belong to
         public readonly Queue<double> Pings = new();     // the ping figures of the last PingWindow seconds
         public readonly Queue<bool> Answers = new();     // whether the server answered each ICMP echo (or udp_unreachable), same window
-        public bool IcmpSeen;                            // the server has answered ICMP: no udp_unreachable for it
+        public (int Ms, DateTime At)? LastIcmp;          // the server's last ICMP answer: udp_unreachable only when it's old
         public (double Ms, DateTime At)? Estimate;       // the profile target's last answer (under lock: set in the background)
         public bool EstimateNew;                         // Estimate came in since the last tick read it
         public Task? Measuring;                          // the profile target's measurement in progress
@@ -300,20 +301,29 @@ internal sealed class GameRelay : IDisposable
             state.For = key;
             state.Pings.Clear();
             state.Answers.Clear();
-            state.IcmpSeen = false;
+            state.LastIcmp = null;
             lock (state) { state.Estimate = null; state.EstimateNew = false; }
             state.EstimateNext = DateTime.MinValue;
         }
 
+        var now = DateTime.UtcNow;
         var rtt = proto == "tcp" ? TcpTable.Rtt(row) : null;
-        // A UDP server that ignores ICMP (WARDOGS) is timed by the "port unreachable" its own host sends for a byte to a
-        // closed port next to the game's. Once such a port answers, ICMP isn't waited for any more (it never answered).
-        var unreachableOnly = proto == "udp" && !state.IcmpSeen && _unreachable.KnownPort(address, port) is not null;
-        var icmp = unreachableOnly ? null : Probe.IcmpRouted(address);
-        if (icmp is not null) state.IcmpSeen = true;
-        (int? Port, double? Ms) unreachable = proto == "udp" && icmp is null && !state.IcmpSeen && _unreachable.CanTry(address, port)
-            ? _unreachable.Probe(address, port) : default;
-        Push(state.Answers, icmp is not null || unreachable.Ms is not null);
+        // ICMP every second, always. A UDP server that hasn't answered it for a while (WARDOGS never does) is also timed,
+        // at the same time, by the "port unreachable" its own host sends for a byte to a closed port next to the game's.
+        // ICMP used to stop for good once such a port answered before ICMP had: a Tarkov raid server (CDN77, which
+        // drops some pings) missed its first ping, port +1 (another game instance) answered now and then, and the ping
+        // showed "–" for the whole raid.
+        var icmpLately = state.LastIcmp is { } last && now - last.At < IcmpQuietFor;
+        var unreachableTask = proto == "udp" && !icmpLately && _unreachable.CanTry(address, port)
+            ? Task.Run(() => _unreachable.Probe(address, port)) : null;
+        var icmpNow = Probe.IcmpRouted(address);
+        if (icmpNow is { } answered) state.LastIcmp = (answered, now);
+        (int? Port, double? Ms) unreachable = unreachableTask?.GetAwaiter().GetResult() ?? default;
+        if (icmpNow is not null) unreachable = default; // ICMP answered: that's the figure
+        Push(state.Answers, icmpNow is not null || unreachable.Ms is not null);
+        // A server that drops some pings (rate limits) keeps its last answer for a few seconds rather than flickering
+        // to "–"; the miss still counts as loss.
+        var icmp = icmpNow ?? (state.LastIcmp is { } held && now - held.At < IcmpHold ? held.Ms : null);
         // Behind a CDN (a game profile covers the server) both only reach the CDN's edge: the profile's target in
         // the servers' real region is the figure then, and the edge's stays alongside.
         var edge = rtt ?? icmp ?? unreachable.Ms;

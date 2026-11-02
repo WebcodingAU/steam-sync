@@ -219,6 +219,14 @@ internal sealed unsafe class FrameCounter : IDisposable
         var handle = _consumer;
         var error = ProcessTrace(&handle, 1, IntPtr.Zero, IntPtr.Zero);
         if (error != 0 && error != ErrorCancelled) Log.Info($"FPS: frame trace ended ({error})");
+        lock (_lock)
+        {
+            // Stopped by something else (another program starting a session by this name stops ours): forget it, so
+            // the next read starts a new one rather than counting nothing until the game closes.
+            if (_consumer != handle || _disposed) return;
+            Log.Info("FPS: the frame trace was stopped from outside; starting it again");
+            StopLocked();
+        }
     }
 
     [UnmanagedCallersOnly]
