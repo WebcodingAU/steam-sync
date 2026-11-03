@@ -18,7 +18,8 @@ internal sealed record RunningGame(string Key, string Name, IReadOnlyList<int> P
 /// "Playing now": Steam counts their play time itself.
 /// <para>
 /// A game is running when a process's exe sits inside its install folder (launchers and gamelaunchhelper.exe hand
-/// over to the real game exe, so the launched process can't simply be timed). A process whose path can't be read
+/// over to the real game exe, so the launched process can't simply be timed), or, for a Steam game, inside the folder
+/// of the same name in another Steam library (Neverwinter's launcher patches the game there). A process whose path can't be read
 /// (some anti-cheat-protected games) is matched by exe name against the exes found in each game's folder. Crash
 /// reporters, updaters, installers and anti-cheat services don't count.
 /// </para>
@@ -116,6 +117,16 @@ internal sealed class PlayTracker : IDisposable
             {
                 if (g.Installed && g.InstallPath is { } folder) targets.Add(new Target(g.EntityKey, g.Name, folder));
             }
+        }
+        // A launcher may keep the game itself in a folder of the same name in another Steam library: Neverwinter's
+        // Cryptic launcher patches GameClient.exe into F:\SteamLibrary\steamapps\common\Cryptic Studios while Steam's
+        // copy (the launcher) is on E:. Those count too, after every game's own folder, so one another game owns stays its.
+        var libraries = steam.Games.Select(g => g.LibraryPath).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        foreach (var g in steam.Games)
+        {
+            if (string.IsNullOrWhiteSpace(g.InstallDir)) continue;
+            foreach (var library in libraries.Where(l => !string.Equals(l, g.LibraryPath, StringComparison.OrdinalIgnoreCase)))
+                targets.Add(new Target($"steam:{g.AppId}", g.Name, Path.Combine(library, "steamapps", "common", g.InstallDir)));
         }
 
         // A folder must be a game's own: never a drive root or a top-level folder like G:\Games, which would claim
