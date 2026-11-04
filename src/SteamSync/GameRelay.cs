@@ -820,6 +820,11 @@ internal sealed class GameRelay : IDisposable
         }
     }
 
+    /// <summary>Whether the address shares a /24 with the relay server. A game hosted there (the user's Minecraft server)
+    /// is never learned: a route for that range would send the tunnel's own packets into the tunnel. It's timed direct.</summary>
+    private bool OnRelayServer(uint raw) => IPEndPoint.TryParse(_relayEndpoint ?? "", out var relay)
+        && relay.AddressFamily == AddressFamily.InterNetwork && ((BitConverter.ToUInt32(relay.Address.GetAddressBytes()) ^ raw) & 0x00FFFFFF) == 0;
+
     /// <summary>Adds the /24 of every public server the running games have held a TCP connection to for a minute.</summary>
     private void Learn(IReadOnlyList<RunningGame> running)
     {
@@ -832,7 +837,7 @@ internal sealed class GameRelay : IDisposable
             foreach (var g in running) foreach (var pid in g.Pids) byPid.TryAdd(pid, g);
             foreach (var row in TcpTable.Established())
             {
-                if (!byPid.TryGetValue(row.Pid, out var game) || !IsPublic(row.Remote) || NotLearnedPorts.Contains(row.RemotePort) || IsLauncher(row.Pid)) continue;
+                if (!byPid.TryGetValue(row.Pid, out var game) || !IsPublic(row.Remote) || NotLearnedPorts.Contains(row.RemotePort) || IsLauncher(row.Pid) || OnRelayServer(row.Remote)) continue;
                 var key = (row.Pid, row.Remote, row.RemotePort);
                 seen.Add(key);
                 if (!_firstSeen.TryGetValue(key, out var first)) _firstSeen[key] = first = now;
@@ -854,7 +859,7 @@ internal sealed class GameRelay : IDisposable
             foreach (var peer in _udp.Read(byPid.Keys))
             {
                 if (!byPid.TryGetValue(peer.Pid, out var game) || !IsPublic(peer.Remote) || NotLearnedPorts.Contains(peer.Port)
-                    || UdpServicePorts.Contains(peer.Port) || IsLauncher(peer.Pid)) continue;
+                    || UdpServicePorts.Contains(peer.Port) || IsLauncher(peer.Pid) || OnRelayServer(peer.Remote)) continue;
                 var range = Slash24(peer.Remote);
                 if (peer.Quiet < TimeSpan.FromSeconds(10)) live.Add(range);
                 var seconds = peer.Age.TotalSeconds;

@@ -270,15 +270,27 @@ internal sealed class PlayTracker : IDisposable
                     known = (processName, Identify(p.Id, processName, targets, byName));
                     _pidCache[p.Id] = known;
                 }
-                if (known.Hit is { } hit)
-                {
-                    if (!found.TryGetValue(hit.Key, out var game)) found[hit.Key] = game = new RunningGame(hit.Key, hit.Name, new List<int>());
-                    ((List<int>)game.Pids).Add(p.Id);
-                }
+                if (known.Hit is { } hit) Add(hit, p.Id);
             }
         }
         foreach (var pid in _pidCache.Keys.Where(pid => !alive.Contains(pid)).ToList()) _pidCache.Remove(pid);
+
+        // A Java game's exe is the Java runtime, which needn't sit in the game's folder (Minecraft's launcher keeps it in
+        // its package's LocalCache, here on another drive): a java or javaw that a game's own process started is that
+        // game. After the pass above, so the order processes are listed in doesn't matter.
+        foreach (var (pid, known) in _pidCache.Where(kv => kv.Value.Hit is null && kv.Value.Name is "java" or "javaw").ToList())
+        {
+            if (ParentPid(pid) is not { } parent || !_pidCache.TryGetValue(parent, out var starter) || starter.Hit is not { } hit) continue;
+            _pidCache[pid] = known with { Hit = hit };
+            Add(hit, pid);
+        }
         return found;
+
+        void Add(Target hit, int pid)
+        {
+            if (!found.TryGetValue(hit.Key, out var game)) found[hit.Key] = game = new RunningGame(hit.Key, hit.Name, new List<int>());
+            ((List<int>)game.Pids).Add(pid);
+        }
     }
 
     /// <summary>The game a process belongs to, or null: by where its exe is, else (path hidden) by its name.</summary>
@@ -409,6 +421,22 @@ internal sealed class PlayTracker : IDisposable
             var buffer = new StringBuilder(1024);
             var size = buffer.Capacity;
             return QueryFullProcessImageName(handle, 0, buffer, ref size) ? buffer.ToString(0, size) : null;
+        }
+        finally { CloseHandle(handle); }
+    }
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtQueryInformationProcess(IntPtr process, int infoClass, [Out] IntPtr[] info, int size, IntPtr returned);
+
+    /// <summary>The pid that started a process, from PROCESS_BASIC_INFORMATION (six pointer-sized fields, the last being it).</summary>
+    private static int? ParentPid(int pid)
+    {
+        var handle = OpenProcess(ProcessQueryLimitedInformation, false, pid);
+        if (handle == IntPtr.Zero) return null;
+        try
+        {
+            var info = new IntPtr[6];
+            return NtQueryInformationProcess(handle, 0, info, IntPtr.Size * info.Length, IntPtr.Zero) == 0 ? (int)info[5] : null;
         }
         finally { CloseHandle(handle); }
     }

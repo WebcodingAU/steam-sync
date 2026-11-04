@@ -93,7 +93,7 @@ non-Steam games that aren't in Steam, and Windows runs `SteamSync.exe --play <li
 
 `PlayTracker.cs` checks the running processes every second (only new processes are looked at). A game is running when a process's exe sits
 inside its install folder (launchers and `gamelaunchhelper.exe` hand over to the real exe, so the launched
-process isn't timed); a process whose path is hidden (some anti-cheat-protected games) is matched by exe name
+process isn't timed), or when it's a Java runtime the game's own process started (Minecraft); a process whose path is hidden (some anti-cheat-protected games) is matched by exe name
 against the exes in each game folder. Crash reporters, updaters, installers and anti-cheat services don't count.
 
 - A session is reported as running as soon as it's seen, and ends 2 seconds after the last process closes (back within a minute = the same session);
