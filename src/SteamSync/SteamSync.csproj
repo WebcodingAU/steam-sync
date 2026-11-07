@@ -27,6 +27,32 @@
     <EmbeddedResource Include="game-profiles.json" LogicalName="SteamSync.game-profiles.json" />
   </ItemGroup>
 
+  <!-- The limiter behind "Prevent clipping" (limiter\limiter.c): a native VST2 plugin, because Equalizer APO loads it into
+       the audio engine. Compiled with Zig, downloaded at build time from ziglang.org and checked against this hash like
+       wireguard.dll in RelayHelper.csproj, so neither a C compiler install nor a binary in the repo is needed. -->
+  <PropertyGroup>
+    <ZigVersion>0.17.1</ZigVersion>
+    <ZigSha256>b03f477a1943673e02aca0f570e8030dffd536ce1f45cbc4d3326ec31159562e</ZigSha256>
+    <ZigDir>$(MSBuildProjectDirectory)\obj\zig-$(ZigVersion)</ZigDir>
+    <ZigExe>$(ZigDir)\zig-x86_64-windows-$(ZigVersion)\zig.exe</ZigExe>
+    <LimiterDll>$(MSBuildProjectDirectory)\obj\limiter\limiter.dll</LimiterDll>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="$(LimiterDll)" LogicalName="SteamSync.limiter.dll" />
+  </ItemGroup>
+
+  <Target Name="FetchZig" Condition="!Exists('$(ZigExe)')">
+    <DownloadFile SourceUrl="https://ziglang.org/download/$(ZigVersion)/zig-x86_64-windows-$(ZigVersion).zip" DestinationFolder="$(ZigDir)" />
+    <VerifyFileHash File="$(ZigDir)\zig-x86_64-windows-$(ZigVersion).zip" Hash="$(ZigSha256)" Algorithm="SHA256" />
+    <Unzip SourceFiles="$(ZigDir)\zig-x86_64-windows-$(ZigVersion).zip" DestinationFolder="$(ZigDir)" />
+  </Target>
+
+  <Target Name="BuildLimiter" BeforeTargets="BeforeBuild;AssignTargetPaths" DependsOnTargets="FetchZig" Inputs="limiter\limiter.c" Outputs="$(LimiterDll)">
+    <MakeDir Directories="$(MSBuildProjectDirectory)\obj\limiter" />
+    <Exec Command="&quot;$(ZigExe)&quot; cc -target x86_64-windows-gnu -O2 -fno-sanitize=undefined -shared -o &quot;$(LimiterDll)&quot; limiter\limiter.c" EnvironmentVariables="ZIG_GLOBAL_CACHE_DIR=$(ZigDir)\cache;ZIG_LOCAL_CACHE_DIR=$(ZigDir)\cache" />
+  </Target>
+
   <ItemGroup>
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4258.31" />
     <PackageReference Include="Velopack" Version="1.2.161" />

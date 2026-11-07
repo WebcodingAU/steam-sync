@@ -299,6 +299,7 @@ internal sealed class TrayApp : ApplicationContext
         var items = _eqItem.DropDownItems;
         items.Clear();
         eq.RestoreBuiltInPresets();
+        eq.RefreshLimiter();
         var state = eq.Read();
         var presets = eq.Presets();
         // Off remembers its preset; the first switch-on falls back to the first preset, or to Peace's settings.
@@ -327,13 +328,17 @@ internal sealed class TrayApp : ApplicationContext
             });
 
         items.Add(new ToolStripSeparator());
-        var clip = new ToolStripMenuItem(state.PreventClipping && state.Preamp < 0 ? $"Prevent clipping ({state.Preamp:0.0} dB)" : "Prevent clipping")
-        {
-            Checked = state.PreventClipping,
-            Enabled = preset is not null && !state.OtherApp,
-            ToolTipText = "Lowers the volume by the preset's loudest boost, so loud sounds aren't distorted. Worked out again each time a preset is picked.",
-        };
-        clip.Click += (_, _) => EqualizerAction(() => eq.Set(state.On, preset!, preventClipping: !clip.Checked));
+        var clip = new ToolStripMenuItem("Prevent clipping") { Enabled = preset is not null && !state.OtherApp };
+        void Clipping(string label, Equalizer.Clipping choice, string tip) =>
+            clip.DropDownItems.Add(new ToolStripMenuItem(label, null, (_, _) => EqualizerAction(() => eq.Set(state.On, preset!, choice)))
+            {
+                Checked = state.Clipping == choice,
+                ToolTipText = tip,
+            });
+        Clipping("Only when needed", Equalizer.Clipping.Limiter, "Keeps full volume and turns down just the peaks that would clip, for a moment. Adds 2 ms of delay.");
+        Clipping(state.Clipping == Equalizer.Clipping.Preamp && state.Preamp < 0 ? $"Always lower the volume ({state.Preamp:0.0} dB)" : "Always lower the volume",
+            Equalizer.Clipping.Preamp, "Lowers everything by the preset's loudest boost. Worked out again each time a preset is picked.");
+        Clipping("Off", Equalizer.Clipping.Off, "Loud sounds can distort where the preset boosts them.");
         items.Add(clip);
         if (eq.CanImportPeace)
             items.Add(new ToolStripMenuItem("Import Peace's current settings", null, (_, _) => EqualizerAction(() =>

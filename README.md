@@ -134,6 +134,10 @@ dotnet build src/SteamSync
 dotnet publish src/SteamSync -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
 ```
 
+The equalizer's limiter (`src/SteamSync/limiter/limiter.c`, the "Only when needed" choice under **Prevent clipping**) is a
+native VST2 plugin that Equalizer APO loads after the EQ. The build compiles it with [Zig](https://ziglang.org), downloaded
+once into `src/SteamSync/obj` and hash-checked, so no C compiler needs installing.
+
 `SteamSync.exe --dump scan.json` writes the local scan (Steam and non-Steam) to a file without
 touching the network.
 

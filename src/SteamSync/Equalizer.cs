@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Numerics;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
@@ -48,17 +49,22 @@ internal sealed partial class Equalizer
     [GeneratedRegex(@"^[ \t]*(#[ \t]*)?Include:[ \t]*GamingEnjoyer\\(.+?)\.txt[ \t]*\r?$", RegexOptions.IgnoreCase | RegexOptions.Multiline)]
     private static partial Regex OurInclude();
 
-    // Our preamp line, commented out along with the Include when off; and the marker that prevent clipping was turned off.
+    // Our preamp line, commented out along with the Include when off; and the markers for the other clipping choices.
     [GeneratedRegex(@"^[ \t]*(?:#[ \t]*)?Preamp:[ \t]*(-?[\d.]+)[ \t]*dB", RegexOptions.IgnoreCase | RegexOptions.Multiline)]
     private static partial Regex OurPreamp();
     private const string ClippingOffLine = "# Prevent clipping: off";
+    private const string ClippingLimiterLine = "# Prevent clipping: limiter";
+
+    /// <summary>How clipping is kept off: not at all, a preamp that lowers everything by the preset's loudest boost, or
+    /// the limiter (limiter\limiter.c), which keeps full volume and turns down only the peaks that would clip.</summary>
+    public enum Clipping { Off, Preamp, Limiter }
 
     /// <summary>
     /// What config.txt says: on or off, with which preset. <paramref name="OtherApp"/> is true when it isn't ours
     /// (Peace's "Include: peace.txt", say): switching on here then takes over, keeping a copy of what was there.
     /// <paramref name="Preamp"/> is the volume drop prevent clipping wrote (0 when it isn't needed or is off).
     /// </summary>
-    public record struct EqState(bool On, string? Preset, bool OtherApp, bool PreventClipping, double Preamp);
+    public record struct EqState(bool On, string? Preset, bool OtherApp, Clipping Clipping, double Preamp);
 
     public EqState Read()
     {
@@ -66,11 +72,12 @@ internal sealed partial class Equalizer
         if (OurInclude().Match(text) is { Success: true } m)
         {
             var preamp = OurPreamp().Match(text) is { Success: true } p ? double.Parse(p.Groups[1].Value, CultureInfo.InvariantCulture) : 0;
-            return new EqState(On: !m.Groups[1].Success, m.Groups[2].Value, OtherApp: false,
-                PreventClipping: !text.Contains(ClippingOffLine, StringComparison.OrdinalIgnoreCase), preamp);
+            var clipping = text.Contains(ClippingLimiterLine, StringComparison.OrdinalIgnoreCase) ? Clipping.Limiter
+                : text.Contains(ClippingOffLine, StringComparison.OrdinalIgnoreCase) ? Clipping.Off : Clipping.Preamp;
+            return new EqState(On: !m.Groups[1].Success, m.Groups[2].Value, OtherApp: false, clipping, preamp);
         }
         var hasSettings = text.Split('\n').Any(l => l.Trim() is { Length: > 0 } t && !t.StartsWith('#'));
-        return new EqState(On: hasSettings, null, OtherApp: hasSettings, PreventClipping: true, 0);
+        return new EqState(On: hasSettings, null, OtherApp: hasSettings, Clipping.Preamp, 0);
     }
 
     /// <summary>The preset names, from the .txt files in the preset folder. A ";" would split Equalizer APO's Include line, so those are skipped.</summary>
@@ -80,28 +87,68 @@ internal sealed partial class Equalizer
             : [];
 
     /// <summary>
-    /// Points config.txt at a preset, on or off. With prevent clipping (kept as it was when null; on by default), a
+    /// Points config.txt at a preset, on or off. Clipping is kept as it was when null (the preamp by default). The
     /// preamp lowers the volume by the preset's loudest boost, worked out again each time, so editing a preset file is
-    /// picked up the next time it's chosen. Equalizer APO picks the change up by itself within a moment.
+    /// picked up the next time it's chosen. The limiter goes after the preset, so it sees what the EQ made of the sound,
+    /// and only while the equalizer is on. Equalizer APO picks the change up by itself within a moment.
     /// </summary>
-    public void Set(bool on, string preset, bool? preventClipping = null)
+    public void Set(bool on, string preset, Clipping? clipping = null)
     {
         var file = Path.Combine(PresetDir, preset + ".txt");
         if (!File.Exists(file)) throw new FileNotFoundException($"No preset called {preset}");
         var state = Read();
-        var clip = preventClipping ?? state.PreventClipping;
+        var clip = clipping ?? state.Clipping;
         // The first time, keep what another app (Peace) had in config.txt, so it can be put back by hand.
         var backup = Path.Combine(PresetDir, "config.txt.before");
         if (state.OtherApp && !File.Exists(backup)) File.Copy(ConfigFile, backup);
 
         var off = on ? "" : "# ";
         var lines = new List<string> { "# Written by Gaming Enjoyer (tray menu > Equalizer). When it's off, its lines are commented out." };
-        var headroom = clip ? Headroom(File.ReadAllText(file)) : 0;
-        if (!clip) lines.Add(ClippingOffLine);
+        var headroom = clip == Clipping.Preamp ? Headroom(File.ReadAllText(file)) : 0;
+        if (clip == Clipping.Off) lines.Add(ClippingOffLine);
+        else if (clip == Clipping.Limiter) lines.Add(ClippingLimiterLine);
         else if (headroom > 0) lines.Add($"{off}Preamp: {(-headroom).ToString("0.0", CultureInfo.InvariantCulture)} dB");
         lines.Add($"{off}Include: {PresetFolder}\\{preset}.txt");
+        if (clip == Clipping.Limiter)
+        {
+            // A preset can leave the Device and Channel it set in force; the limiter takes both channels of everything.
+            lines.Add($"{off}Device: all");
+            lines.Add($"{off}Channel: all");
+            lines.Add($"{off}VSTPlugin: Library \"{WriteLimiter()}\"");
+        }
         File.WriteAllLines(ConfigFile, lines);
-        Log.Info($"Equalizer {(on ? "on" : "off")} ({preset}{(headroom > 0 ? $", preamp -{headroom:0.0} dB" : "")})");
+        Log.Info($"Equalizer {(on ? "on" : "off")} ({preset}{(headroom > 0 ? $", preamp -{headroom:0.0} dB" : "")}{(clip == Clipping.Limiter ? ", limiter" : "")})");
+    }
+
+    /// <summary>
+    /// Writes the limiter built into the app next to the presets and returns its path. The file's name holds a hash of its
+    /// contents: the audio engine keeps the one it's using locked, so a new version has to be a new file. Old ones
+    /// go once they're free. They can't live in the app's own folder, which updates replace.
+    /// </summary>
+    private string WriteLimiter()
+    {
+        using var source = Assembly.GetExecutingAssembly().GetManifestResourceStream("SteamSync.limiter.dll")!;
+        using var bytes = new MemoryStream();
+        source.CopyTo(bytes);
+        var name = $"limiter-{Convert.ToHexStringLower(SHA256.HashData(bytes.ToArray()))[..12]}.dll";
+        var target = Path.Combine(PresetDir, name);
+        Directory.CreateDirectory(PresetDir);
+        if (!File.Exists(target)) File.WriteAllBytes(target, bytes.ToArray());
+        foreach (var old in Directory.GetFiles(PresetDir, "limiter-*.dll").Where(f => !f.Equals(target, StringComparison.OrdinalIgnoreCase)))
+        {
+            try { File.Delete(old); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { } // still loaded: next time
+        }
+        return target;
+    }
+
+    /// <summary>Puts the limiter's file back, or moves config.txt on to the version in this build of the app.</summary>
+    public void RefreshLimiter()
+    {
+        var state = Read();
+        if (state.Clipping != Clipping.Limiter || state.Preset is not { } preset || !File.Exists(Path.Combine(PresetDir, preset + ".txt"))) return;
+        var text = File.ReadAllText(ConfigFile);
+        if (!text.Contains(Path.GetFileName(WriteLimiter()), StringComparison.OrdinalIgnoreCase)) Set(state.On, preset);
     }
 
     /// <summary>
