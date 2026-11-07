@@ -40,7 +40,16 @@ internal sealed partial class Equalizer
             : null;
     }
 
+    public string ConfigDir => _configDir;
     public string PresetDir => Path.Combine(_configDir, PresetFolder);
+
+    /// <summary>The filters being applied, as Equalizer APO config text: the chosen preset's file, or Peace's when Peace is in control.</summary>
+    public string? CurveText(EqState state)
+    {
+        var file = state.OtherApp ? PeacePreset : state.Preset is { } p ? Path.Combine(PresetDir, p + ".txt") : null;
+        try { return file is not null && File.Exists(file) ? File.ReadAllText(file) : null; }
+        catch (IOException) { return null; } // mid-save: the window tries again on the next change
+    }
     private string ConfigFile => Path.Combine(_configDir, "config.txt");
     private string PeacePreset => Path.Combine(_configDir, "peace.txt");
     private string PeaceSettings => Path.Combine(_configDir, "peace.ini");
@@ -159,9 +168,24 @@ internal sealed partial class Equalizer
     /// </summary>
     public static double Headroom(string config)
     {
+        var peak = Response(config).Gain.Max();
+        return peak > 0.005 ? Math.Ceiling(peak * 10 - 0.05) / 10 : 0;
+    }
+
+    /// <summary>One filter of a config, for showing what's set: its type (PK, LSC, HSC...), frequency, gain and Q.</summary>
+    public readonly record struct Band(string Type, double Fc, double Gain, double Q);
+
+    /// <summary>
+    /// What an Equalizer APO config does to each frequency from 10 Hz to 20 kHz (1000 points, evenly spaced in pitch), in
+    /// dB, and the filters that make it up. Headroom's peak, and the curve the equalizer window draws.
+    /// </summary>
+    public static (double[] Freq, double[] Gain, IReadOnlyList<Band> Bands, double Preamp) Response(string config)
+    {
         const double rate = 48000;
         var freqs = Enumerable.Range(0, 1000).Select(i => 10 * Math.Pow(2000, i / 999.0)).ToArray(); // 10 Hz to 20 kHz
         var gain = new double[freqs.Length];
+        var bands = new List<Band>();
+        var preamp = 0.0;
         foreach (var raw in config.Split('\n'))
         {
             var line = raw.Trim();
@@ -169,6 +193,8 @@ internal sealed partial class Equalizer
             if (Regex.Match(line, @"^Preamp:\s*(-?[\d.]+)\s*dB", RegexOptions.IgnoreCase) is { Success: true } pre)
             {
                 var db = Num(pre.Groups[1].Value);
+                if (!double.IsFinite(db)) continue;
+                preamp += db;
                 for (var i = 0; i < gain.Length; i++) gain[i] += db;
             }
             else if (Regex.Match(line, @"^GraphicEQ:(.*)$", RegexOptions.IgnoreCase) is { Success: true } geq)
@@ -195,6 +221,7 @@ internal sealed partial class Equalizer
                     : Regex.Match(rest, @"BW Oct\s+([\d.]+)", RegexOptions.IgnoreCase) is { Success: true } bw ? 1 / (2 * Math.Sinh(Math.Log(2) / 2 * Num(bw.Groups[1].Value)))
                     : 0.7071;
                 if (Biquad(type, Num(fc.Groups[1].Value), g, q, rate) is not { } c) continue;
+                bands.Add(new Band(type, Num(fc.Groups[1].Value), g, q));
                 for (var i = 0; i < gain.Length; i++)
                 {
                     var z = Complex.FromPolarCoordinates(1, -2 * Math.PI * freqs[i] / rate);
@@ -203,8 +230,7 @@ internal sealed partial class Equalizer
                 }
             }
         }
-        var peak = gain.Max();
-        return peak > 0.005 ? Math.Ceiling(peak * 10 - 0.05) / 10 : 0;
+        return (freqs, gain, bands, preamp);
 
         static double Num(string s) => double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : double.NaN;
     }

@@ -34,6 +34,7 @@ internal sealed class TrayApp : ApplicationContext
     private readonly Updater _updater = new();
     private readonly ToolStripMenuItem _updateItem = new() { Visible = false };
     private LibraryWindow? _library;
+    private EqualizerWindow? _eqWindow;
     private readonly Dictionary<SyncState, Icon> _icons = new()
     {
         [SyncState.Synced] = TrayIcons.Create(),
@@ -328,6 +329,20 @@ internal sealed class TrayApp : ApplicationContext
             });
 
         items.Add(new ToolStripSeparator());
+        items.Add(new ToolStripMenuItem("Show curve…", null, (_, _) =>
+        {
+            if (_eqWindow is null || _eqWindow.IsDisposed)
+            {
+                _eqWindow = new EqualizerWindow(eq);
+                _eqWindow.FormClosed += (_, _) => _eqWindow = null;
+                _eqWindow.Show();
+            }
+            if (_eqWindow.WindowState == FormWindowState.Minimized) _eqWindow.WindowState = FormWindowState.Normal;
+            _eqWindow.Activate();
+        })
+        {
+            ToolTipText = "What the equalizer does to each frequency, the values of its filters, and whether it's on.",
+        });
         var clip = new ToolStripMenuItem("Prevent clipping") { Enabled = preset is not null && !state.OtherApp };
         void Clipping(string label, Equalizer.Clipping choice, string tip) =>
             clip.DropDownItems.Add(new ToolStripMenuItem(label, null, (_, _) => EqualizerAction(() => eq.Set(state.On, preset!, choice)))
