@@ -50,7 +50,7 @@
 
   <Target Name="BuildLimiter" BeforeTargets="BeforeBuild;AssignTargetPaths" DependsOnTargets="FetchZig" Inputs="limiter\limiter.c" Outputs="$(LimiterDll)">
     <MakeDir Directories="$(MSBuildProjectDirectory)\obj\limiter" />
-    <Exec Command="&quot;$(ZigExe)&quot; cc -target x86_64-windows-gnu -O2 -fno-sanitize=undefined -shared -o &quot;$(LimiterDll)&quot; limiter\limiter.c" EnvironmentVariables="ZIG_GLOBAL_CACHE_DIR=$(ZigDir)\cache;ZIG_LOCAL_CACHE_DIR=$(ZigDir)\cache" />
+    <Exec Command="&quot;$(ZigExe)&quot; cc -target x86_64-windows-gnu -O2 -fno-sanitize=undefined -shared -o &quot;$(LimiterDll)&quot; limiter\limiter.c -ladvapi32" EnvironmentVariables="ZIG_GLOBAL_CACHE_DIR=$(ZigDir)\cache;ZIG_LOCAL_CACHE_DIR=$(ZigDir)\cache" />
   </Target>
 
   <ItemGroup>

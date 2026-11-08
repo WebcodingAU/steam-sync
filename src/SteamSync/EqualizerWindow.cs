@@ -18,6 +18,9 @@ internal sealed class EqualizerWindow : Form
     private readonly Label _status = new() { Dock = DockStyle.Top, AutoSize = false, Height = 24, TextAlign = ContentAlignment.MiddleLeft };
     private readonly Label _bands = new() { Dock = DockStyle.Bottom, AutoSize = false, Height = 72, Padding = new Padding(0, 4, 0, 0) };
     private readonly CheckBox _onTop = new() { Text = "Keep on top", AutoSize = true, Dock = DockStyle.Right };
+    private readonly Label _limiter = new() { Dock = DockStyle.Top, AutoSize = false, Height = 36, TextAlign = ContentAlignment.MiddleLeft, Visible = false };
+    private bool _showCounts;
+    private readonly System.Windows.Forms.Timer _counts = new() { Interval = 1000 }; // the limiter's counts change without any file changing
     private readonly Graph _graph = new() { Dock = DockStyle.Fill };
 
     public EqualizerWindow(Equalizer eq)
@@ -39,6 +42,7 @@ internal sealed class EqualizerWindow : Form
         _onTop.CheckedChanged += (_, _) => TopMost = _onTop.Checked;
         Controls.Add(_graph);
         Controls.Add(_bands);
+        Controls.Add(_limiter);
         Controls.Add(top);
 
         var dark = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme", 1) is 0;
@@ -55,6 +59,8 @@ internal sealed class EqualizerWindow : Form
         _watcher.Deleted += Changed;
         _watcher.EnableRaisingEvents = true;
         _reload.Tick += (_, _) => { _reload.Stop(); Reload(); };
+        _counts.Tick += (_, _) => { if (_showCounts) _limiter.Text = Equalizer.DescribeLimiter(Equalizer.ReadLimiterStats()); };
+        _counts.Start();
         Reload();
     }
 
@@ -81,6 +87,9 @@ internal sealed class EqualizerWindow : Form
         _status.Text = $"{name}: {(state.On ? "on" : "off")}   ·   Prevent clipping: {clipping}"
             // "Fosi (Fosi Audio K5 Pro)" → "Fosi": the line has to fit next to Keep on top.
             + (devices.Count > 0 ? $"   ·   {string.Join(", ", devices.Select(d => d.Split(" (")[0]))}" : "   ·   not installed on a connected device");
+        // Its own flag: a control reads as hidden until the window is on screen.
+        _limiter.Visible = _showCounts = state.Clipping == Equalizer.Clipping.Limiter && !state.OtherApp;
+        if (_showCounts) _limiter.Text = Equalizer.DescribeLimiter(Equalizer.ReadLimiterStats());
 
         if (text is null)
         {
@@ -118,6 +127,7 @@ internal sealed class EqualizerWindow : Form
         {
             _watcher.Dispose();
             _reload.Dispose();
+            _counts.Dispose();
         }
         base.Dispose(disposing);
     }

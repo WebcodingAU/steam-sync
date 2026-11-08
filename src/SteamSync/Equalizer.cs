@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.IO.MemoryMappedFiles;
 using System.Numerics;
 using System.Reflection;
 using System.Security.Cryptography;
@@ -149,6 +150,54 @@ internal sealed partial class Equalizer
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { } // still loaded: next time
         }
         return target;
+    }
+
+    /// <summary>
+    /// What the limiter has done since <paramref name="Since"/>, added up over every app's sound: how many times it turned
+    /// the sound down (<paramref name="Dips"/>), how deep it went, when it last did, and how many samples were over full
+    /// scale going in (<paramref name="OverFullScale"/>), which would have clipped without it.
+    /// </summary>
+    public readonly record struct LimiterStats(DateTime Since, int Streams, long Dips, long OverFullScale, double DeepestDb, TimeSpan? LastDip);
+
+    private static MemoryMappedFile? _limiterStats;
+
+    /// <summary>
+    /// The limiter's counts (limiter.c's Stats), or null before any copy of it has run. The shared memory is kept open
+    /// once found: Windows deletes it when the last handle closes, so without this the counts would start again from
+    /// nothing whenever sound stopped for a while.
+    /// </summary>
+    public static LimiterStats? ReadLimiterStats()
+    {
+        _limiterStats ??= Open(@"Global\GamingEnjoyerLimiter1") ?? Open(@"Local\GamingEnjoyerLimiter1");
+        if (_limiterStats is null) return null;
+        using var view = _limiterStats.CreateViewAccessor(0, 60, MemoryMappedFileAccess.Read);
+        if (view.ReadUInt32(0) != 0x734C4547) return null; // "GELs": not filled in yet
+        var lastDip = view.ReadInt64(48);
+        var deepest = view.ReadSingle(56);
+        return new LimiterStats(
+            DateTime.FromFileTimeUtc(view.ReadInt64(8)).ToLocalTime(),
+            (int)view.ReadUInt32(4),
+            view.ReadInt64(40),
+            view.ReadInt64(32),
+            deepest > 0 && deepest < 1 ? 20 * Math.Log10(deepest) : 0,
+            lastDip > 0 ? TimeSpan.FromMilliseconds(Environment.TickCount64 - lastDip) : null);
+
+        static MemoryMappedFile? Open(string name)
+        {
+            try { return MemoryMappedFile.OpenExisting(name, MemoryMappedFileRights.Read); }
+            catch (Exception ex) when (ex is FileNotFoundException or UnauthorizedAccessException or IOException) { return null; }
+        }
+    }
+
+    /// <summary>One line about the limiter's counts, for the equalizer window and menu.</summary>
+    public static string DescribeLimiter(LimiterStats? stats)
+    {
+        if (stats is not { } s) return "Limiter: no counts yet. It starts counting when sound plays.";
+        var since = s.Since.Date == DateTime.Today ? s.Since.ToString("h:mm tt", CultureInfo.CurrentCulture) : s.Since.ToString("d MMM h:mm tt", CultureInfo.CurrentCulture);
+        if (s.Dips == 0) return $"Limiter since {since}: nothing has needed turning down";
+        var ago = s.LastDip is not { } t ? "" : t.TotalSeconds < 60 ? ", last just now" : t.TotalMinutes < 60 ? $", last {t.TotalMinutes:0} min ago" : $", last {t.TotalHours:0.#} h ago";
+        return $"Limiter since {since}: turned down {s.Dips:N0} peak{(s.Dips == 1 ? "" : "s")}, deepest {s.DeepestDb.ToString("0.0", CultureInfo.InvariantCulture)} dB{ago}"
+            + (s.OverFullScale > 0 ? $"   ·   {s.OverFullScale:N0} samples kept from clipping" : "   ·   none would have clipped");
     }
 
     /// <summary>Puts the limiter's file back, or moves config.txt on to the version in this build of the app.</summary>

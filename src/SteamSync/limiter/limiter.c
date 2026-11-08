@@ -15,6 +15,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <windows.h>
+#include <sddl.h>
 
 #define MAX_LOOKAHEAD 2048 // samples: 2 ms at up to 1 MHz, far past any audio device
 #define LOOKAHEAD_SECONDS 0.002
@@ -60,9 +62,59 @@ enum
     Version = 1,
 };
 
+// What the limiter has done, for the tray app's equalizer window: shared memory that every copy adds to (one per app's
+// sound stream, as Equalizer APO runs per stream), once per block. Named after its layout's version, so a newer DLL never
+// reads an older layout. Global when the audio engine creates it (a service may), else Local (Equalizer APO's Benchmark).
+#define STATS_NAME L"GamingEnjoyerLimiter1"
+#define STATS_MAGIC 0x734C4547 // "GELs"
+
+typedef struct
+{
+    uint32_t magic;
+    uint32_t streams;            // copies running now
+    int64_t since;               // FILETIME (UTC) when the counting started
+    int64_t frames;              // processed, all streams
+    int64_t limited;             // frames turned down
+    int64_t overFullScale;       // frames that were over full scale going in: these would have clipped
+    int64_t dips;                // separate peaks it turned down (over the ceiling after 50 ms under it)
+    int64_t lastDip;             // GetTickCount64 at the last frame it turned down
+    int32_t lowestGain;          // the float bits of the lowest gain it used (1.0 = never)
+} Stats;
+
+static Stats *openStats(HANDLE *mapping)
+{
+    // Read for the signed-in user (the tray app); everything for the accounts the audio engine runs as.
+    SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, FALSE };
+    ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;NS)(A;;GA;;;BA)(A;;GA;;;OW)(A;;GR;;;IU)",
+        SDDL_REVISION_1, &sa.lpSecurityDescriptor, NULL);
+    HANDLE m = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, sizeof(Stats), L"Global\\" STATS_NAME);
+    if (!m) m = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, sizeof(Stats), L"Local\\" STATS_NAME);
+    BOOL created = m && GetLastError() != ERROR_ALREADY_EXISTS;
+    if (sa.lpSecurityDescriptor) LocalFree(sa.lpSecurityDescriptor);
+    if (!m) return NULL;
+    Stats *s = MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Stats));
+    if (!s) { CloseHandle(m); return NULL; }
+    if (created)
+    {
+        FILETIME now;
+        GetSystemTimeAsFileTime(&now);
+        s->since = (int64_t)(((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime);
+        float one = 1;
+        memcpy(&s->lowestGain, &one, sizeof one);
+        InterlockedExchange((volatile LONG *)&s->magic, STATS_MAGIC);
+    }
+    InterlockedIncrement((volatile LONG *)&s->streams);
+    *mapping = m;
+    return s;
+}
+
 typedef struct
 {
     AEffect effect;
+    Stats *stats;                // null when the shared memory couldn't be made: the limiter works the same without it
+    HANDLE mapping;
+    int64_t under;               // samples since the sound was last over the ceiling, for counting separate peaks
+    int apart;                   // how long under the ceiling (50 ms) makes the next one a new peak
     int look;                    // the look-ahead in samples: the delay, and the moving average's length
     int at;                      // where in delay and recent the next sample goes
     double release;              // the part of the way back to 1 the gain goes each sample
@@ -93,6 +145,8 @@ static void setRate(Limiter *l, double rate)
     int look = (int)ceil(rate * LOOKAHEAD_SECONDS);
     l->look = look < 1 ? 1 : look > MAX_LOOKAHEAD ? MAX_LOOKAHEAD : look;
     l->release = 1 - exp(-1 / (RELEASE_SECONDS * rate));
+    l->apart = (int)(rate * 0.05);
+    l->under = l->apart;
     l->effect.initialDelay = l->look;
     reset(l);
 }
@@ -104,11 +158,21 @@ static void processReplacing(AEffect *e, float **in, float **out, int32_t frames
 {
     Limiter *l = e->object;
     const int cap = MAX_LOOKAHEAD + 2;
+    int64_t limited = 0, over = 0, dips = 0;
+    double lowestGain = 1;
     for (int32_t i = 0; i < frames; i++)
     {
         float a = clean(in[0][i]), b = clean(in[1][i]);
         float peak = fmaxf(fabsf(a), fabsf(b));
+        if (peak > 1.0f) over++;
         double need = peak > CEILING ? (double)CEILING / peak : 1.0;
+        // A peak is sound going over the ceiling after 50 ms under it; the gain's slow return in between doesn't matter.
+        if (need < 1.0)
+        {
+            if (l->under >= l->apart) dips++;
+            l->under = 0;
+        }
+        else l->under++;
 
         // The lowest need of the last look + 1 samples: anything that isn't lower than this one can never be the lowest again.
         while (l->tail != l->head)
@@ -150,10 +214,32 @@ static void processReplacing(AEffect *e, float **in, float **out, int32_t frames
         {
             outA = (float)(outA * gain);
             outB = (float)(outB * gain);
+            limited++;
+            if (gain < lowestGain) lowestGain = gain;
         }
         // Rounding could leave a sample a hair over; it never gets past the ceiling.
         out[0][i] = fminf(fmaxf(outA, -CEILING), CEILING);
         out[1][i] = fminf(fmaxf(outB, -CEILING), CEILING);
+    }
+
+    // Once per block: a few atomic adds, no locks, so the audio thread never waits.
+    Stats *s = l->stats;
+    if (!s) return;
+    InterlockedExchangeAdd64(&s->frames, frames);
+    if (over) InterlockedExchangeAdd64(&s->overFullScale, over);
+    if (dips) InterlockedExchangeAdd64(&s->dips, dips);
+    if (!limited) return;
+    InterlockedExchangeAdd64(&s->limited, limited);
+    InterlockedExchange64(&s->lastDip, (int64_t)GetTickCount64());
+    // Positive floats order like their bits, so the lowest gain is an integer minimum.
+    float low = (float)lowestGain;
+    LONG bits;
+    memcpy(&bits, &low, sizeof bits);
+    for (LONG seen = s->lowestGain; bits < seen;)
+    {
+        LONG was = InterlockedCompareExchange((volatile LONG *)&s->lowestGain, bits, seen);
+        if (was == seen) break;
+        seen = was;
     }
 }
 
@@ -163,7 +249,15 @@ static intptr_t dispatcher(AEffect *e, int32_t opcode, int32_t index, intptr_t v
     Limiter *l = e->object;
     switch (opcode)
     {
-        case OpClose: free(l); return 1;
+        case OpClose:
+            if (l->stats)
+            {
+                InterlockedDecrement((volatile LONG *)&l->stats->streams);
+                UnmapViewOfFile(l->stats);
+                CloseHandle(l->mapping);
+            }
+            free(l);
+            return 1;
         case OpSetSampleRate: setRate(l, opt); return 1;
         case OpMainsChanged: if (value) reset(l); return 0;
         case OpGetPlugCategory: return CategoryMastering;
@@ -197,5 +291,6 @@ __declspec(dllexport) AEffect *VSTPluginMain(AudioMaster host)
     e->version = Version;
     e->processReplacing = processReplacing;
     setRate(l, 48000);
+    l->stats = openStats(&l->mapping);
     return e;
 }

@@ -35,6 +35,7 @@ internal sealed class TrayApp : ApplicationContext
     private readonly ToolStripMenuItem _updateItem = new() { Visible = false };
     private LibraryWindow? _library;
     private EqualizerWindow? _eqWindow;
+    private readonly System.Windows.Forms.Timer _limiterWatch = new() { Interval = 30_000 };
     private readonly Dictionary<SyncState, Icon> _icons = new()
     {
         [SyncState.Synced] = TrayIcons.Create(),
@@ -58,6 +59,14 @@ internal sealed class TrayApp : ApplicationContext
         _eqItem.DropDownItems.Add("…"); // rebuilt each time it opens (BuildEqualizerMenu)
         _eqItem.DropDownOpening += (_, _) => BuildEqualizerMenu();
         _eqItem.Visible = _eq is not null;
+        if (_eq is not null)
+        {
+            // Moves config.txt on to this build's limiter, and keeps hold of its counts so they last between songs.
+            try { _eq.RefreshLimiter(); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Log.Error("Updating the equalizer's limiter failed", ex); }
+            _limiterWatch.Tick += (_, _) => Equalizer.ReadLimiterStats();
+            _limiterWatch.Start();
+        }
 
         _syncNowItem.Click += async (_, _) => await _sync.SyncNowAsync();
         _pairItem.Click += (_, _) => TogglePairing();
@@ -354,6 +363,11 @@ internal sealed class TrayApp : ApplicationContext
         Clipping(state.Clipping == Equalizer.Clipping.Preamp && state.Preamp < 0 ? $"Always lower the volume ({state.Preamp:0.0} dB)" : "Always lower the volume",
             Equalizer.Clipping.Preamp, "Lowers everything by the preset's loudest boost. Worked out again each time a preset is picked.");
         Clipping("Off", Equalizer.Clipping.Off, "Loud sounds can distort where the preset boosts them.");
+        if (state.Clipping == Equalizer.Clipping.Limiter)
+        {
+            clip.DropDownItems.Add(new ToolStripSeparator());
+            clip.DropDownItems.Add(new ToolStripMenuItem(Equalizer.DescribeLimiter(Equalizer.ReadLimiterStats())) { Enabled = false });
+        }
         items.Add(clip);
         if (eq.CanImportPeace)
             items.Add(new ToolStripMenuItem("Import Peace's current settings", null, (_, _) => EqualizerAction(() =>
