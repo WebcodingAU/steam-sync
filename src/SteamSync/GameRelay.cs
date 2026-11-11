@@ -147,8 +147,22 @@ internal sealed class GameRelay : IDisposable
         _pingTimer = new(_ => PingTick());
     }
 
-    /// <summary>The relay helper service is installed (the relay has been set up on this PC).</summary>
+    /// <summary>The relay has been set up on this PC: the helper service is installed with a relay config. Helpers from
+    /// 1.2.0 record which in their Parameters key (Relay = 0 when installed for the CPU temperature only); older ones
+    /// were only ever installed with a config.</summary>
     public static bool IsSetUp
+    {
+        get
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\" + HelperService);
+            if (key is null) return false;
+            using var parameters = key.OpenSubKey("Parameters");
+            return parameters?.GetValue("Relay") is not int relay || relay != 0;
+        }
+    }
+
+    /// <summary>The relay helper service is installed, with or without a relay (PawnIo uses it for the CPU temperature).</summary>
+    public static bool HelperInstalled
     {
         get
         {
@@ -1113,10 +1127,16 @@ internal sealed class GameRelay : IDisposable
     /// <summary>Re-installs the packaged (newer) helper, keeping the stored config.</summary>
     public static Task<string?> UpdateHelperAsync() => RunHelperElevatedAsync(PackagedHelper, ["install"]);
 
-    /// <summary>Removes the helper, its files and the stored config, running the installed helper's own uninstall
-    /// from a temporary copy (so it can delete its own file).</summary>
+    /// <summary>Installs or updates the packaged helper for the CPU temperature (PawnIo): keeps the relay config when
+    /// there is one, else it runs without a relay.</summary>
+    public static Task<string?> InstallHelperAsync() => RunHelperElevatedAsync(PackagedHelper, ["install"]);
+
+    /// <summary>Removes the relay. When the CPU temperature through PawnIO is on, the helper stays for that and only
+    /// the relay config goes; otherwise the helper, its files and the stored config are removed, running the installed
+    /// helper's own uninstall from a temporary copy (so it can delete its own file).</summary>
     public static async Task<string?> RemoveAsync()
     {
+        if (PawnIo.Enabled && File.Exists(PackagedHelper)) return await RunHelperElevatedAsync(PackagedHelper, ["install", "--no-relay"]);
         var source = File.Exists(InstalledHelper) ? InstalledHelper : PackagedHelper;
         var copy = Path.Combine(Path.GetTempPath(), $"GamingEnjoyerRelay-uninstall-{Guid.NewGuid():N}.exe");
         try
@@ -1143,7 +1163,8 @@ internal sealed class GameRelay : IDisposable
             return process.ExitCode switch
             {
                 0 => null,
-                1 when args[0] == "install" => "The relay helper couldn't be installed. Check the relay config (it needs PrivateKey, Address, PublicKey and Endpoint); details are in Windows' Application event log.",
+                1 when args is ["install", var config] && config != "--no-relay" => "The relay helper couldn't be installed. Check the relay config (it needs PrivateKey, Address, PublicKey and Endpoint); details are in Windows' Application event log.",
+                1 when args[0] == "install" => "The relay helper couldn't be installed; details are in Windows' Application event log.",
                 _ => $"The relay helper stopped with code {process.ExitCode}.",
             };
         }

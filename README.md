@@ -113,6 +113,17 @@ and hooks the game: read from its shared memory, no admin needed, `null` otherwi
 `system` object and `method` `pc_load`, and `null` when the game stops. Stable builds never start it.
 `SteamSync.exe --system-stats out.jsonl [seconds] [pid...]` writes the samples without sending them.
 
+The GPU's temperature (`system.gpu_temp_c`) comes from NVIDIA's driver. The CPU's (`system.cpu_temp_c`, one decimal,
+`null` when nothing has it) comes from, in order: PawnIO, MSI Afterburner's shared memory, HWiNFO's shared memory.
+PawnIO is opt-in: **PC load → CPU temperature (installs PawnIO)…** in the tray asks first, then downloads PawnIO's
+official installer from its GitHub releases, runs it only if its SHA-256 matches the pin in `PawnIo.cs`, and lets it
+ask for administrator rights itself. PawnIO is GPL-2.0, so the app never ships it. The relay helper does the reading
+(`CpuSensor.cs`), because PawnIO's device is open to administrators only. It loads PawnIO's signed `AMDFamily17.bin`
+(Zen: Tctl/Tdie) or `IntelMSR.bin` (CPU Package). Those two modules are LGPL-2.1: they're fetched at build time with a
+pinned hash and shipped with their licence. The tray app asks the helper over its pipe (`sensors`). Without a relay,
+the helper is installed for this alone (`install` with no config; `Relay = 0` in its service's `Parameters` key).
+`GamingEnjoyerRelay.exe cpu-temp [n]` (as administrator) prints the reading.
+
 ## Old ping helper
 
 Live ping (0.4.0-beta.6 to beta.17) has been removed. Its ping helper was a Windows service in

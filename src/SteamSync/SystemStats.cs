@@ -13,7 +13,8 @@ namespace SteamSync;
 /// the busiest engine of any GPU, each engine's use summed over its processes, the way Task Manager does it. Memory
 /// load is Windows' own figure (GlobalMemoryStatusEx). The CPU's speed is Task Manager's too (base clock times
 /// "% Processor Performance"); the GPU's clock and temperature come from NVIDIA's driver (NvidiaGpu), so other GPUs
-/// have none. The CPU's temperature is borrowed from MSI Afterburner or HWiNFO when one is running (CpuTemperature). The
+/// have none. The CPU's temperature comes from PawnIO through the relay helper when the user turned that on, else it's
+/// borrowed from MSI Afterburner or HWiNFO when one is running (CpuTemperature). The
 /// game's FPS is counted from Windows' own present events (FrameCounter), or read from RivaTuner when this PC can't
 /// run that trace (FrameRate).
 /// </para>
@@ -335,16 +336,17 @@ internal static class NvidiaGpu
 }
 
 /// <summary>
-/// The CPU's temperature in °C, borrowed from a sensor tool that's running, since Windows has no proper way to read it
-/// and reading the CPU's sensors directly takes a kernel driver (the common free one, WinRing0, is on Defender's
-/// vulnerable-driver list, so the app doesn't ship one). Both tools publish their readings in shared memory that any
-/// program can read without admin rights:
+/// The CPU's temperature in °C. Windows has no proper way to read it: reading the CPU's sensors takes a kernel driver
+/// (the common free one, WinRing0, is on Defender's vulnerable-driver list, so the app never ships one). In order:
 /// <list type="bullet">
+/// <item>PawnIO (PawnIo), when the user turned "CPU temperature" on in the PC load menu: the relay helper reads Tctl/Tdie
+/// on AMD and CPU Package on Intel.</item>
 /// <item>MSI Afterburner ("MAHMSharedMemory"): its "CPU temperature" source, or the hottest CPU temperature source.</item>
 /// <item>HWiNFO ("Global\HWiNFO_SENS_SM2", only with its "Shared Memory Support" setting on): CPU (Tctl/Tdie) on AMD,
 /// CPU Package on Intel.</item>
 /// </list>
-/// Null when neither is running or neither has a CPU temperature.
+/// The two tools publish their readings in shared memory that any program can read without admin rights. Null when
+/// none of the three has a reading.
 /// </summary>
 internal static class CpuTemperature
 {
@@ -352,7 +354,8 @@ internal static class CpuTemperature
 
     public static double? Read()
     {
-        var (c, source) = Afterburner() is { } a ? (a, "MSI Afterburner")
+        var (c, source) = PawnIo.Read() is { } p ? (p, "PawnIO")
+            : Afterburner() is { } a ? (a, "MSI Afterburner")
             : HwInfo() is { } h ? (h, "HWiNFO")
             : ((double?)null, (string?)null);
         if (source != _source)

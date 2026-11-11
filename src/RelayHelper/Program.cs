@@ -11,12 +11,16 @@ namespace RelayHelper;
 /// <list type="bullet">
 /// <item>(no arguments, started by Windows): the service. Creates the relay's WireGuard adapter (Tunnel) and takes
 /// the tray app's commands on \\.\pipe\GamingEnjoyer.Relay (PipeServer): which game ranges go through it, up, down.</item>
-/// <item><c>install [client.conf]</c> (as administrator): copies this exe and wireguard.dll to Program Files\Gaming
-/// Enjoyer, stores the relay's WireGuard client config (if given; else keeps the one already stored) in
-/// %ProgramData%\GamingEnjoyer\relay, readable only by SYSTEM and Administrators since it holds the private key, and
-/// installs or updates the service (LocalSystem: creating a network adapter needs it).</item>
-/// <item><c>uninstall</c> (as administrator): stops and removes the service, its files and the stored config.</item>
+/// <item><c>install [client.conf | --no-relay]</c> (as administrator): copies this exe, wireguard.dll and the PawnIO
+/// modules to Program Files\Gaming Enjoyer, stores the relay's WireGuard client config (if given; else keeps the one
+/// already stored; --no-relay deletes it) in %ProgramData%\GamingEnjoyer\relay, readable only by SYSTEM and
+/// Administrators since it holds the private key, and installs or updates the service (LocalSystem: creating a network
+/// adapter and opening PawnIO need it). With no config at all it runs for the CPU temperature only. The service's
+/// Parameters key gets Relay = 1 or 0 so the tray app can tell the two apart without reading the config.</item>
+/// <item><c>uninstall</c> (as administrator): stops and removes the service, its files and the stored config. PawnIO
+/// itself stays: it's its own program (Apps in Settings), which other tools may use too.</item>
 /// <item><c>console</c> (as administrator): runs the same thing in this window until Ctrl+C, for testing.</item>
+/// <item><c>cpu-temp</c> (as administrator): prints the PawnIO CPU temperature a few times, for testing.</item>
 /// </list>
 /// The service's exe and wireguard.dll must stay in Program Files, which only administrators can change: a service
 /// running files from a folder the user can write to would let any program the user runs swap them and run as SYSTEM.
@@ -26,8 +30,9 @@ internal static class Program
     public const string ServiceName = "GamingEnjoyerRelay";
     private const string DisplayName = "Gaming Enjoyer relay helper";
     private const string Description = "Runs the Gaming Enjoyer game relay: a WireGuard tunnel to your own server that carries only the "
-        + "game servers you switch on in the Gaming Enjoyer app.";
-    private static readonly string[] Payload = ["GamingEnjoyerRelay.exe", "wireguard.dll", "wireguard-nt-LICENSE.txt"];
+        + "game servers you switch on in the Gaming Enjoyer app. Also reads the CPU temperature through PawnIO when you turn that on.";
+    private static readonly string[] Payload = ["GamingEnjoyerRelay.exe", "wireguard.dll", "wireguard-nt-LICENSE.txt",
+        @"pawnio\AMDFamily17.bin", @"pawnio\IntelMSR.bin", @"pawnio\COPYING.txt", @"pawnio\README.txt"];
 
     public static string Version { get; } =
         Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.0.0";
@@ -54,6 +59,8 @@ internal static class Program
             case "--version":
                 Console.WriteLine(Version);
                 return 0;
+            case "cpu-temp":
+                return RequireAdmin() ?? CpuTemp(args.Length > 1 && int.TryParse(args[1], out var n) ? Math.Clamp(n, 1, 3600) : 5);
             case "duplicate-test" when args.Length > 1:
                 return DuplicateTest(args[1]);
             default:
@@ -108,20 +115,29 @@ internal static class Program
         return 0;
     }
 
+    private static int CpuTemp(int count)
+    {
+        using var sensor = new CpuSensor();
+        for (var i = 0; i < count; i++)
+        {
+            var (c, state) = sensor.Read();
+            Console.WriteLine($"{DateTime.Now:HH:mm:ss} {(c is { } x ? $"{x:0.0} °C" : "no reading")} ({state})");
+            Thread.Sleep(1000);
+        }
+        return 0;
+    }
+
     private static int Install(string? clientConfig)
     {
         try
         {
             // Check the config before touching anything.
             string? config = null;
-            if (clientConfig is not null)
+            var noRelay = clientConfig == "--no-relay";
+            if (clientConfig is not null && !noRelay)
             {
                 config = File.ReadAllText(clientConfig);
                 RelayConfig.Parse(config); // throws with what's wrong
-            }
-            else if (!File.Exists(ConfigFile))
-            {
-                throw new InvalidOperationException("No relay config: run install with the path to your relay's WireGuard client config.");
             }
 
             var exists = Sc("query", ServiceName) == 0;
@@ -133,6 +149,7 @@ internal static class Program
             {
                 foreach (var file in Payload)
                 {
+                    Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(InstallDir, file))!);
                     // The old files can stay locked for a moment after the service stops.
                     for (var attempt = 1; ; attempt++)
                     {
@@ -153,6 +170,10 @@ internal static class Program
                 dir.SetAccessControl(acl);
                 File.WriteAllText(ConfigFile, config);
             }
+            else if (noRelay && Directory.Exists(ConfigDir))
+            {
+                Directory.Delete(ConfigDir, recursive: true);
+            }
 
             var binPath = $"\"{InstalledExe}\"";
             var code = exists
@@ -163,10 +184,13 @@ internal static class Program
             Sc("description", ServiceName, Description);
             Sc("sidtype", ServiceName, "unrestricted");
             Sc("failure", ServiceName, "reset=", "86400", "actions=", "restart/5000/restart/10000/restart/60000");
+            var relay = File.Exists(ConfigFile);
+            using (var parameters = Microsoft.Win32.Registry.LocalMachine.CreateSubKey($@"SYSTEM\CurrentControlSet\Services\{ServiceName}\Parameters"))
+                parameters.SetValue("Relay", relay ? 1 : 0, Microsoft.Win32.RegistryValueKind.DWord);
 
             code = Sc("start", ServiceName);
             if (code != 0 && code != 1056) throw new InvalidOperationException($"sc start failed ({code})"); // 1056: already running
-            Console.WriteLine($"Installed {DisplayName} {Version}.");
+            Console.WriteLine($"Installed {DisplayName} {Version}{(relay ? "" : " (CPU temperature only, no relay)")}.");
             return 0;
         }
         catch (Exception ex)
@@ -191,6 +215,8 @@ internal static class Program
                 var path = Path.Combine(InstallDir, file);
                 if (File.Exists(path)) File.Delete(path);
             }
+            var modules = Path.Combine(InstallDir, "pawnio");
+            if (Directory.Exists(modules) && !Directory.EnumerateFileSystemEntries(modules).Any()) Directory.Delete(modules);
             if (Directory.Exists(InstallDir) && !Directory.EnumerateFileSystemEntries(InstallDir).Any()) Directory.Delete(InstallDir);
             if (Directory.Exists(ConfigDir)) Directory.Delete(ConfigDir, recursive: true);
         }
@@ -242,11 +268,16 @@ internal sealed class Engine : IDisposable
 
     public void Start()
     {
-        _tunnel = new Tunnel(RelayConfig.Parse(File.ReadAllText(Program.ConfigFile)));
-        _tunnel.Start();
-        _pipe = new PipeServer(_tunnel, Program.Version);
+        // No relay config: installed for the CPU temperature only, so just the pipe.
+        var config = File.Exists(Program.ConfigFile) ? RelayConfig.Parse(File.ReadAllText(Program.ConfigFile)) : null;
+        if (config is not null)
+        {
+            _tunnel = new Tunnel(config);
+            _tunnel.Start();
+        }
+        _pipe = new PipeServer(_tunnel, config, new CpuSensor(), Program.Version);
         _pipe.Start();
-        Log.Write($"Started {Program.Version}");
+        Log.Write($"Started {Program.Version}{(config is null ? " (no relay config: CPU temperature only)" : "")}");
     }
 
     public void Dispose()

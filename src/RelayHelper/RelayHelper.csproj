@@ -12,7 +12,7 @@
     <AssemblyName>GamingEnjoyerRelay</AssemblyName>
     <RootNamespace>RelayHelper</RootNamespace>
     <!-- Its own version: the tray app compares it with the installed copy to offer an update. Bump on any change. -->
-    <Version>1.1.1</Version>
+    <Version>1.2.0</Version>
     <Product>Gaming Enjoyer</Product>
     <AssemblyTitle>Gaming Enjoyer relay helper</AssemblyTitle>
     <Company>gamingenjoyer.com</Company>
@@ -49,6 +49,31 @@
   <ItemGroup>
     <None Include="$(WireGuardNtDir)\wireguard-nt\bin\amd64\wireguard.dll" Link="wireguard.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
     <None Include="$(WireGuardNtDir)\wireguard-nt\LICENSE.txt" Link="wireguard-nt-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+  </ItemGroup>
+
+  <!-- PawnIO modules for the CPU temperature (CpuSensor): the author-signed AMDFamily17.bin and IntelMSR.bin from
+       PawnIO.Modules' official release, downloaded at build time and checked against this hash. They're LGPL-2.1, so
+       they ship unmodified as separate files with their licence (COPYING) and a README saying where their source is.
+       PawnIO itself (the driver, GPL-2.0) is never shipped: the tray app downloads its official installer when the user
+       turns the CPU temperature on (PawnIoSetup in the tray app). -->
+  <PropertyGroup>
+    <PawnIoModulesVersion>0.2.11</PawnIoModulesVersion>
+    <PawnIoModulesSha256>43608cb89bc84247fef1368a139013f7d043e17db6d6c8dfc9b46bf0905a81f4</PawnIoModulesSha256>
+    <PawnIoModulesDir>$(MSBuildProjectDirectory)\obj\pawnio-modules-$(PawnIoModulesVersion)</PawnIoModulesDir>
+    <PawnIoModulesZip>release_$(PawnIoModulesVersion.Replace('.', '_')).zip</PawnIoModulesZip>
+  </PropertyGroup>
+
+  <Target Name="FetchPawnIoModules" BeforeTargets="AssignTargetPaths" Condition="!Exists('$(PawnIoModulesDir)\AMDFamily17.bin')">
+    <DownloadFile SourceUrl="https://github.com/namazso/PawnIO.Modules/releases/download/$(PawnIoModulesVersion)/$(PawnIoModulesZip)" DestinationFolder="$(PawnIoModulesDir)" />
+    <VerifyFileHash File="$(PawnIoModulesDir)\$(PawnIoModulesZip)" Hash="$(PawnIoModulesSha256)" Algorithm="SHA256" />
+    <Unzip SourceFiles="$(PawnIoModulesDir)\$(PawnIoModulesZip)" DestinationFolder="$(PawnIoModulesDir)" />
+  </Target>
+
+  <ItemGroup>
+    <None Include="$(PawnIoModulesDir)\AMDFamily17.bin" Link="pawnio\AMDFamily17.bin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <None Include="$(PawnIoModulesDir)\IntelMSR.bin" Link="pawnio\IntelMSR.bin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <None Include="$(PawnIoModulesDir)\COPYING" Link="pawnio\COPYING.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <None Include="pawnio-README.txt" Link="pawnio\README.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
   </ItemGroup>
 
 </Project>

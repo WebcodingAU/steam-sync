@@ -15,9 +15,12 @@ namespace RelayHelper;
 /// <item><c>{"cmd":"down"}</c></item>
 /// <item><c>{"cmd":"duplicate","on":true}</c>: packet duplication over every connection (Duplicator), when the relay
 /// config has a [GamingEnjoyer] DuplicateEndpoint</item>
+/// <item><c>{"cmd":"sensors"}</c>: the reply also carries cpu_temp_c (°C or null) and cpu_temp_state ("ok", or why
+/// there's no reading) from PawnIO (CpuSensor). PawnIO is only touched once this has been asked for.</item>
 /// </list>
-/// Every reply: ok, error, version, up, routes, handshake_age_s, rx, tx, relay, endpoint, duplicate_available,
-/// duplicate, paths (per connection: name, phone, sent, received, quiet_s). Open to people signed in at
+/// Every reply: ok, error, version, relay_configured, up, routes, handshake_age_s, rx, tx, relay, endpoint,
+/// duplicate_available, duplicate, paths (per connection: name, phone, sent, received, quiet_s). Without a relay config
+/// (installed for the CPU temperature only) there's no tunnel: up and duplicate fail, relay and endpoint are null. Open to people signed in at
 /// this PC (INTERACTIVE; the tray app runs as the signed-in user), closed to the network. Ranges are checked here:
 /// public IPv4 only, /8 or narrower, never the relay's own address (that would loop the tunnel into itself).
 /// </summary>
@@ -26,20 +29,24 @@ internal sealed class PipeServer : IDisposable
     public const string PipeName = "GamingEnjoyer.Relay";
     private const int MaxClients = 4;
 
-    private readonly Tunnel _tunnel;
-    private readonly RelayConfig _config;
+    private readonly Tunnel? _tunnel;
+    private readonly RelayConfig? _config;
+    private readonly CpuSensor _cpu;
     private readonly string _version;
     private readonly CancellationTokenSource _stop = new();
     private readonly object _duplicateGate = new();
     private Duplicator? _duplicator;
     private int _clients;
 
-    public PipeServer(Tunnel tunnel, string version)
+    public PipeServer(Tunnel? tunnel, RelayConfig? config, CpuSensor cpu, string version)
     {
         _tunnel = tunnel;
-        _config = RelayConfig.Parse(File.ReadAllText(Program.ConfigFile));
+        _config = config;
+        _cpu = cpu;
         _version = version;
     }
+
+    private Tunnel Relay => _tunnel ?? throw new InvalidOperationException("the relay isn't set up on this PC");
 
     public void Start() => _ = Task.Run(() => AcceptLoop(_stop.Token));
 
@@ -107,6 +114,7 @@ internal sealed class PipeServer : IDisposable
     private JsonObject Handle(string line)
     {
         string? error = null;
+        (double? Celsius, string State)? cpu = null;
         try
         {
             var request = JsonNode.Parse(line) as JsonObject ?? throw new FormatException("not a JSON object");
@@ -114,15 +122,19 @@ internal sealed class PipeServer : IDisposable
             {
                 case "status":
                     break;
+                case "sensors":
+                    cpu = _cpu.Read();
+                    break;
                 case "up":
+                    var tunnel = Relay;
                     var ranges = (request["ranges"] as JsonArray ?? []).Select(r => (string?)r ?? "").ToList();
                     if (ranges.Count > Tunnel.MaxRanges) throw new FormatException($"too many ranges (most {Tunnel.MaxRanges})");
                     var bad = ranges.Where(r => !IsAllowed(r)).ToList();
                     if (bad.Count > 0) throw new FormatException($"not allowed: {string.Join(", ", bad.Take(5))}");
-                    error = _tunnel.Up(ranges.Select(Normalise).Distinct().ToList());
+                    error = tunnel.Up(ranges.Select(Normalise).Distinct().ToList());
                     break;
                 case "down":
-                    _tunnel.Down();
+                    _tunnel?.Down();
                     break;
                 case "duplicate":
                     SetDuplicate((bool?)request["on"] ?? false);
@@ -136,29 +148,36 @@ internal sealed class PipeServer : IDisposable
             error = ex.Message;
         }
 
-        var (up, routes, handshake, rx, tx) = _tunnel.Status();
+        var (up, routes, handshake, rx, tx) = _tunnel?.Status() ?? (false, 0, null, 0, 0);
         var paths = new JsonArray();
         lock (_duplicateGate)
         {
             foreach (var (name, phone, sent, received, quiet) in _duplicator?.Paths() ?? [])
                 paths.Add((JsonNode)new JsonObject { ["name"] = name, ["phone"] = phone, ["sent"] = sent, ["received"] = received, ["quiet_s"] = quiet });
         }
-        return new JsonObject
+        var reply = new JsonObject
         {
-            ["duplicate_available"] = _config.DuplicateEndpoint is not null,
+            ["duplicate_available"] = _config?.DuplicateEndpoint is not null,
             ["duplicate"] = _duplicator is not null,
             ["paths"] = paths,
             ["ok"] = error is null,
             ["error"] = error,
             ["version"] = _version,
+            ["relay_configured"] = _tunnel is not null,
             ["up"] = up,
             ["routes"] = routes,
             ["handshake_age_s"] = handshake is { } h ? (long)(DateTimeOffset.UtcNow - h).TotalSeconds : null,
             ["rx"] = rx,
             ["tx"] = tx,
-            ["relay"] = _config.RelayAddress.ToString(),
-            ["endpoint"] = _config.EndpointText,
+            ["relay"] = _config?.RelayAddress.ToString(),
+            ["endpoint"] = _config?.EndpointText,
         };
+        if (cpu is { } c)
+        {
+            reply["cpu_temp_c"] = c.Celsius is { } x ? Math.Round(x, 1) : null;
+            reply["cpu_temp_state"] = c.State;
+        }
+        return reply;
     }
 
     /// <summary>A public IPv4 range, /8 to /32, that doesn't contain the relay's own address.</summary>
@@ -171,7 +190,7 @@ internal sealed class PipeServer : IDisposable
         if (b[0] is 0 or 10 or 127 or >= 224 || (b[0] == 172 && b[1] is >= 16 and <= 31) || (b[0] == 192 && b[1] == 168)
             || (b[0] == 169 && b[1] == 254) || (b[0] == 100 && b[1] is >= 64 and <= 127)) return false;
         var mask = bits == 32 ? uint.MaxValue : ~(uint.MaxValue >> bits);
-        return (ToUInt(_config.Endpoint.Address) & mask) != (ToUInt(ip) & mask);
+        return _config is not null && (ToUInt(_config.Endpoint.Address) & mask) != (ToUInt(ip) & mask);
     }
 
     /// <summary>The range with its host bits cleared (66.40.178.45/24 → 66.40.178.0/24), as routes need it.</summary>
@@ -197,18 +216,19 @@ internal sealed class PipeServer : IDisposable
         lock (_duplicateGate)
         {
             if (on == (_duplicator is not null)) return;
+            var tunnel = Relay;
             if (on)
             {
-                if (_config.DuplicateEndpoint is not { } endpoint || _config.DuplicateToken is not { } token)
+                if (_config!.DuplicateEndpoint is not { } endpoint || _config.DuplicateToken is not { } token)
                     throw new InvalidOperationException("the relay config has no DuplicateEndpoint");
                 var duplicator = new Duplicator(endpoint, token);
                 duplicator.Start();
-                _tunnel.SetEndpoint(duplicator.LocalEndPoint);
+                tunnel.SetEndpoint(duplicator.LocalEndPoint);
                 _duplicator = duplicator;
             }
             else
             {
-                _tunnel.SetEndpoint(_config.Endpoint);
+                tunnel.SetEndpoint(_config!.Endpoint);
                 _duplicator!.Dispose();
                 _duplicator = null;
             }
@@ -223,5 +243,6 @@ internal sealed class PipeServer : IDisposable
             _duplicator?.Dispose();
             _duplicator = null;
         }
+        _cpu.Dispose();
     }
 }

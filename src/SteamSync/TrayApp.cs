@@ -12,6 +12,7 @@ internal sealed class TrayApp : ApplicationContext
     private readonly PcLoad _pcLoad;            // beta builds only
     private readonly GameRelay _relay;          // menu shown in beta builds that carry the relay helper, or once set up
     private readonly ToolStripMenuItem _relayItem = new("Game relay");
+    private readonly ToolStripMenuItem _pcLoadItem = new("PC load") { Visible = UpdateChannel.IsBetaBuild };
     private readonly Equalizer? _eq = Equalizer.Find(); // menu shown only when Equalizer APO is installed
     private readonly ToolStripMenuItem _eqItem = new("Equalizer");
     private readonly SynchronizationContext _ui;
@@ -56,6 +57,8 @@ internal sealed class TrayApp : ApplicationContext
         _pcLoad = new PcLoad(config, _play, _relay);
         _relayItem.DropDownItems.Add("…"); // rebuilt each time it opens (BuildRelayMenu); this only shows the arrow
         _relayItem.DropDownOpening += (_, _) => BuildRelayMenu();
+        _pcLoadItem.DropDownItems.Add("…"); // rebuilt each time it opens (BuildPcLoadMenu)
+        _pcLoadItem.DropDownOpening += (_, _) => BuildPcLoadMenu();
         _eqItem.DropDownItems.Add("…"); // rebuilt each time it opens (BuildEqualizerMenu)
         _eqItem.DropDownOpening += (_, _) => BuildEqualizerMenu();
         _eqItem.Visible = _eq is not null;
@@ -93,6 +96,7 @@ internal sealed class TrayApp : ApplicationContext
             _startupItem,
             _betaItem,
             _relayItem,
+            _pcLoadItem,
             _eqItem,
             _oldHelperItem,
             new ToolStripSeparator(),
@@ -290,10 +294,59 @@ internal sealed class TrayApp : ApplicationContext
         });
         items.Add(new ToolStripMenuItem("Remove game relay…", null, async (_, _) =>
         {
-            if (MessageBox.Show("Remove the game relay from this PC? Its tunnel, the relay helper service and the stored relay config are removed (asks for administrator rights).",
+            if (MessageBox.Show(PawnIo.Enabled
+                    ? "Remove the game relay from this PC? Its tunnel and the stored relay config are removed; the relay helper service stays, for the CPU temperature (asks for administrator rights)."
+                    : "Remove the game relay from this PC? Its tunnel, the relay helper service and the stored relay config are removed (asks for administrator rights).",
                     AppInfo.Name, MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
                 await RelayAdminAsync(GameRelay.RemoveAsync(), "Game relay removed.");
         }));
+    }
+
+    /// <summary>
+    /// The PC load submenu (beta builds): the CPU temperature through PawnIO, off until the user turns it on. Turning it
+    /// on asks first, then installs PawnIO with its own installer if it isn't there (PawnIo.EnableAsync).
+    /// </summary>
+    private void BuildPcLoadMenu()
+    {
+        var items = _pcLoadItem.DropDownItems;
+        items.Clear();
+        if (PawnIo.Enabled)
+        {
+            items.Add(new ToolStripMenuItem($"CPU temperature: {PawnIo.Status}") { Enabled = false });
+            items.Add(new ToolStripMenuItem("CPU temperature through PawnIO", null, (_, _) => PawnIo.Enabled = false)
+            {
+                Checked = true,
+                ToolTipText = "Untick to stop reading it through PawnIO (MSI Afterburner's or HWiNFO's reading is used when one is running). PawnIO stays installed; remove it from Apps in Windows Settings.",
+            });
+            return;
+        }
+        var installed = PawnIo.IsInstalled;
+        items.Add(new ToolStripMenuItem(installed ? "CPU temperature through PawnIO…" : "CPU temperature (installs PawnIO)…", null,
+            async (_, _) => await EnableCpuTemperatureAsync(installed))
+        {
+            ToolTipText = "Reads the CPU's temperature for the site's PC load with PawnIO, the Microsoft-signed sensor driver LibreHardwareMonitor and Fan Control use. "
+                + "Without it, the temperature comes from MSI Afterburner or HWiNFO while one is running.",
+        });
+    }
+
+    private async Task EnableCpuTemperatureAsync(bool installed)
+    {
+        const string helper = "Gaming Enjoyer's relay helper service does the reading; if it isn't installed or is out of date, Windows asks for administrator rights for that too.";
+        var question = installed
+            ? $"PawnIO is already installed on this PC. Read the CPU's temperature with it?\n\n{helper}"
+            : "Read the CPU's temperature with PawnIO?\n\nPawnIO is a free, Microsoft-signed driver for reading hardware sensors (pawnio.eu), the one LibreHardwareMonitor and Fan Control use. "
+              + $"Gaming Enjoyer downloads its official installer and runs it, and Windows asks for administrator rights.\n\n{helper}\n\nYou can remove PawnIO later from Apps in Windows Settings.";
+        if (MessageBox.Show(question, $"{AppInfo.Name} — CPU temperature", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+
+        _pcLoadItem.Enabled = false;
+        try
+        {
+            var problem = await PawnIo.EnableAsync();
+            if (problem == "") return; // a UAC prompt was declined
+            if (problem is not null) MessageBox.Show(problem, AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            else _tray.ShowBalloonTip(5000, AppInfo.Name, "CPU temperature on: it's read through PawnIO while a game runs.", ToolTipIcon.Info);
+        }
+        finally { _pcLoadItem.Enabled = true; }
     }
 
     private static string EqualizerLabel(Equalizer.EqState s) =>
