@@ -3,7 +3,8 @@
 #   ./release.ps1                  version from <Version> in the csproj; builds, packs and uploads to everyone
 #   ./release.ps1 -Channel beta    a test build for copies on the beta channel only: versioned <Version>-beta.N
 #                                  (N = the next free number, or -Beta N) and published as a GitHub pre-release
-#   ./release.ps1 -NoUpload        builds and packs only (artifacts\releases\GamingEnjoyer-win-Setup.exe)
+#   ./release.ps1 -NoUpload        builds and packs only (artifacts\releases\GamingEnjoyer-win-Setup.exe); what the
+#                                  GitHub workflow runs. It still downloads the previous release for the delta package.
 #
 # Channels: stable is Velopack's default "win" channel (releases.win.json); beta is "beta" (releases.beta.json, on
 # pre-releases). Installed copies read one or the other (UpdateChannel in the app), so a beta never reaches anyone
@@ -65,12 +66,13 @@ if ($LASTEXITCODE) { throw 'dotnet publish failed' }
 dotnet publish (Join-Path $PSScriptRoot 'src\RelayHelper\RelayHelper.csproj') -c Release -o $publish -nologo -v q
 if ($LASTEXITCODE) { throw 'dotnet publish (relay helper) failed' }
 
-if ($token) {
-    # The previous release on this channel lets vpk build a small delta package, so updates download only what changed.
-    $pre = @(if ($Channel -eq 'beta') { '--pre' }) # @() keeps it an array: a lone string would splat letter by letter
-    vpk download github --repoUrl $repo --token $token -o $releases -c $vpkChannel @pre
-    if ($LASTEXITCODE) { Write-Warning 'No previous release downloaded (first release?); this one ships full only.' }
-}
+# The previous release on this channel lets vpk build a small delta package, so updates download only what changed. The
+# releases repo is public, so this needs no token (the GitHub workflow has none: -NoUpload); one is passed when there is
+# one, which only raises GitHub's rate limit.
+$pre = @(if ($Channel -eq 'beta') { '--pre' }) # @() keeps it an array: a lone string would splat letter by letter
+$auth = @(if ($token) { '--token', $token })
+vpk download github --repoUrl $repo @auth -o $releases -c $vpkChannel @pre
+if ($LASTEXITCODE) { Write-Warning 'No previous release downloaded (first release?); this one ships full only.' }
 
 vpk pack -u GamingEnjoyer -v $version -c $vpkChannel -r win-x64 -p $publish -e SteamSync.exe -o $releases `
     --packTitle 'Gaming Enjoyer' --packAuthors 'gamingenjoyer.com' `
