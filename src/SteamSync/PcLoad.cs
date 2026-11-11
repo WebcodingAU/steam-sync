@@ -5,7 +5,8 @@ namespace SteamSync;
 
 /// <summary>
 /// Beta builds only: while a game runs, the PC's load once a second (SystemStats: CPU, GPU, memory load, an
-/// approximate responsiveness and the game's own CPU), for the site's PC load badge and page. Sent through
+/// approximate responsiveness, the game's own CPU, and the GPU and CPU temperatures when they can be read), for the
+/// site's PC load badge and page. Sent through
 /// report_live_ping, the table live ping used, as a sample with a "system" object and no ping. When the game stops
 /// it sends null, which clears the PC's row. A stable build never starts it. While the game goes through the game
 /// relay, the sample also carries its live ping (GameRelay.PingSample: ping_ms, jitter_ms, loss_pct, server, relay),

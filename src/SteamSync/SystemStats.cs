@@ -12,7 +12,8 @@ namespace SteamSync;
 /// CPU is "% Processor Utility" (what Task Manager and Process Lasso show, frequency included, capped at 100). GPU is
 /// the busiest engine of any GPU, each engine's use summed over its processes, the way Task Manager does it. Memory
 /// load is Windows' own figure (GlobalMemoryStatusEx). The CPU's speed is Task Manager's too (base clock times
-/// "% Processor Performance"); the GPU's clock comes from NVIDIA's driver (GpuClock), so other GPUs have none. The
+/// "% Processor Performance"); the GPU's clock and temperature come from NVIDIA's driver (NvidiaGpu), so other GPUs
+/// have none. The CPU's temperature is borrowed from MSI Afterburner or HWiNFO when one is running (CpuTemperature). The
 /// game's FPS is counted from Windows' own present events (FrameCounter), or read from RivaTuner when this PC can't
 /// run that trace (FrameRate).
 /// </para>
@@ -90,8 +91,10 @@ internal sealed class SystemStats : IDisposable
             {
                 ["cpu_pct"] = Round(cpu),
                 ["cpu_ghz"] = cpuGhz is { } ghz ? Math.Round(ghz, 2) : null,
-                ["gpu_mhz"] = GpuClock.GraphicsMhz(),
+                ["cpu_temp_c"] = CpuTemperature.Read(),
+                ["gpu_mhz"] = NvidiaGpu.GraphicsMhz(),
                 ["gpu_pct"] = Round(gpu),
+                ["gpu_temp_c"] = NvidiaGpu.TemperatureC(),
                 ["gpu_engine"] = gpuEngine,
                 ["mem_pct"] = haveMemory ? (int)memory.MemoryLoad : null,
                 ["mem_used_gb"] = haveMemory ? Round((memory.TotalPhys - memory.AvailPhys) / 1073741824.0) : null,
@@ -278,16 +281,23 @@ internal sealed class SystemStats : IDisposable
 }
 
 /// <summary>
-/// The GPU's graphics clock in MHz, from NVIDIA's management library (nvml.dll, installed in System32 with every NVIDIA
-/// driver). The first NVIDIA GPU; null without one, or when the library can't be loaded (then it isn't tried again).
+/// The GPU's graphics clock in MHz and its temperature in °C, from NVIDIA's management library (nvml.dll, installed in
+/// System32 with every NVIDIA driver, no admin rights needed). The first NVIDIA GPU; null without one, or when the
+/// library can't be loaded (then it isn't tried again). The temperature is the GPU's main sensor: hotspot and memory
+/// temperatures exist only on some cards.
 /// </summary>
-internal static class GpuClock
+internal static class NvidiaGpu
 {
-    private const int NvmlClockGraphics = 0;
+    private const int NvmlClockGraphics = 0, NvmlTemperatureGpu = 0;
     private static bool _tried, _failed;
     private static IntPtr _device;
 
-    public static int? GraphicsMhz()
+    public static int? GraphicsMhz() => Read(d => nvmlDeviceGetClockInfo(d, NvmlClockGraphics, out var mhz) == 0 ? (int)mhz : null);
+
+    public static int? TemperatureC() =>
+        Read(d => nvmlDeviceGetTemperature(d, NvmlTemperatureGpu, out var c) == 0 && c is > 0 and < 150 ? (int)c : null);
+
+    private static int? Read(Func<IntPtr, int?> read)
     {
         if (_failed) return null;
         try
@@ -300,13 +310,13 @@ internal static class GpuClock
                     _failed = true;
                     return null;
                 }
-                Log.Info("GPU clock: reading it from NVIDIA's driver");
+                Log.Info("GPU clock and temperature: reading them from NVIDIA's driver");
             }
-            return nvmlDeviceGetClockInfo(_device, NvmlClockGraphics, out var mhz) == 0 ? (int)mhz : null;
+            return read(_device);
         }
         catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
         {
-            _failed = true; // no NVIDIA driver: no clock
+            _failed = true; // no NVIDIA driver: no clock or temperature
             return null;
         }
     }
@@ -319,6 +329,126 @@ internal static class GpuClock
 
     [DllImport("nvml.dll")]
     private static extern int nvmlDeviceGetClockInfo(IntPtr device, int type, out uint clock);
+
+    [DllImport("nvml.dll")]
+    private static extern int nvmlDeviceGetTemperature(IntPtr device, int sensor, out uint temperature);
+}
+
+/// <summary>
+/// The CPU's temperature in °C, borrowed from a sensor tool that's running, since Windows has no proper way to read it
+/// and reading the CPU's sensors directly takes a kernel driver (the common free one, WinRing0, is on Defender's
+/// vulnerable-driver list, so the app doesn't ship one). Both tools publish their readings in shared memory that any
+/// program can read without admin rights:
+/// <list type="bullet">
+/// <item>MSI Afterburner ("MAHMSharedMemory"): its "CPU temperature" source, or the hottest CPU temperature source.</item>
+/// <item>HWiNFO ("Global\HWiNFO_SENS_SM2", only with its "Shared Memory Support" setting on): CPU (Tctl/Tdie) on AMD,
+/// CPU Package on Intel.</item>
+/// </list>
+/// Null when neither is running or neither has a CPU temperature.
+/// </summary>
+internal static class CpuTemperature
+{
+    private static string? _source;
+
+    public static double? Read()
+    {
+        var (c, source) = Afterburner() is { } a ? (a, "MSI Afterburner")
+            : HwInfo() is { } h ? (h, "HWiNFO")
+            : ((double?)null, (string?)null);
+        if (source != _source)
+        {
+            _source = source;
+            Log.Info(source is null ? "CPU temperature: no sensor tool is sharing it" : $"CPU temperature: reading it from {source}");
+        }
+        return c is { } x ? Math.Round(x, 1) : null;
+    }
+
+    private const uint MahmSignature = 0x4D41484D; // "MAHM"
+    private const int MaxPath = 260;
+    private const uint MahmCpuTemperature = 0x80;  // MONITORING_SOURCE_ID_CPU_TEMPERATURE
+
+    /// <summary>MAHM v2: a header (dwSignature, dwVersion, dwHeaderSize, dwNumEntries, dwEntrySize, ...), then entries of
+    /// five MAX_PATH strings (name, units, localised name and units, format), float data (FLT_MAX: no reading),
+    /// minLimit, maxLimit, dwFlags, dwGpu, dwSrcId.</summary>
+    private static double? Afterburner(string name = "MAHMSharedMemory")
+    {
+        try
+        {
+            using var map = MemoryMappedFile.OpenExisting(name, MemoryMappedFileRights.Read);
+            using var view = map.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+            if (view.ReadUInt32(0) != MahmSignature || view.ReadUInt32(4) < 0x00020000) return null;
+            uint headerSize = view.ReadUInt32(8), count = view.ReadUInt32(12), entrySize = view.ReadUInt32(16);
+            const int Data = 5 * MaxPath, SrcId = Data + 4 * 4 + 4;
+            if (entrySize < SrcId + 4) return null;
+            double? named = null, hottest = null;
+            for (uint i = 0; i < count; i++)
+            {
+                long entry = headerSize + i * (long)entrySize;
+                if (entry + SrcId + 4 > view.Capacity) break;
+                if (view.ReadUInt32(entry + SrcId) != MahmCpuTemperature) continue;
+                var c = view.ReadSingle(entry + Data);
+                if (c is not (> 0 and < 150)) continue; // FLT_MAX: not read yet
+                if (AnsiString(view, entry, MaxPath) == "CPU temperature") named = c;
+                hottest = Math.Max(hottest ?? c, c);
+            }
+            return named ?? hottest;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or IOException or UnauthorizedAccessException)
+        {
+            return null; // Afterburner isn't running
+        }
+    }
+
+    private const uint HwInfoSignature = 0x53695748; // "HWiS"
+    private const int HwInfoTemperature = 1;          // SENSOR_READING_TYPE SENSOR_TYPE_TEMP
+    private const int LabelSize = 128, UnitSize = 16;
+
+    // Best first: the package/die figure each vendor's own tools show, then the hottest core.
+    private static readonly string[] HwInfoLabels = ["CPU (Tctl/Tdie)", "CPU Package", "CPU (Tdie)", "CPU (Tctl)", "CPU Die (average)", "Core Max"];
+
+    /// <summary>HWiNFO's packed header: dwSignature, dwVersion, dwRevision, poll_time (64-bit), then the sensor section's
+    /// offset, element size and count, and the reading section's offset (32), element size (36) and count (40). A reading
+    /// is tReading, dwSensorIndex, dwReadingID, szLabelOrig[128], szLabelUser[128], szUnit[16], then double Value.</summary>
+    private static double? HwInfo(string name = @"Global\HWiNFO_SENS_SM2")
+    {
+        try
+        {
+            using var map = MemoryMappedFile.OpenExisting(name, MemoryMappedFileRights.Read);
+            using var view = map.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+            if (view.ReadUInt32(0) != HwInfoSignature) return null; // "DEAD": HWiNFO closed or sharing stopped
+            uint offset = view.ReadUInt32(32), size = view.ReadUInt32(36), count = view.ReadUInt32(40);
+            const int Label = 12, Unit = Label + 2 * LabelSize, Value = Unit + UnitSize;
+            if (size < Value + 8) return null;
+            var best = int.MaxValue;
+            double? found = null;
+            for (uint i = 0; i < count; i++)
+            {
+                long reading = offset + i * (long)size;
+                if (reading + Value + 8 > view.Capacity) break;
+                if (view.ReadInt32(reading) != HwInfoTemperature) continue;
+                var rank = Array.IndexOf(HwInfoLabels, AnsiString(view, reading + Label, LabelSize));
+                if (rank < 0 || rank >= best) continue;
+                var c = view.ReadDouble(reading + Value);
+                if (AnsiString(view, reading + Unit, UnitSize).EndsWith('F')) c = (c - 32) * 5 / 9; // HWiNFO set to °F
+                if (c is not (> 0 and < 150)) continue;
+                best = rank;
+                found = c;
+            }
+            return found;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or IOException or UnauthorizedAccessException)
+        {
+            return null; // HWiNFO isn't running, or its shared memory support is off
+        }
+    }
+
+    private static string AnsiString(MemoryMappedViewAccessor view, long at, int size)
+    {
+        var bytes = new byte[size];
+        view.ReadArray(at, bytes, 0, size);
+        var end = Array.IndexOf(bytes, (byte)0);
+        return System.Text.Encoding.Latin1.GetString(bytes, 0, end < 0 ? size : end);
+    }
 }
 
 /// <summary>
