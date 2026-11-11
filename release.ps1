@@ -67,7 +67,7 @@ if ($LASTEXITCODE) { throw 'dotnet publish (relay helper) failed' }
 
 if ($token) {
     # The previous release on this channel lets vpk build a small delta package, so updates download only what changed.
-    $pre = if ($Channel -eq 'beta') { @('--pre') } else { @() }
+    $pre = @(if ($Channel -eq 'beta') { '--pre' }) # @() keeps it an array: a lone string would splat letter by letter
     vpk download github --repoUrl $repo --token $token -o $releases -c $vpkChannel @pre
     if ($LASTEXITCODE) { Write-Warning 'No previous release downloaded (first release?); this one ships full only.' }
 }
