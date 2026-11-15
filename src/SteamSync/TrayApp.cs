@@ -399,8 +399,12 @@ internal sealed class TrayApp : ApplicationContext
         finally { _pcLoadItem.Enabled = true; }
     }
 
+    // Switched on but installed on no connected device means nothing is heard (a big Windows update can remove it).
     private static string EqualizerLabel(Equalizer.EqState s) =>
-        s.OtherApp ? "Equalizer (Peace)" : s.On ? $"Equalizer: on — {s.Preset}" : "Equalizer: off";
+        s.OtherApp ? "Equalizer (Peace)"
+        : !s.On ? "Equalizer: off"
+        : Equalizer.Devices().Count == 0 ? "Equalizer: not active on any device"
+        : $"Equalizer: on — {s.Preset}";
 
     /// <summary>
     /// The Equalizer submenu: the on/off switch, a radio list of presets (picking one switches it on), importing Peace's
@@ -496,7 +500,7 @@ internal sealed class TrayApp : ApplicationContext
         if (devices.Count == 0)
             items.Add(new ToolStripMenuItem("Not installed on any connected device…", null, (_, _) => eq.OpenDeviceSelector())
             {
-                ToolTipText = "Windows may see your headphones' device as new (another USB port, say). Tick it in Equalizer APO's Device Selector and restart when asked.",
+                ToolTipText = "A big Windows update can remove Equalizer APO from your devices, or Windows may see your headphones' device as new (another USB port, say). Tick it in Equalizer APO's Device Selector and restart when asked.",
             });
     }
 
