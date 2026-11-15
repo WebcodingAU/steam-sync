@@ -14,7 +14,8 @@ internal sealed class TrayApp : ApplicationContext
     private readonly ToolStripMenuItem _relayItem = new("Game relay");
     private readonly ToolStripMenuItem _pcLoadItem = new("PC load") { Visible = UpdateChannel.IsBetaBuild };
     private readonly ToolStripMenuItem _spotifyItem = new("Spotify") { Visible = UpdateChannel.IsBetaBuild };
-    private SpotifyWindow? _spotify;            // created on first use, then kept (hidden) so music keeps playing
+    // Beta builds: the Spotify player. It lives in the Library window and keeps playing in the background after it closes.
+    private readonly SpotifyPlayer? _spotify;
     private readonly Equalizer? _eq = Equalizer.Find(); // menu shown only when Equalizer APO is installed
     private readonly ToolStripMenuItem _eqItem = new("Equalizer");
     private readonly SynchronizationContext _ui;
@@ -61,6 +62,7 @@ internal sealed class TrayApp : ApplicationContext
         _relayItem.DropDownOpening += (_, _) => BuildRelayMenu();
         _pcLoadItem.DropDownItems.Add("…"); // rebuilt each time it opens (BuildPcLoadMenu)
         _pcLoadItem.DropDownOpening += (_, _) => BuildPcLoadMenu();
+        if (UpdateChannel.IsBetaBuild) _spotify = new SpotifyPlayer(config);
         _spotifyItem.DropDownItems.Add("…"); // rebuilt each time it opens (BuildSpotifyMenu)
         _spotifyItem.DropDownOpening += (_, _) => BuildSpotifyMenu();
         _eqItem.DropDownItems.Add("…"); // rebuilt each time it opens (BuildEqualizerMenu)
@@ -159,7 +161,7 @@ internal sealed class TrayApp : ApplicationContext
     {
         if (_library is null || _library.IsDisposed)
         {
-            _library = new LibraryWindow(_config);
+            _library = new LibraryWindow(_config, _spotify);
             _library.FormClosed += (_, _) => _library = null;
             _library.Show();
         }
@@ -309,8 +311,8 @@ internal sealed class TrayApp : ApplicationContext
 
     /// <summary>
     /// The Spotify submenu (beta builds): what the Spotify player shows as playing (here or on another Spotify Connect
-    /// device), Play/Pause, Next and Previous, and opening the player. The player keeps running hidden after its window
-    /// closes, so these work without it on screen.
+    /// device), Play/Pause, Next and Previous, and showing it in the Library window. The player keeps running in the
+    /// background after the Library window closes, so these work without it on screen.
     /// </summary>
     private void BuildSpotifyMenu()
     {
@@ -334,15 +336,20 @@ internal sealed class TrayApp : ApplicationContext
                 ToolTipText = "Starts the Spotify player in the background and plays where you left off.",
             });
         }
-        items.Add(new ToolStripMenuItem("Open Spotify player", null, async (_, _) => await SpotifyAsync(null)) { Font = new Font(_spotifyItem.Font, FontStyle.Bold) });
+        items.Add(new ToolStripMenuItem("Show Spotify", null, async (_, _) => await SpotifyAsync(null))
+        {
+            Font = new Font(_spotifyItem.Font, FontStyle.Bold),
+            ToolTipText = "Opens the Library window with Spotify over the whole window. Collapse it to a player bar along the bottom.",
+        });
     }
 
-    /// <summary>Opens the Spotify player (action null) or sends it play/pause, next or previous.</summary>
+    /// <summary>Shows Spotify in the Library window (action null) or sends the player play/pause, next or previous.</summary>
     private async Task SpotifyAsync(string? action)
     {
-        if (_spotify is null || _spotify.IsDisposed) _spotify = new SpotifyWindow(_config);
-        if (action is null) await _spotify.ShowPlayerAsync();
-        else await _spotify.CommandAsync(action);
+        if (_spotify is null) return;
+        if (action is not null) { await _spotify.CommandAsync(action); return; }
+        OpenLibrary();
+        if (_library is { } library) await library.ShowSpotifyAsync();
     }
 
     /// <summary>
@@ -552,7 +559,7 @@ internal sealed class TrayApp : ApplicationContext
         _openWait.Unregister(null);
         _updater.Dispose();
         _library?.Close();
-        _spotify?.Exit();
+        _spotify?.Dispose();
         _tray.Visible = false;
         _tray.Dispose();
         _pcLoad.Dispose();

@@ -9,6 +9,11 @@ namespace SteamSync;
 /// A single-purpose window for gamingenjoyer.com on the WebView2 (Edge) runtime that ships with Windows, built to stay
 /// out of a game's way: one profile, no extensions or background services, Efficiency mode whenever it isn't the
 /// active window, frozen while minimized, and every browser process gone once it is closed.
+/// <para>
+/// In beta builds, once the user has signed in to Spotify, a Spotify player bar runs along the bottom (SpotifyPlayer,
+/// its own engine apart from the site's) and expands to the whole window. Closing the window hands the player back
+/// to the tray app, which keeps it playing in the background.
+/// </para>
 /// </summary>
 internal sealed class LibraryWindow : Form
 {
@@ -46,9 +51,12 @@ internal sealed class LibraryWindow : Form
     private bool? _efficient;
     private bool _fullScreen;
     private FormWindowState _stateBeforeFullScreen;
+    private readonly SpotifyPlayer? _spotify;
+    private readonly Panel _spotifyPanel = new() { Dock = DockStyle.Bottom, Visible = false, BackColor = Color.FromArgb(18, 21, 28) };
 
-    public LibraryWindow(AppConfig config)
+    public LibraryWindow(AppConfig config, SpotifyPlayer? spotify = null)
     {
+        _spotify = spotify;
         var site = new Uri(config.WebsiteUrl);
         _home = new Uri(site, "/library.php");
         var bare = site.Host.StartsWith("www.", StringComparison.OrdinalIgnoreCase) ? site.Host[4..] : site.Host;
@@ -61,14 +69,71 @@ internal sealed class LibraryWindow : Form
         StartPosition = FormStartPosition.Manual;
         LoadBounds();
         _web = NewWebView();
+        Controls.Add(_spotifyPanel);
         Controls.Add(_web);
         _unloadTimer.Tick += (_, _) => UnloadIfStillMinimized();
 
-        Load += async (_, _) => await InitAsync(_home);
+        Load += async (_, _) =>
+        {
+            var site = InitAsync(_home);
+            if (_spotify is { } player)
+            {
+                player.ExpandedChanged += LayOutSpotify;
+                player.RunningChanged += LayOutSpotify;
+                if (player.SignedIn || player.Running) await AttachSpotifyAsync();
+            }
+            await site;
+        };
         Activated += (_, _) => { _active = true; UpdateEfficiency(); };
         Deactivate += (_, _) => { _active = false; UpdateEfficiency(); };
         Resize += async (_, _) => { UpdateEfficiency(); await OnResizedAsync(); };
-        FormClosing += (_, _) => SaveBounds();
+        DpiChanged += (_, _) => LayOutSpotify();
+        FormClosing += (_, _) =>
+        {
+            SaveBounds();
+            if (_spotify is { } player)
+            {
+                player.ExpandedChanged -= LayOutSpotify;
+                player.RunningChanged -= LayOutSpotify;
+                player.Detach(_spotifyPanel); // keeps playing in the background
+            }
+        };
+    }
+
+    /// <summary>Shows the Spotify player over the whole window (the tray's "Show Spotify").</summary>
+    public async Task ShowSpotifyAsync()
+    {
+        if (_spotify is null) return;
+        _spotify.SetExpanded(true);
+        await AttachSpotifyAsync();
+    }
+
+    private async Task AttachSpotifyAsync()
+    {
+        _spotifyPanel.Visible = true;
+        LayOutSpotify();
+        await _spotify!.AttachAsync(_spotifyPanel);
+        LayOutSpotify();
+    }
+
+    /// <summary>The player bar along the bottom (92 px at 100% scaling), or the whole window when expanded.</summary>
+    private void LayOutSpotify()
+    {
+        if (InvokeRequired) { BeginInvoke(LayOutSpotify); return; }
+        if (_spotify is null || IsDisposed) return;
+        if (_spotify.Expanded)
+        {
+            _spotifyPanel.Visible = true;
+            _spotifyPanel.Dock = DockStyle.Fill;
+            _spotifyPanel.BringToFront();
+        }
+        else
+        {
+            _spotifyPanel.Visible = _spotify.Running || _spotify.SignedIn;
+            _spotifyPanel.Dock = DockStyle.Bottom;
+            _spotifyPanel.Height = (int)Math.Round(92 * DeviceDpi / 96.0);
+            _web.BringToFront(); // the site fills what's left above the bar
+        }
     }
 
     private WebView2 NewWebView()
@@ -236,6 +301,7 @@ internal sealed class LibraryWindow : Form
                 // Bring the engine back on the page the window was showing.
                 _unloaded = false;
                 Controls.Add(_web);
+                LayOutSpotify(); // the re-added site goes back under (or above) the Spotify bar
                 await InitAsync(_resumeAt ?? _home);
                 return;
             }

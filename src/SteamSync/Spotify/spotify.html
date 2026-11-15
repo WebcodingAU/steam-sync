@@ -128,6 +128,17 @@
   .toast { position: fixed; left: 50%; bottom: 108px; transform: translateX(-50%); background: #2a3040; color: var(--text); padding: 10px 18px; border-radius: 8px; box-shadow: 0 6px 20px #0008; z-index: 20; max-width: 80vw; opacity: 0; transition: opacity .2s; pointer-events: none; }
   .toast.show { opacity: 1; }
   .hidden { display: none !important; }
+  /* Bar mode: only the player bar, along the bottom of the Library window (SpotifyPlayer / LibraryWindow). */
+  body.bar .app { display: block; }
+  body.bar .side, body.bar .main, body.bar .toast { display: none; }
+  body.bar .bar { height: 100vh; border-top: 1px solid var(--line); }
+  body.bar .np { cursor: pointer; }
+  .expand { color: var(--dim); display: grid; place-items: center; padding: 4px; }
+  .expand:hover { color: var(--text); }
+  .expand svg { width: 20px; height: 20px; transition: transform .15s; }
+  body:not(.bar) .expand svg { transform: rotate(180deg); }
+  @media (max-width: 820px) { .bar { grid-template-columns: minmax(140px, 1fr) minmax(260px, 1.6fr) auto; } .right input[type=range], .device { display: none; } }
+  @media (max-width: 600px) { #b-shuffle, #b-repeat, .prog span { display: none; } }
   ::-webkit-scrollbar { width: 12px; }
   ::-webkit-scrollbar-thumb { background: #2a3040; border-radius: 6px; border: 3px solid transparent; background-clip: content-box; }
   ::-webkit-scrollbar-thumb:hover { background-color: #3a4050; }
@@ -151,6 +162,7 @@
   <symbol id="i-mute" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M4 9h4l5-4v14l-5-4H4Zm12.5 0 5 6m0-6-5 6"/></symbol>
   <symbol id="i-device" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" d="M3 5h18v11H3zM8 20h8M12 16v4"/></symbol>
   <symbol id="i-list" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m6 15 6-6 6 6"/></symbol>
   <symbol id="i-clock" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></g></symbol>
 </svg>
 
@@ -189,6 +201,7 @@
       <button class="here-btn hidden" id="here" title="Move playback to Gaming Enjoyer">Play here</button>
       <button id="b-mute" title="Mute"><svg><use href="#i-vol"/></svg></button>
       <input type="range" id="vol" min="0" max="100" value="60" title="Volume">
+      <button class="expand" id="b-expand" title="Show Spotify"><svg><use href="#i-up"/></svg></button>
     </div>
   </footer>
 </div>
@@ -477,7 +490,20 @@ if ("mediaSession" in navigator) {
   navigator.mediaSession.setActionHandler("previoustrack", () => command("previous"));
 }
 
+// ---- bar or whole window (the app decides; it lays out the Library window) ----
+let expanded = true;
+function applyMode(on) {
+  expanded = on;
+  document.body.classList.toggle("bar", !on);
+  $("b-expand").title = on ? "Back to your library (Esc)" : "Show Spotify";
+  if (on && !currentView && signedIn) showHome();
+}
+function setMode(on) { applyMode(on); send({ type: "mode", expanded: on }); }
+$("b-expand").onclick = () => setMode(!expanded);
+document.querySelector(".np").addEventListener("click", e => { if (!expanded && !e.target.closest("button, .link")) setMode(true); });
+
 document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && expanded && signedIn) { setMode(false); return; }
   if (e.target.tagName === "INPUT" && e.target.type !== "range") return;
   if (e.code === "Space") { e.preventDefault(); command("toggle"); }
 });
@@ -688,7 +714,8 @@ const loadSidebar = guard(async () => {
 
 // ---- sign-in and the app's messages ----
 let signedIn = false, started = false;
-function showSignIn() { signedIn = false; $("ov-signin").classList.remove("hidden"); }
+// Signing in needs room: the bar asks the app for the whole window.
+function showSignIn() { signedIn = false; $("ov-signin").classList.remove("hidden"); if (!expanded) setMode(true); }
 function begin() {
   signedIn = true;
   $("ov-signin").classList.add("hidden");
@@ -696,7 +723,7 @@ function begin() {
   if (started) return;
   started = true;
   loadSidebar();
-  showHome();
+  if (expanded) showHome(); // in bar mode the library loads the first time it's expanded
   refresh();
   loadSdk();
 }
@@ -709,8 +736,12 @@ if (hostView) hostView.addEventListener("message", e => {
   const m = e.data;
   switch (m.type) {
     case "state":
-      if (!m.configured) { $("ov-setup").classList.remove("hidden"); break; }
+      applyMode(m.expanded !== false);
+      if (!m.configured) { $("ov-setup").classList.remove("hidden"); if (!expanded) setMode(true); break; }
       if (m.signedIn) begin(); else showSignIn();
+      break;
+    case "mode":
+      applyMode(!!m.expanded);
       break;
     case "token": {
       if (m.token) cachedToken = { token: m.token, expires: m.expires };

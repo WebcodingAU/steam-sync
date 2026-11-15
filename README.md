@@ -105,17 +105,21 @@ against the exes in each game folder. Crash reporters, updaters, installers and 
 
 ## Spotify player (beta builds only)
 
-The tray's **Spotify** menu opens a Spotify player (`Spotify/`). It's a Spotify Connect device called "Gaming Enjoyer",
-built on Spotify's Web Playback SDK, so music plays from the app itself and the Spotify app can stay closed. It needs
-Spotify Premium; that's Spotify's rule for the SDK.
-- **The page:** Home, Search, Liked Songs, your playlists, Queue, and a player bar. Play here moves playback over from
-  another device. The page (`spotify.html`) is embedded in the app.
-- **Hosting:** the page is written out and served to its own WebView2 as `https://spotify.gaming-enjoyer.invalid/`.
-  The SDK's Widevine DRM needs a secure page and WebView2's component updates; with `--disable-component-update`
-  every song fails.
-- **Closing the window** hides it, so the music keeps playing. The tray menu then shows the song, with Play/Pause,
-  Next and Previous. Hidden and paused for 10 minutes, the engine shuts down. Its processes stay at normal priority
-  (the rest of the app uses Efficiency mode), so audio doesn't stutter under a game.
+The Library window has a Spotify player (`Spotify/SpotifyPlayer.cs`). It's a Spotify Connect device called "Gaming
+Enjoyer", built on Spotify's Web Playback SDK, so music plays from the app itself and the Spotify app can stay closed.
+It needs Spotify Premium; that's Spotify's rule for the SDK.
+- **Where it shows:** once you're signed in, a player bar runs along the bottom of the Library window. Its arrow (or a
+  click on the song) expands it over the whole window: Home, Search, Liked Songs, your playlists, Queue. The arrow or
+  Esc collapses it again. Play here moves playback over from another device. The tray's **Spotify → Show Spotify**
+  opens the window expanded; sign-in starts from there.
+- **Hosting:** the page (`spotify.html`, embedded) is served from memory to its own WebView2 engine (profile
+  `WebView2-Spotify`) as `https://spotify.gaming-enjoyer.invalid/`. It's a bare `CoreWebView2Controller` so it can
+  move between windows. The SDK's Widevine DRM needs a secure page and WebView2's component updates; with
+  `--disable-component-update` every song fails.
+- **Closing the Library window** moves the player to a hidden window, so the music keeps playing. The tray menu then
+  shows the song, with Play/Pause, Next and Previous, and the next Library window takes the player back. In the
+  background and paused for 10 minutes, the engine shuts down. Its processes stay at normal priority (the rest of the
+  app uses Efficiency mode), so audio doesn't stutter under a game.
 - **Sign-in** (`SpotifyAuth.cs`) uses PKCE with the Spotify developer app's public Client ID (`SpotifyClientId` in
   `appsettings.json`; no secret). Spotify returns to `http://127.0.0.1:43819/spotify/callback`, which must be the
   app's redirect URI exactly: the dashboard rejects one without a port. The refresh token is DPAPI-encrypted in
