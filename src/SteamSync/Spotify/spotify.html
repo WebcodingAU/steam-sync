@@ -1,0 +1,735 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spotify</title>
+<!--
+  The Gaming Enjoyer Spotify player (SpotifyWindow.cs hosts it). A Spotify Connect device through the Web Playback SDK,
+  plus browsing and search through the Web API. Access tokens come from the app over chrome.webview (SpotifyAuth.cs);
+  this page never sees the refresh token. Written for Spotify's Development Mode rules since February 2026: playlist
+  songs come from /playlists/{id}/items (only playlists the user owns or collaborates on), likes go through
+  /me/library with URIs, search returns at most 10 per type and page, and artists have no top-tracks endpoint.
+-->
+<style>
+  :root {
+    --bg: #0a0c11; --panel: #12151c; --panel2: #181c25; --line: #232835; --text: #e8eaf0; --dim: #9aa1b2; --faint: #6b7282;
+    --accent: #1ed760; --accent-dim: #169c47; --danger: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; overflow: hidden; user-select: none; }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  input { font: inherit; color: var(--text); }
+  a { color: var(--accent); }
+  .app { display: grid; grid-template-columns: 232px 1fr; grid-template-rows: 1fr 92px; height: 100vh; }
+  .side { grid-row: 1; background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 18px 18px 10px; font-weight: 700; font-size: 16px; }
+  .brand svg { width: 26px; height: 26px; color: var(--accent); }
+  .nav { padding: 6px 8px; }
+  .nav button, .lists button { display: flex; align-items: center; gap: 12px; width: 100%; padding: 8px 10px; border-radius: 6px; color: var(--dim); text-align: left; }
+  .nav button:hover, .lists button:hover { color: var(--text); background: var(--panel2); }
+  .nav button.on, .lists button.on { color: var(--text); background: var(--panel2); }
+  .nav svg { width: 20px; height: 20px; flex: none; }
+  .sect { padding: 14px 18px 6px; color: var(--faint); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+  .lists { flex: 1; overflow-y: auto; padding: 0 8px 8px; min-height: 0; }
+  .lists button { padding: 6px 10px; }
+  .lists img, .lists .ph { width: 32px; height: 32px; border-radius: 4px; object-fit: cover; flex: none; background: var(--panel2); }
+  .lists span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .me { display: flex; align-items: center; gap: 10px; padding: 12px 18px; border-top: 1px solid var(--line); color: var(--dim); font-size: 13px; }
+  .me span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .me button { color: var(--faint); font-size: 12px; }
+  .me button:hover { color: var(--text); }
+  .main { grid-row: 1; overflow-y: auto; min-height: 0; position: relative; }
+  .view { padding: 24px 32px 32px; }
+  h1 { font-size: 28px; margin: 0 0 4px; font-weight: 700; }
+  h2 { font-size: 18px; margin: 28px 0 12px; font-weight: 600; }
+  .sub { color: var(--dim); }
+  .search { position: sticky; top: 0; z-index: 2; background: var(--bg); padding: 20px 32px 12px; }
+  .search input { width: 100%; max-width: 520px; padding: 11px 16px 11px 42px; border-radius: 24px; border: 1px solid var(--line); background: var(--panel2) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' fill='none' stroke='%239aa1b2' stroke-width='2' viewBox='0 0 24 24'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m20 20-3.5-3.5'/%3E%3C/svg%3E") no-repeat 15px center; outline: none; }
+  .search input:focus { border-color: var(--faint); }
+  .hero { display: flex; gap: 24px; align-items: flex-end; margin-bottom: 20px; }
+  .hero img, .hero .ph { width: 168px; height: 168px; border-radius: 6px; object-fit: cover; box-shadow: 0 8px 24px #0008; background: var(--panel2); flex: none; }
+  .hero .kind { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+  .hero h1 { font-size: 36px; line-height: 1.1; margin: 4px 0 8px; }
+  .actions { display: flex; align-items: center; gap: 12px; margin: 8px 0 16px; }
+  .play-big { width: 52px; height: 52px; border-radius: 50%; background: var(--accent); color: #000; display: grid; place-items: center; }
+  .play-big:hover { transform: scale(1.04); background: #3be477; }
+  .play-big svg { width: 24px; height: 24px; }
+  .tracks { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  .tracks th { text-align: left; color: var(--faint); font-weight: 400; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  .tracks td { padding: 6px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
+  .tracks tr.row:hover td { background: var(--panel2); }
+  .tracks tr.row td:first-child { border-radius: 6px 0 0 6px; }
+  .tracks tr.row td:last-child { border-radius: 0 6px 6px 0; }
+  .tracks tr.playing .t-title { color: var(--accent); }
+  .tracks .num { width: 44px; text-align: right; color: var(--faint); }
+  .tracks .art { width: 52px; }
+  .tracks .art img, .tracks .art .ph { width: 40px; height: 40px; border-radius: 4px; display: block; object-fit: cover; background: var(--panel2); }
+  .tracks .t-title { color: var(--text); overflow: hidden; text-overflow: ellipsis; }
+  .tracks .t-artist { font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+  .tracks .dur { width: 64px; text-align: right; font-variant-numeric: tabular-nums; }
+  .tracks .tools { width: 76px; text-align: right; }
+  .tracks .tools button { opacity: 0; color: var(--dim); padding: 4px; }
+  .tracks tr.row:hover .tools button, .tracks .tools button.liked { opacity: 1; }
+  .tracks .tools button:hover { color: var(--text); }
+  .tracks .tools svg { width: 18px; height: 18px; vertical-align: middle; }
+  .liked { color: var(--accent) !important; }
+  .link { cursor: pointer; }
+  .link:hover { text-decoration: underline; color: var(--text); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 16px; }
+  .card { background: var(--panel); border-radius: 8px; padding: 12px; cursor: pointer; text-align: left; }
+  .card:hover { background: var(--panel2); }
+  .card img, .card .ph { width: 100%; aspect-ratio: 1; border-radius: 6px; object-fit: cover; background: var(--panel2); display: block; margin-bottom: 10px; }
+  .card.round img, .card.round .ph { border-radius: 50%; }
+  .card b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .card span { display: block; color: var(--dim); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .more { margin: 16px 0; padding: 8px 18px; border: 1px solid var(--line); border-radius: 18px; color: var(--dim); }
+  .more:hover { color: var(--text); border-color: var(--faint); }
+  .empty { color: var(--dim); padding: 40px 0; }
+  .note { color: var(--dim); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin: 12px 0; max-width: 720px; }
+  .bar { grid-column: 1 / 3; background: var(--panel); border-top: 1px solid var(--line); display: grid; grid-template-columns: minmax(180px, 1fr) minmax(320px, 1.6fr) minmax(180px, 1fr); align-items: center; padding: 0 16px; gap: 16px; }
+  .np { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .np img, .np .ph { width: 56px; height: 56px; border-radius: 4px; object-fit: cover; background: var(--panel2); flex: none; }
+  .np .txt { min-width: 0; }
+  .np .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .np .artist { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); font-size: 13px; }
+  .np button { color: var(--dim); padding: 4px; flex: none; }
+  .np button svg { width: 18px; height: 18px; }
+  .ctl { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .btns { display: flex; align-items: center; gap: 18px; }
+  .btns button { color: var(--dim); display: grid; place-items: center; }
+  .btns button:hover:not(:disabled) { color: var(--text); }
+  .btns button.active { color: var(--accent); }
+  .btns svg { width: 20px; height: 20px; }
+  .btns .pp { width: 36px; height: 36px; border-radius: 50%; background: var(--text); color: #000; }
+  .btns .pp:hover:not(:disabled) { color: #000; transform: scale(1.05); }
+  .btns .pp svg { width: 18px; height: 18px; }
+  .prog { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 600px; font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
+  .prog span { width: 40px; text-align: center; }
+  input[type=range] { -webkit-appearance: none; appearance: none; flex: 1; height: 4px; border-radius: 2px; background: linear-gradient(to right, var(--text) var(--p, 0%), #3a4050 var(--p, 0%)); outline: none; cursor: pointer; }
+  input[type=range]:hover { background: linear-gradient(to right, var(--accent) var(--p, 0%), #3a4050 var(--p, 0%)); }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%; background: var(--text); opacity: 0; }
+  input[type=range]:hover::-webkit-slider-thumb { opacity: 1; }
+  .right { display: flex; align-items: center; justify-content: flex-end; gap: 10px; color: var(--dim); }
+  .right svg { width: 18px; height: 18px; flex: none; }
+  .right input[type=range] { max-width: 110px; }
+  .device { font-size: 12px; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+  .here-btn { font-size: 12px; padding: 5px 12px; border-radius: 14px; background: var(--accent); color: #000; font-weight: 600; white-space: nowrap; }
+  .overlay { position: fixed; inset: 0; background: var(--bg); display: grid; place-items: center; z-index: 10; text-align: center; padding: 24px; }
+  .overlay .box { max-width: 520px; }
+  .overlay svg.logo { width: 64px; height: 64px; color: var(--accent); }
+  .overlay h1 { margin: 16px 0 8px; }
+  .overlay p { color: var(--dim); }
+  .overlay ol { text-align: left; color: var(--dim); line-height: 1.7; }
+  .overlay code { background: var(--panel2); padding: 2px 6px; border-radius: 4px; color: var(--text); user-select: text; }
+  .cta { margin-top: 16px; padding: 12px 32px; border-radius: 24px; background: var(--accent); color: #000; font-weight: 700; font-size: 15px; }
+  .cta:hover { background: #3be477; }
+  .toast { position: fixed; left: 50%; bottom: 108px; transform: translateX(-50%); background: #2a3040; color: var(--text); padding: 10px 18px; border-radius: 8px; box-shadow: 0 6px 20px #0008; z-index: 20; max-width: 80vw; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .hidden { display: none !important; }
+  ::-webkit-scrollbar { width: 12px; }
+  ::-webkit-scrollbar-thumb { background: #2a3040; border-radius: 6px; border: 3px solid transparent; background-clip: content-box; }
+  ::-webkit-scrollbar-thumb:hover { background-color: #3a4050; }
+</style>
+</head>
+<body>
+<svg style="display:none" xmlns="http://www.w3.org/2000/svg">
+  <symbol id="i-logo" viewBox="0 0 24 24"><path fill="currentColor" d="M12 1.5a10.5 10.5 0 1 0 0 21 10.5 10.5 0 0 0 0-21Zm4.82 15.15a.65.65 0 0 1-.9.22c-2.46-1.5-5.56-1.84-9.21-1a.66.66 0 0 1-.29-1.28c4-.91 7.43-.52 10.18 1.16.31.19.41.6.22.9Zm1.28-2.86a.82.82 0 0 1-1.12.27c-2.82-1.73-7.12-2.23-10.45-1.22a.82.82 0 1 1-.48-1.57c3.81-1.15 8.54-.6 11.78 1.4.38.23.5.74.27 1.12Zm.11-2.98C14.83 8.8 9.25 8.61 6.02 9.6a.98.98 0 1 1-.57-1.88c3.71-1.12 9.88-.9 13.77 1.41a.98.98 0 0 1-1.01 1.68Z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></g></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3Z"/></symbol>
+  <symbol id="i-heart" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M12 20s-7.5-4.6-9.3-9.2C1.5 7.6 3.6 4.5 7 4.5c2 0 3.4 1.1 5 3 1.6-1.9 3-3 5-3 3.4 0 5.5 3.1 4.3 6.3C19.5 15.4 12 20 12 20Z"/></symbol>
+  <symbol id="i-heart-on" viewBox="0 0 24 24"><path fill="currentColor" d="M12 20s-7.5-4.6-9.3-9.2C1.5 7.6 3.6 4.5 7 4.5c2 0 3.4 1.1 5 3 1.6-1.9 3-3 5-3 3.4 0 5.5 3.1 4.3 6.3C19.5 15.4 12 20 12 20Z"/></symbol>
+  <symbol id="i-queue" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M4 6h16M4 12h10M4 18h10m4-6v8m-4-4h8"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path fill="currentColor" d="M7 4.5v15a1 1 0 0 0 1.5.86l12.4-7.5a1 1 0 0 0 0-1.72L8.5 3.64A1 1 0 0 0 7 4.5Z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path fill="currentColor" d="M6 4h4v16H6zm8 0h4v16h-4z"/></symbol>
+  <symbol id="i-next" viewBox="0 0 24 24"><path fill="currentColor" d="M5 5.2v13.6a.8.8 0 0 0 1.2.7L16 13v6h2V5h-2v6L6.2 4.5a.8.8 0 0 0-1.2.7Z"/></symbol>
+  <symbol id="i-prev" viewBox="0 0 24 24"><path fill="currentColor" d="M19 5.2v13.6a.8.8 0 0 1-1.2.7L8 13v6H6V5h2v6l9.8-6.5a.8.8 0 0 1 1.2.7Z"/></symbol>
+  <symbol id="i-shuffle" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 7h3.5c2 0 3.3 1 4.4 2.7l2.2 4.6C14.2 16 15.5 17 17.5 17H21m0 0-3-3m3 3-3 3M3 17h3.5c1.2 0 2.1-.4 2.9-1.1M21 7h-3.5c-1.2 0-2.1.4-2.9 1.1M21 7l-3-3m3 3-3 3"/></symbol>
+  <symbol id="i-repeat" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M17 2l3 3-3 3M3 11V9a4 4 0 0 1 4-4h13M7 22l-3-3 3-3m14-3v2a4 4 0 0 1-4 4H4"/></symbol>
+  <symbol id="i-vol" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M4 9h4l5-4v14l-5-4H4Z M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/></symbol>
+  <symbol id="i-mute" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M4 9h4l5-4v14l-5-4H4Zm12.5 0 5 6m0-6-5 6"/></symbol>
+  <symbol id="i-device" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" d="M3 5h18v11H3zM8 20h8M12 16v4"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></g></symbol>
+</svg>
+
+<div class="app">
+  <aside class="side">
+    <div class="brand"><svg><use href="#i-logo"/></svg>Spotify</div>
+    <nav class="nav">
+      <button data-view="home"><svg><use href="#i-home"/></svg>Home</button>
+      <button data-view="search"><svg><use href="#i-search"/></svg>Search</button>
+      <button data-view="liked"><svg><use href="#i-heart"/></svg>Liked Songs</button>
+      <button data-view="queue"><svg><use href="#i-list"/></svg>Queue</button>
+    </nav>
+    <div class="sect">Your playlists</div>
+    <div class="lists" id="playlists"></div>
+    <div class="me"><span id="me">Spotify</span><button id="signout" title="Sign out of Spotify in Gaming Enjoyer">Sign out</button></div>
+  </aside>
+  <main class="main" id="main"></main>
+  <footer class="bar">
+    <div class="np">
+      <div class="ph" id="np-art-ph"></div><img id="np-art" class="hidden" alt="">
+      <div class="txt"><div class="title" id="np-title">Nothing playing</div><div class="artist" id="np-artist"></div></div>
+      <button id="np-like" class="hidden" title="Save to your Liked Songs"><svg><use href="#i-heart"/></svg></button>
+    </div>
+    <div class="ctl">
+      <div class="btns">
+        <button id="b-shuffle" title="Shuffle"><svg><use href="#i-shuffle"/></svg></button>
+        <button id="b-prev" title="Previous"><svg><use href="#i-prev"/></svg></button>
+        <button id="b-play" class="pp" title="Play"><svg><use href="#i-play"/></svg></button>
+        <button id="b-next" title="Next"><svg><use href="#i-next"/></svg></button>
+        <button id="b-repeat" title="Repeat"><svg><use href="#i-repeat"/></svg></button>
+      </div>
+      <div class="prog"><span id="t-pos">0:00</span><input type="range" id="seek" min="0" max="1000" value="0"><span id="t-dur">0:00</span></div>
+    </div>
+    <div class="right">
+      <span class="device hidden" id="device"></span>
+      <button class="here-btn hidden" id="here" title="Move playback to Gaming Enjoyer">Play here</button>
+      <button id="b-mute" title="Mute"><svg><use href="#i-vol"/></svg></button>
+      <input type="range" id="vol" min="0" max="100" value="60" title="Volume">
+    </div>
+  </footer>
+</div>
+
+<div class="overlay hidden" id="ov-setup"><div class="box">
+  <svg class="logo"><use href="#i-logo"/></svg>
+  <h1>Spotify isn't set up yet</h1>
+  <p>This build of Gaming Enjoyer has no Spotify Client ID. It needs one from a Spotify developer app:</p>
+  <ol>
+    <li>Open <a href="#" data-open="https://developer.spotify.com/dashboard">developer.spotify.com/dashboard</a> and create an app.</li>
+    <li>Redirect URI: <code>http://127.0.0.1:43819/spotify/callback</code>; APIs: Web API and Web Playback SDK.</li>
+    <li>Put its Client ID in <code>SpotifyClientId</code> in appsettings.json.</li>
+  </ol>
+</div></div>
+
+<div class="overlay hidden" id="ov-signin"><div class="box">
+  <svg class="logo"><use href="#i-logo"/></svg>
+  <h1>Play Spotify in Gaming Enjoyer</h1>
+  <p>Sign in with your Spotify account in your browser. Gaming Enjoyer then shows up as a device in Spotify Connect and plays your music itself, so the Spotify app can stay closed.</p>
+  <p style="font-size:13px">Playing music here needs Spotify Premium (Spotify's rule for players like this one).</p>
+  <button class="cta" id="signin">Sign in to Spotify</button>
+  <p id="signin-msg" class="sub" style="min-height:1.4em"></p>
+</div></div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const hostView = window.chrome && window.chrome.webview;
+const send = m => hostView && hostView.postMessage(m);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmt = ms => { if (!ms || ms < 0) ms = 0; const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+const img = (images, size = 300) => { if (!images || !images.length) return ""; const fit = [...images].sort((a, b) => (a.width || 0) - (b.width || 0)).find(i => (i.width || 0) >= size); return (fit || images[0]).url; };
+const artistLinks = artists => (artists || []).map(a => a.id ? `<span class="link" data-artist="${esc(a.id)}">${esc(a.name)}</span>` : esc(a.name)).join(", ");
+const artistNames = artists => (artists || []).map(a => a.name).join(", ");
+
+let toastTimer;
+function toast(text, ms = 3500) { const t = $("toast"); t.textContent = text; t.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), ms); }
+
+// ---- tokens and the Web API ----
+let cachedToken = null, tokenSeq = 0;
+const tokenWaiters = new Map();
+function getToken() {
+  if (cachedToken && cachedToken.expires - Date.now() > 60000) return Promise.resolve(cachedToken.token);
+  return new Promise(resolve => { const id = ++tokenSeq; tokenWaiters.set(id, resolve); send({ type: "token", id }); });
+}
+
+async function api(path, { method = "GET", query, body, retry = true } = {}) {
+  const token = await getToken();
+  if (!token) throw Object.assign(new Error("Not signed in to Spotify"), { status: 401 });
+  let url = path.startsWith("https://") ? path : "https://api.spotify.com/v1" + path;
+  if (query) url += (url.includes("?") ? "&" : "?") + new URLSearchParams(query);
+  const r = await fetch(url, { method, headers: { Authorization: "Bearer " + token, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+  if (r.status === 401 && retry) { cachedToken = null; return api(path, { method, query, body, retry: false }); }
+  if (r.status === 429 && retry) { await new Promise(res => setTimeout(res, Math.min(10, +(r.headers.get("Retry-After") || 2)) * 1000)); return api(path, { method, query, body, retry: false }); }
+  const text = await r.text();
+  let data = null; try { data = text ? JSON.parse(text) : null; } catch { }
+  if (!r.ok) throw Object.assign(new Error(data?.error?.message || `Spotify said ${r.status}`), { status: r.status, reason: data?.error?.reason });
+  return data;
+}
+
+function explain(e) {
+  if (e.reason === "PREMIUM_REQUIRED" || e.status === 403 && /premium/i.test(e.message)) return "Spotify Premium is needed to play music here.";
+  if (e.reason === "NO_ACTIVE_DEVICE") return "No Spotify device is active. Press Play here first.";
+  if (e.reason === "QUOTA_EXCEEDED") return "Spotify's request limit for this app was reached. Try again in a minute.";
+  return e.message || String(e);
+}
+const guard = fn => async (...args) => { try { await fn(...args); } catch (e) { console.warn(e); toast(explain(e)); } };
+
+// ---- the Web Playback SDK device ----
+let player = null, deviceId = null, sdkLoaded = false, sdkReady = false, pendingCommand = null;
+function loadSdk() {
+  if (sdkLoaded) return;
+  sdkLoaded = true;
+  window.onSpotifyWebPlaybackSDKReady = () => { sdkReady = true; startPlayer(); };
+  const s = document.createElement("script");
+  s.src = "https://sdk.scdn.co/spotify-player.js";
+  s.onerror = () => toast("Spotify's player couldn't be loaded. Check your internet connection.");
+  document.head.appendChild(s);
+}
+
+function startPlayer() {
+  if (player || !sdkReady) return;
+  player = new Spotify.Player({
+    name: "Gaming Enjoyer",
+    getOAuthToken: cb => getToken().then(t => t && cb(t)),
+    volume: savedVolume() / 100,
+  });
+  player.addListener("ready", ({ device_id }) => {
+    deviceId = device_id;
+    refresh().then(() => {
+      // Nothing playing anywhere: become the active device (paused), so Play works straight away.
+      if (!state.active) api("/me/player", { method: "PUT", body: { device_ids: [deviceId], play: false } }).then(() => setTimeout(refresh, 800)).catch(() => { });
+      if (pendingCommand) { const c = pendingCommand; pendingCommand = null; command(c); }
+    });
+  });
+  player.addListener("not_ready", () => { deviceId = null; });
+  player.addListener("player_state_changed", s => onSdkState(s));
+  // Problems also go to the app's log (Open log in the tray menu), where they can be looked at later.
+  const problem = (kind, message, text, ms) => { send({ type: "log", message: `${kind}: ${message}` }); toast(text, ms); };
+  player.addListener("initialization_error", ({ message }) => problem("initialization_error", message, "Spotify's player couldn't start: " + message, 6000));
+  player.addListener("authentication_error", ({ message }) => { cachedToken = null; problem("authentication_error", message, "Spotify sign-in expired. Signing in again may be needed.", 6000); });
+  player.addListener("account_error", ({ message }) => problem("account_error", message, "Spotify Premium is needed to play music in Gaming Enjoyer.", 8000));
+  player.addListener("playback_error", ({ message }) => problem("playback_error", message, "Playback problem: " + message));
+  player.addListener("autoplay_failed", () => problem("autoplay_failed", "the browser blocked playback without a click", "Click play to start the music."));
+  player.connect();
+}
+
+// ---- now playing ----
+// One picture of the player, from the SDK when this PC plays, else from /me/player (another device, or nothing).
+const state = { active: false, here: false, device: null, deviceVolume: null, supportsVolume: true, track: null, playing: false, position: 0, duration: 0, at: 0, shuffle: false, repeat: "off", liked: null, contextUri: null };
+
+// The SDK's names come HTML-escaped ("Sun &amp; Moon"); the Web API's don't.
+const unescapeHtml = s => s && s.includes("&") ? new DOMParser().parseFromString(s, "text/html").documentElement.textContent : s;
+
+function onSdkState(s) {
+  if (!s) { if (state.here) { state.here = false; refresh(); } return; }
+  const t = s.track_window.current_track;
+  Object.assign(state, {
+    active: true, here: true, device: "Gaming Enjoyer",
+    track: t ? { id: t.id, uri: t.uri, name: unescapeHtml(t.name), artists: t.artists.map(a => ({ name: unescapeHtml(a.name), id: (a.uri || "").split(":")[2] })), album: { name: unescapeHtml(t.album.name), images: t.album.images, id: (t.album.uri || "").split(":")[2], uri: t.album.uri }, duration_ms: t.duration_ms } : null,
+    playing: !s.paused, position: s.position, duration: s.duration, at: Date.now(), shuffle: s.shuffle,
+    repeat: ["off", "context", "track"][s.repeat_mode] || "off", contextUri: s.context?.uri || null,
+  });
+  render();
+}
+
+let lastLikedFor = null;
+async function refresh() {
+  try {
+    const p = await api("/me/player", { query: { additional_types: "episode" } });
+    const here = !!(p && deviceId && p.device?.id === deviceId);
+    if (here && state.here) {
+      // The SDK already keeps position and pause state; take only what it doesn't have.
+      state.supportsVolume = true;
+    } else if (p && p.item) {
+      Object.assign(state, {
+        active: true, here, device: p.device?.name || "another device", deviceVolume: p.device?.volume_percent ?? null,
+        supportsVolume: p.device?.supports_volume !== false,
+        track: p.item.type === "episode" ? { id: p.item.id, uri: p.item.uri, name: p.item.name, artists: [{ name: p.item.show?.name }], album: { name: p.item.show?.name, images: p.item.images }, duration_ms: p.item.duration_ms } : p.item,
+        playing: p.is_playing, position: p.progress_ms || 0, duration: p.item.duration_ms, at: Date.now(),
+        shuffle: p.shuffle_state, repeat: p.repeat_state || "off", contextUri: p.context?.uri || null,
+      });
+    } else if (!state.here) {
+      Object.assign(state, { active: !!p?.device, here: false, device: p?.device?.name || null, track: null, playing: false, position: 0, duration: 0 });
+    }
+    if (state.track?.uri && state.track.uri !== lastLikedFor && state.track.uri.startsWith("spotify:track:")) {
+      lastLikedFor = state.track.uri;
+      api("/me/library/contains", { query: { uris: state.track.uri } }).then(r => { if (lastLikedFor === state.track?.uri) { state.liked = Array.isArray(r) ? !!r[0] : null; render(); } }).catch(() => { state.liked = null; render(); });
+    }
+    render();
+  } catch (e) {
+    if (e.status === 401) showSignIn();
+  }
+}
+
+function currentPosition() { return state.playing ? Math.min(state.duration, state.position + (Date.now() - state.at)) : state.position; }
+
+let seeking = false, lastReported = "";
+function render() {
+  const t = state.track;
+  $("np-title").textContent = t ? t.name : "Nothing playing";
+  $("np-artist").innerHTML = t ? artistLinks(t.artists) : "";
+  const art = t ? img(t.album?.images, 64) : "";
+  $("np-art").classList.toggle("hidden", !art); $("np-art-ph").classList.toggle("hidden", !!art);
+  if (art && $("np-art").src !== art) $("np-art").src = art;
+  const like = $("np-like");
+  like.classList.toggle("hidden", !t || state.liked === null);
+  like.classList.toggle("liked", state.liked === true);
+  like.querySelector("use").setAttribute("href", state.liked ? "#i-heart-on" : "#i-heart");
+  like.title = state.liked ? "Remove from your Liked Songs" : "Save to your Liked Songs";
+  $("b-play").querySelector("use").setAttribute("href", state.playing ? "#i-pause" : "#i-play");
+  $("b-play").title = state.playing ? "Pause" : "Play";
+  $("b-shuffle").classList.toggle("active", state.shuffle);
+  $("b-repeat").classList.toggle("active", state.repeat !== "off");
+  $("b-repeat").title = state.repeat === "track" ? "Repeat: this song" : state.repeat === "context" ? "Repeat: on" : "Repeat";
+  $("b-repeat").style.opacity = state.repeat === "track" ? "1" : "";
+  const dev = $("device");
+  const elsewhere = state.active && !state.here && state.device;
+  dev.classList.toggle("hidden", !elsewhere);
+  dev.textContent = elsewhere ? `Playing on ${state.device}` : "";
+  $("here").classList.toggle("hidden", !(deviceId && !state.here && state.track));
+  $("t-dur").textContent = fmt(state.duration);
+  tick();
+  document.querySelectorAll("tr.row").forEach(r => r.classList.toggle("playing", !!t && r.dataset.uri === t.uri));
+  const report = JSON.stringify([t?.name, artistNames(t?.artists), state.playing, state.here, state.device]);
+  if (report !== lastReported) {
+    lastReported = report;
+    send({ type: "nowplaying", title: t ? t.name : null, artist: artistNames(t?.artists), playing: state.playing, here: state.here, device: state.device });
+    if ("mediaSession" in navigator && state.here) {
+      navigator.mediaSession.metadata = t ? new MediaMetadata({ title: t.name, artist: artistNames(t.artists), album: t.album?.name || "", artwork: (t.album?.images || []).map(i => ({ src: i.url, sizes: `${i.width}x${i.height}` })) }) : null;
+      navigator.mediaSession.playbackState = state.playing ? "playing" : "paused";
+    }
+  }
+}
+
+function tick() {
+  if (seeking) return;
+  const pos = currentPosition();
+  $("t-pos").textContent = fmt(pos);
+  const p = state.duration ? pos / state.duration * 1000 : 0;
+  $("seek").value = p;
+  $("seek").style.setProperty("--p", p / 10 + "%");
+}
+setInterval(tick, 500);
+setInterval(() => { if (signedIn) refresh(); }, 4000);
+
+// ---- controls ----
+async function transferHere(play = true) {
+  if (!deviceId) { toast("Spotify's player is still starting."); return; }
+  await api("/me/player", { method: "PUT", body: { device_ids: [deviceId], play } });
+  setTimeout(refresh, 700);
+}
+
+const command = guard(async action => {
+  if (!deviceId && !state.active) { pendingCommand = action; return; }
+  if (player) player.activateElement?.();
+  switch (action) {
+    case "toggle":
+      if (state.here && player) await player.togglePlay();
+      else if (state.active && state.track) await api(state.playing ? "/me/player/pause" : "/me/player/play", { method: "PUT" });
+      else await transferHere(true);
+      break;
+    case "next":
+      if (state.here && player) await player.nextTrack(); else await api("/me/player/next", { method: "POST" });
+      break;
+    case "previous":
+      if (state.here && player) await player.previousTrack(); else await api("/me/player/previous", { method: "POST" });
+      break;
+  }
+  if (!state.here) setTimeout(refresh, 500);
+});
+
+async function playItems(body) {
+  if (!deviceId) { toast("Spotify's player is still starting. Try again in a moment."); return; }
+  player?.activateElement?.();
+  await api("/me/player/play", { method: "PUT", query: { device_id: deviceId }, body });
+  setTimeout(refresh, 700);
+}
+const playContext = guard((contextUri, offsetUri) => playItems({ context_uri: contextUri, ...(offsetUri ? { offset: { uri: offsetUri } } : {}) }));
+const playUris = guard((uris, offsetUri) => playItems({ uris, ...(offsetUri ? { offset: { uri: offsetUri } } : {}) }));
+const addToQueue = guard(async uri => { await api("/me/player/queue", { method: "POST", query: { uri, ...(state.here && deviceId ? { device_id: deviceId } : {}) } }); toast("Added to queue"); });
+const setLiked = guard(async (uri, on) => { await api("/me/library", { method: on ? "PUT" : "DELETE", query: { uris: uri } }); if (state.track?.uri === uri) { state.liked = on; render(); } toast(on ? "Saved to Liked Songs" : "Removed from Liked Songs"); });
+
+$("b-play").onclick = () => command("toggle");
+$("b-next").onclick = () => command("next");
+$("b-prev").onclick = () => command("previous");
+$("here").onclick = guard(() => transferHere(true));
+$("np-like").onclick = () => state.track && setLiked(state.track.uri, !state.liked);
+$("b-shuffle").onclick = guard(async () => { await api("/me/player/shuffle", { method: "PUT", query: { state: !state.shuffle } }); state.shuffle = !state.shuffle; render(); });
+$("b-repeat").onclick = guard(async () => { const next = { off: "context", context: "track", track: "off" }[state.repeat]; await api("/me/player/repeat", { method: "PUT", query: { state: next } }); state.repeat = next; render(); });
+$("seek").oninput = e => { seeking = true; const ms = e.target.value / 1000 * state.duration; $("t-pos").textContent = fmt(ms); e.target.style.setProperty("--p", e.target.value / 10 + "%"); };
+$("seek").onchange = guard(async e => {
+  const ms = Math.round(e.target.value / 1000 * state.duration);
+  seeking = false;
+  if (state.here && player) await player.seek(ms); else await api("/me/player/seek", { method: "PUT", query: { position_ms: ms } });
+  state.position = ms; state.at = Date.now(); tick();
+});
+
+// Storage is a convenience (volume, last search): the page works without it.
+const store = {
+  get(area, key) { try { return window[area].getItem(key); } catch { return null; } },
+  set(area, key, value) { try { window[area].setItem(key, value); } catch { } },
+};
+function savedVolume() { const raw = store.get("localStorage", "volume"); const v = +raw; return raw !== null && Number.isFinite(v) ? v : 60; }
+let volTimer, lastVolume = savedVolume();
+function showVolume(v) { $("vol").value = v; $("vol").style.setProperty("--p", v + "%"); $("b-mute").querySelector("use").setAttribute("href", v == 0 ? "#i-mute" : "#i-vol"); }
+showVolume(savedVolume());
+async function setVolume(v) {
+  showVolume(v);
+  store.set("localStorage", "volume", v);
+  clearTimeout(volTimer);
+  volTimer = setTimeout(guard(async () => {
+    if (state.here && player) await player.setVolume(v / 100);
+    else if (state.active && state.supportsVolume) await api("/me/player/volume", { method: "PUT", query: { volume_percent: v } });
+  }), 120);
+}
+$("vol").oninput = e => setVolume(+e.target.value);
+$("b-mute").onclick = () => { const v = +$("vol").value; if (v > 0) { lastVolume = v; setVolume(0); } else setVolume(lastVolume || 50); };
+
+if ("mediaSession" in navigator) {
+  navigator.mediaSession.setActionHandler("play", () => command("toggle"));
+  navigator.mediaSession.setActionHandler("pause", () => command("toggle"));
+  navigator.mediaSession.setActionHandler("nexttrack", () => command("next"));
+  navigator.mediaSession.setActionHandler("previoustrack", () => command("previous"));
+}
+
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" && e.target.type !== "range") return;
+  if (e.code === "Space") { e.preventDefault(); command("toggle"); }
+});
+
+// ---- views ----
+const main = $("main");
+let currentView = null;
+function setNav(name) { document.querySelectorAll(".nav button, .lists button").forEach(b => b.classList.toggle("on", b.dataset.view === name || b.dataset.playlist === name)); }
+
+function trackRows(items, { context, showAlbum = true, showArt = true, numbered = true } = {}) {
+  // items: [{ track, added? }]; context: a context URI to play within, else the list itself is played.
+  const rows = items.filter(i => i.track && i.track.uri).map((i, n) => {
+    const t = i.track;
+    const art = showArt ? img(t.album?.images, 64) : "";
+    return `<tr class="row" data-uri="${esc(t.uri)}" data-n="${n}">
+      <td class="num">${numbered ? n + 1 : ""}</td>
+      ${showArt ? `<td class="art">${art ? `<img loading="lazy" src="${esc(art)}" alt="">` : `<div class="ph"></div>`}</td>` : ""}
+      <td><div class="t-title">${esc(t.name)}</div><div class="t-artist">${artistLinks(t.artists)}</div></td>
+      ${showAlbum ? `<td>${t.album?.id ? `<span class="link" data-album="${esc(t.album.id)}">${esc(t.album.name)}</span>` : esc(t.album?.name || "")}</td>` : ""}
+      <td class="tools"><button data-queue="${esc(t.uri)}" title="Add to queue"><svg><use href="#i-queue"/></svg></button></td>
+      <td class="dur">${fmt(t.duration_ms)}</td></tr>`;
+  }).join("");
+  const table = document.createElement("table");
+  table.className = "tracks";
+  table.innerHTML = `<colgroup><col style="width:44px">${showArt ? '<col style="width:52px">' : ""}<col>${showAlbum ? '<col style="width:32%">' : ""}<col style="width:48px"><col style="width:64px"></colgroup>
+    <thead><tr><th class="num">#</th>${showArt ? "<th></th>" : ""}<th>Title</th>${showAlbum ? "<th>Album</th>" : ""}<th></th><th class="dur"><svg width="14" height="14"><use href="#i-clock"/></svg></th></tr></thead><tbody>${rows}</tbody>`;
+  const uris = items.filter(i => i.track && i.track.uri && !i.track.is_local).map(i => i.track.uri);
+  table.addEventListener("click", e => {
+    if (e.target.closest("[data-queue]")) { addToQueue(e.target.closest("[data-queue]").dataset.queue); return; }
+    if (e.target.closest(".link")) return;
+    const row = e.target.closest("tr.row");
+    if (!row) return;
+    if (context) playContext(context, row.dataset.uri); else playUris(uris.slice(0, 200), row.dataset.uri);
+  });
+  render();
+  return table;
+}
+
+function cards(items, kind) {
+  const div = document.createElement("div");
+  div.className = "cards";
+  div.innerHTML = items.filter(Boolean).map(i => {
+    const sub = kind === "album" ? artistNames(i.artists) : kind === "playlist" ? `By ${i.owner?.display_name || "Spotify"}` : kind === "artist" ? "Artist" : "";
+    const pic = img(i.images, 200);
+    return `<button class="card${kind === "artist" ? " round" : ""}" data-${kind}="${esc(i.id)}">${pic ? `<img loading="lazy" src="${esc(pic)}" alt="">` : `<div class="ph"></div>`}<b>${esc(i.name)}</b><span>${esc(sub)}</span></button>`;
+  }).join("");
+  return div;
+}
+
+function view(html, name) {
+  currentView = name;
+  setNav(name);
+  main.scrollTop = 0;
+  main.innerHTML = "";
+  const v = document.createElement("div");
+  v.className = "view";
+  v.innerHTML = html;
+  main.appendChild(v);
+  return v;
+}
+
+main.addEventListener("click", e => {
+  // Capture phase: a link inside a song row opens its page instead of playing the row.
+  const a = e.target.closest("[data-artist]"), al = e.target.closest("[data-album]"), pl = e.target.closest("[data-playlist]");
+  if (a) { e.stopPropagation(); showArtist(a.dataset.artist); }
+  else if (al) { e.stopPropagation(); showAlbum(al.dataset.album); }
+  else if (pl) { e.stopPropagation(); showPlaylist(pl.dataset.playlist); }
+}, true);
+$("np-artist").addEventListener("click", e => { const a = e.target.closest("[data-artist]"); if (a) showArtist(a.dataset.artist); });
+
+const showHome = guard(async () => {
+  const v = view(`<h1>${greeting()}</h1><p class="sub">Recently played</p><div id="recent"></div>`, "home");
+  const r = await api("/me/player/recently-played", { query: { limit: 50 } });
+  const seen = new Set();
+  const items = (r.items || []).filter(i => !seen.has(i.track.uri) && seen.add(i.track.uri)).map(i => ({ track: i.track }));
+  const box = v.querySelector("#recent");
+  if (!items.length) { box.innerHTML = `<p class="empty">Nothing played recently. Search for something to play.</p>`; return; }
+  box.appendChild(trackRows(items));
+});
+function greeting() { const h = new Date().getHours(); return h < 5 ? "Good night" : h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening"; }
+
+let searchTimer, searchSeq = 0;
+function showSearch() {
+  currentView = "search"; setNav("search");
+  main.innerHTML = `<div class="search"><input id="q" placeholder="What do you want to play?" autocomplete="off" spellcheck="false"></div><div class="view" id="results" style="padding-top:8px"></div>`;
+  const q = $("q");
+  q.value = store.get("sessionStorage", "q") || "";
+  q.focus();
+  q.oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => runSearch(q.value.trim()), 300); };
+  if (q.value) runSearch(q.value.trim());
+}
+const runSearch = guard(async text => {
+  store.set("sessionStorage", "q", text);
+  const box = $("results");
+  if (!box) return;
+  if (!text) { box.innerHTML = ""; return; }
+  const seq = ++searchSeq;
+  // Development Mode caps search at 10 per type and request; songs get a second page.
+  const [a, b] = await Promise.all([
+    api("/search", { query: { q: text, type: "track,artist,album,playlist", limit: 10 } }),
+    api("/search", { query: { q: text, type: "track", limit: 10, offset: 10 } }).catch(() => null),
+  ]);
+  if (seq !== searchSeq || !$("results")) return;
+  box.innerHTML = "";
+  const tracks = [...(a.tracks?.items || []), ...(b?.tracks?.items || [])].filter(Boolean);
+  if (tracks.length) { box.insertAdjacentHTML("beforeend", "<h2 style='margin-top:8px'>Songs</h2>"); box.appendChild(trackRows(tracks.map(t => ({ track: t })))); }
+  const artists = (a.artists?.items || []).filter(Boolean);
+  if (artists.length) { box.insertAdjacentHTML("beforeend", "<h2>Artists</h2>"); box.appendChild(cards(artists, "artist")); }
+  const albums = (a.albums?.items || []).filter(Boolean);
+  if (albums.length) { box.insertAdjacentHTML("beforeend", "<h2>Albums</h2>"); box.appendChild(cards(albums, "album")); }
+  const playlists = (a.playlists?.items || []).filter(Boolean);
+  if (playlists.length) { box.insertAdjacentHTML("beforeend", "<h2>Playlists</h2>"); box.appendChild(cards(playlists, "playlist")); }
+  if (!tracks.length && !artists.length && !albums.length && !playlists.length) box.innerHTML = `<p class="empty">Nothing found for “${esc(text)}”.</p>`;
+});
+
+const showLiked = guard(async () => {
+  const v = view(`<div class="hero"><div class="ph" style="background:linear-gradient(135deg,#4527a0,#8e9eab);display:grid;place-items:center"><svg width="64" height="64" style="color:#fff"><use href="#i-heart-on"/></svg></div>
+    <div><div class="kind">Playlist</div><h1>Liked Songs</h1><div class="sub" id="liked-count"></div></div></div>
+    <div class="actions"><button class="play-big" id="liked-play" title="Play"><svg><use href="#i-play"/></svg></button></div><div id="liked-list"></div>`, "liked");
+  let next = "/me/tracks?limit=50", all = [], meId = me?.id;
+  const box = v.querySelector("#liked-list");
+  const context = meId ? `spotify:user:${meId}:collection` : null;
+  v.querySelector("#liked-play").onclick = () => context ? playContext(context) : playUris(all.map(i => i.track.uri));
+  const more = document.createElement("button"); more.className = "more"; more.textContent = "Show more";
+  const load = guard(async () => {
+    more.disabled = true;
+    const page = await api(next);
+    all = all.concat(page.items || []);
+    next = page.next;
+    v.querySelector("#liked-count").textContent = `${page.total} songs`;
+    box.innerHTML = "";
+    box.appendChild(trackRows(all, { context }));
+    if (next) { more.disabled = false; box.appendChild(more); }
+  });
+  more.onclick = load;
+  await load();
+});
+
+const showPlaylist = guard(async id => {
+  const p = await api(`/playlists/${id}`, { query: { fields: "id,name,uri,description,images,owner(display_name,id),collaborative,items(total),tracks(total)" } });
+  const total = p.items?.total ?? p.tracks?.total;
+  const v = view(`<div class="hero">${img(p.images) ? `<img src="${esc(img(p.images))}" alt="">` : `<div class="ph"></div>`}
+    <div><div class="kind">Playlist</div><h1>${esc(p.name)}</h1><div class="sub">${p.description ? esc(new DOMParser().parseFromString(p.description, "text/html").body.textContent) + "<br>" : ""}${esc(p.owner?.display_name || "")}${total != null ? ` · ${total} songs` : ""}</div></div></div>
+    <div class="actions"><button class="play-big" id="pl-play" title="Play"><svg><use href="#i-play"/></svg></button></div><div id="pl-list"></div>`, id);
+  v.querySelector("#pl-play").onclick = () => playContext(p.uri);
+  const box = v.querySelector("#pl-list");
+  let next = `/playlists/${id}/items?limit=100&additional_types=track`, all = [];
+  const more = document.createElement("button"); more.className = "more"; more.textContent = "Show more";
+  const load = async () => {
+    more.disabled = true;
+    try {
+      const page = await api(next);
+      all = all.concat((page.items || []).map(i => ({ track: i.item || i.track })));
+      next = page.next;
+      box.innerHTML = "";
+      box.appendChild(trackRows(all, { context: p.uri }));
+      if (next) { more.disabled = false; box.appendChild(more); }
+    } catch (e) {
+      // Since February 2026 Spotify lists songs only for playlists you own or collaborate on (Development Mode apps).
+      box.innerHTML = `<div class="note">Spotify only lets this app list the songs of playlists you made or collaborate on. Press play to listen to this one.</div>`;
+    }
+  };
+  more.onclick = load;
+  await load();
+});
+
+const showAlbum = guard(async id => {
+  const a = await api(`/albums/${id}`);
+  const v = view(`<div class="hero">${img(a.images) ? `<img src="${esc(img(a.images))}" alt="">` : `<div class="ph"></div>`}
+    <div><div class="kind">${esc(a.album_type || "Album")}</div><h1>${esc(a.name)}</h1><div class="sub">${artistLinks(a.artists)} · ${esc((a.release_date || "").slice(0, 4))} · ${a.total_tracks} songs</div></div></div>
+    <div class="actions"><button class="play-big" id="al-play" title="Play"><svg><use href="#i-play"/></svg></button></div><div id="al-list"></div>`, "album:" + id);
+  v.querySelector("#al-play").onclick = () => playContext(a.uri);
+  const items = (a.tracks?.items || []).map(t => ({ track: { ...t, album: { name: a.name, images: a.images, id: a.id } } }));
+  v.querySelector("#al-list").appendChild(trackRows(items, { context: a.uri, showAlbum: false, showArt: false }));
+});
+
+const showArtist = guard(async id => {
+  const [a, albums] = await Promise.all([api(`/artists/${id}`), api(`/artists/${id}/albums`, { query: { include_groups: "album,single", limit: 30 } })]);
+  const v = view(`<div class="hero">${img(a.images) ? `<img src="${esc(img(a.images))}" alt="" style="border-radius:50%">` : `<div class="ph" style="border-radius:50%"></div>`}
+    <div><div class="kind">Artist</div><h1>${esc(a.name)}</h1><div class="sub">${esc((a.genres || []).slice(0, 3).join(", "))}</div></div></div>
+    <div class="actions"><button class="play-big" id="ar-play" title="Play this artist"><svg><use href="#i-play"/></svg></button></div><h2>Albums and singles</h2>`, "artist:" + id);
+  v.querySelector("#ar-play").onclick = () => playContext(a.uri);
+  v.appendChild(cards(albums.items || [], "album"));
+});
+
+const showQueue = guard(async () => {
+  const v = view(`<h1>Queue</h1>`, "queue");
+  const q = await api("/me/player/queue");
+  if (q.currently_playing) { v.insertAdjacentHTML("beforeend", "<h2>Now playing</h2>"); v.appendChild(trackRows([{ track: q.currently_playing }], { numbered: false })); }
+  const next = (q.queue || []).filter(t => t && t.type === "track");
+  if (next.length) { v.insertAdjacentHTML("beforeend", "<h2>Next up</h2>"); v.appendChild(trackRows(next.map(t => ({ track: t })))); }
+  if (!q.currently_playing && !next.length) v.insertAdjacentHTML("beforeend", `<p class="empty">The queue is empty.</p>`);
+});
+
+const views = { home: showHome, search: showSearch, liked: showLiked, queue: showQueue };
+document.querySelectorAll(".nav button").forEach(b => b.onclick = () => views[b.dataset.view]());
+
+let me = null;
+const loadSidebar = guard(async () => {
+  me = await api("/me");
+  $("me").textContent = me.display_name || me.id;
+  const lists = [];
+  let next = "/me/playlists?limit=50";
+  while (next && lists.length < 300) { const page = await api(next); lists.push(...(page.items || []).filter(Boolean)); next = page.next; }
+  $("playlists").innerHTML = lists.map(p => { const pic = img(p.images, 64); return `<button data-playlist="${esc(p.id)}" title="${esc(p.name)}">${pic ? `<img loading="lazy" src="${esc(pic)}" alt="">` : `<div class="ph"></div>`}<span>${esc(p.name)}</span></button>`; }).join("");
+  $("playlists").querySelectorAll("button").forEach(b => b.onclick = () => showPlaylist(b.dataset.playlist));
+});
+
+// ---- sign-in and the app's messages ----
+let signedIn = false, started = false;
+function showSignIn() { signedIn = false; $("ov-signin").classList.remove("hidden"); }
+function begin() {
+  signedIn = true;
+  $("ov-signin").classList.add("hidden");
+  $("ov-setup").classList.add("hidden");
+  if (started) return;
+  started = true;
+  loadSidebar();
+  showHome();
+  refresh();
+  loadSdk();
+}
+
+$("signin").onclick = () => { $("signin").disabled = true; $("signin-msg").textContent = "Finish signing in in your browser…"; send({ type: "signin" }); };
+$("signout").onclick = () => { if (confirm("Sign out of Spotify in Gaming Enjoyer?")) { player?.disconnect(); send({ type: "signout" }); location.reload(); } };
+document.addEventListener("click", e => { const o = e.target.closest("[data-open]"); if (o) { e.preventDefault(); send({ type: "open", url: o.dataset.open }); } });
+
+if (hostView) hostView.addEventListener("message", e => {
+  const m = e.data;
+  switch (m.type) {
+    case "state":
+      if (!m.configured) { $("ov-setup").classList.remove("hidden"); break; }
+      if (m.signedIn) begin(); else showSignIn();
+      break;
+    case "token": {
+      if (m.token) cachedToken = { token: m.token, expires: m.expires };
+      const resolve = tokenWaiters.get(m.id); tokenWaiters.delete(m.id);
+      resolve?.(m.token || null);
+      if (!m.token && signedIn) showSignIn();
+      break;
+    }
+    case "signin":
+      $("signin").disabled = false;
+      $("signin-msg").textContent = m.error || "";
+      break;
+    case "command":
+      if (!signedIn) break;
+      if (!deviceId && !state.active) pendingCommand = m.action; else command(m.action);
+      break;
+  }
+});
+send({ type: "state" });
+</script>
+</body>
+</html>

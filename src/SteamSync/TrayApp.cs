@@ -13,6 +13,8 @@ internal sealed class TrayApp : ApplicationContext
     private readonly GameRelay _relay;          // menu shown in beta builds that carry the relay helper, or once set up
     private readonly ToolStripMenuItem _relayItem = new("Game relay");
     private readonly ToolStripMenuItem _pcLoadItem = new("PC load") { Visible = UpdateChannel.IsBetaBuild };
+    private readonly ToolStripMenuItem _spotifyItem = new("Spotify") { Visible = UpdateChannel.IsBetaBuild };
+    private SpotifyWindow? _spotify;            // created on first use, then kept (hidden) so music keeps playing
     private readonly Equalizer? _eq = Equalizer.Find(); // menu shown only when Equalizer APO is installed
     private readonly ToolStripMenuItem _eqItem = new("Equalizer");
     private readonly SynchronizationContext _ui;
@@ -59,6 +61,8 @@ internal sealed class TrayApp : ApplicationContext
         _relayItem.DropDownOpening += (_, _) => BuildRelayMenu();
         _pcLoadItem.DropDownItems.Add("…"); // rebuilt each time it opens (BuildPcLoadMenu)
         _pcLoadItem.DropDownOpening += (_, _) => BuildPcLoadMenu();
+        _spotifyItem.DropDownItems.Add("…"); // rebuilt each time it opens (BuildSpotifyMenu)
+        _spotifyItem.DropDownOpening += (_, _) => BuildSpotifyMenu();
         _eqItem.DropDownItems.Add("…"); // rebuilt each time it opens (BuildEqualizerMenu)
         _eqItem.DropDownOpening += (_, _) => BuildEqualizerMenu();
         _eqItem.Visible = _eq is not null;
@@ -87,6 +91,7 @@ internal sealed class TrayApp : ApplicationContext
         menu.Items.AddRange(
         [
             new ToolStripMenuItem("Open Library", null, (_, _) => OpenLibrary()) { Font = new Font(menu.Font, FontStyle.Bold) },
+            _spotifyItem,
             new ToolStripSeparator(),
             _statusItem,
             _lastSyncItem,
@@ -303,6 +308,44 @@ internal sealed class TrayApp : ApplicationContext
     }
 
     /// <summary>
+    /// The Spotify submenu (beta builds): what the Spotify player shows as playing (here or on another Spotify Connect
+    /// device), Play/Pause, Next and Previous, and opening the player. The player keeps running hidden after its window
+    /// closes, so these work without it on screen.
+    /// </summary>
+    private void BuildSpotifyMenu()
+    {
+        var items = _spotifyItem.DropDownItems;
+        items.Clear();
+        if (_spotify?.Current is { } now)
+        {
+            items.Add(new ToolStripMenuItem($"♪ {Truncate(now.Title, 60)}") { Enabled = false });
+            if (now.Artist.Length > 0) items.Add(new ToolStripMenuItem($"     {Truncate(now.Artist, 60)}") { Enabled = false });
+            if (!now.Here && now.Device is { } device) items.Add(new ToolStripMenuItem($"     on {Truncate(device, 50)}") { Enabled = false });
+            items.Add(new ToolStripSeparator());
+            items.Add(new ToolStripMenuItem(now.Playing ? "Pause" : "Play", null, async (_, _) => await SpotifyAsync("toggle")));
+            items.Add(new ToolStripMenuItem("Next", null, async (_, _) => await SpotifyAsync("next")));
+            items.Add(new ToolStripMenuItem("Previous", null, async (_, _) => await SpotifyAsync("previous")));
+            items.Add(new ToolStripSeparator());
+        }
+        else if (SpotifyAuth.HasStoredSignIn)
+        {
+            items.Add(new ToolStripMenuItem("Play", null, async (_, _) => await SpotifyAsync("toggle"))
+            {
+                ToolTipText = "Starts the Spotify player in the background and plays where you left off.",
+            });
+        }
+        items.Add(new ToolStripMenuItem("Open Spotify player", null, async (_, _) => await SpotifyAsync(null)) { Font = new Font(_spotifyItem.Font, FontStyle.Bold) });
+    }
+
+    /// <summary>Opens the Spotify player (action null) or sends it play/pause, next or previous.</summary>
+    private async Task SpotifyAsync(string? action)
+    {
+        if (_spotify is null || _spotify.IsDisposed) _spotify = new SpotifyWindow(_config);
+        if (action is null) await _spotify.ShowPlayerAsync();
+        else await _spotify.CommandAsync(action);
+    }
+
+    /// <summary>
     /// The PC load submenu (beta builds): the CPU temperature through PawnIO, off until the user turns it on. Turning it
     /// on asks first, then installs PawnIO with its own installer if it isn't there (PawnIo.EnableAsync).
     /// </summary>
@@ -509,6 +552,7 @@ internal sealed class TrayApp : ApplicationContext
         _openWait.Unregister(null);
         _updater.Dispose();
         _library?.Close();
+        _spotify?.Exit();
         _tray.Visible = false;
         _tray.Dispose();
         _pcLoad.Dispose();

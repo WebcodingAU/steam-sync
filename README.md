@@ -103,6 +103,31 @@ against the exes in each game folder. Crash reporters, updaters, installers and 
 - Steam games are reported too, but the site only uses them for "Playing now": Steam counts their time.
 - Nothing is recorded before the PC is paired.
 
+## Spotify player (beta builds only)
+
+The tray's **Spotify** menu opens a Spotify player (`Spotify/`). It's a Spotify Connect device called "Gaming Enjoyer",
+built on Spotify's Web Playback SDK, so music plays from the app itself and the Spotify app can stay closed. It needs
+Spotify Premium; that's Spotify's rule for the SDK.
+- **The page:** Home, Search, Liked Songs, your playlists, Queue, and a player bar. Play here moves playback over from
+  another device. The page (`spotify.html`) is embedded in the app.
+- **Hosting:** the page is written out and served to its own WebView2 as `https://spotify.gaming-enjoyer.invalid/`.
+  The SDK's Widevine DRM needs a secure page and WebView2's component updates; with `--disable-component-update`
+  every song fails.
+- **Closing the window** hides it, so the music keeps playing. The tray menu then shows the song, with Play/Pause,
+  Next and Previous. Hidden and paused for 10 minutes, the engine shuts down. Its processes stay at normal priority
+  (the rest of the app uses Efficiency mode), so audio doesn't stutter under a game.
+- **Sign-in** (`SpotifyAuth.cs`) uses PKCE with the Spotify developer app's public Client ID (`SpotifyClientId` in
+  `appsettings.json`; no secret). Spotify returns to `http://127.0.0.1:43819/spotify/callback`, which must be the
+  app's redirect URI exactly: the dashboard rejects one without a port. The refresh token is DPAPI-encrypted in
+  `spotify.bin`.
+- **Spotify's Development Mode limits (February 2026):**
+  - playlist songs come from `/playlists/{id}/items`, and only for playlists you own or collaborate on (others still
+    play);
+  - likes use `/me/library` with URIs;
+  - search returns at most 10 per type and page;
+  - artists have no top tracks;
+  - at most five accounts can use the Client ID.
+
 ## PC load (beta builds only)
 
 While a game runs, a beta build (a version with `-beta` in it) sends the PC's load once a second (`PcLoad.cs`,

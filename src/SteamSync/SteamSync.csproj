@@ -25,6 +25,8 @@
     <!-- Built-in equalizer presets (Equalizer APO config files), put back in the presets folder when missing. -->
     <EmbeddedResource Include="presets\*.txt" LogicalName="SteamSync.presets.%(Filename)%(Extension)" />
     <EmbeddedResource Include="game-profiles.json" LogicalName="SteamSync.game-profiles.json" />
+    <!-- The Spotify player's page (SpotifyWindow writes it out for its WebView2). -->
+    <EmbeddedResource Include="Spotify\spotify.html" LogicalName="SteamSync.spotify.html" />
   </ItemGroup>
 
   <!-- The limiter behind "Prevent clipping" (limiter\limiter.c): a native VST2 plugin, because Equalizer APO loads it into

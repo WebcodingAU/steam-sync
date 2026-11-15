@@ -26,7 +26,9 @@ internal static class AppInfo
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SteamSync")).FullName;
 }
 
-internal sealed record AppConfig(string SupabaseUrl, string SupabaseAnonKey, string WebsiteUrl)
+/// <param name="SpotifyClientId">The Spotify developer app's Client ID for the Spotify player (SpotifyAuth). Public by
+/// design (PKCE, no secret); empty means the player shows how to set it up.</param>
+internal sealed record AppConfig(string SupabaseUrl, string SupabaseAnonKey, string WebsiteUrl, string? SpotifyClientId = null)
 {
     public bool IsConfigured =>
         Uri.IsWellFormedUriString(SupabaseUrl, UriKind.Absolute)
