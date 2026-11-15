@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -52,7 +53,14 @@ internal sealed class LibraryWindow : Form
     private bool _fullScreen;
     private FormWindowState _stateBeforeFullScreen;
     private readonly SpotifyPlayer? _spotify;
-    private readonly Panel _spotifyPanel = new() { Dock = DockStyle.Bottom, Visible = false, BackColor = Color.FromArgb(18, 21, 28) };
+    // The player fills the window, behind the site while the glass bar shows and in front when expanded. Behind (not
+    // hidden) keeps its page counted as visible, so its timers aren't throttled and the bar stays up to date.
+    private readonly Panel _spotifyPanel = new() { Dock = DockStyle.Fill, Visible = false, BackColor = Color.FromArgb(10, 12, 17) };
+    private static readonly Lazy<string> GlassBarScript = new(() =>
+    {
+        using var script = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream("SteamSync.glassbar.js")!;
+        return new StreamReader(script).ReadToEnd();
+    });
 
     public LibraryWindow(AppConfig config, SpotifyPlayer? spotify = null)
     {
@@ -80,6 +88,7 @@ internal sealed class LibraryWindow : Form
             {
                 player.ExpandedChanged += LayOutSpotify;
                 player.RunningChanged += LayOutSpotify;
+                player.BarMessage += OnBarMessage;
                 if (player.SignedIn || player.Running) await AttachSpotifyAsync();
             }
             await site;
@@ -95,6 +104,7 @@ internal sealed class LibraryWindow : Form
             {
                 player.ExpandedChanged -= LayOutSpotify;
                 player.RunningChanged -= LayOutSpotify;
+                player.BarMessage -= OnBarMessage;
                 player.Detach(_spotifyPanel); // keeps playing in the background
             }
         };
@@ -116,24 +126,56 @@ internal sealed class LibraryWindow : Form
         LayOutSpotify();
     }
 
-    /// <summary>The player bar along the bottom (92 px at 100% scaling), or the whole window when expanded.</summary>
+    /// <summary>
+    /// The whole window when expanded; otherwise the player sits behind the site and the site's page shows the glass
+    /// bar (glassbar.js) along its bottom, so the library shows through it.
+    /// </summary>
     private void LayOutSpotify()
     {
         if (InvokeRequired) { BeginInvoke(LayOutSpotify); return; }
         if (_spotify is null || IsDisposed) return;
-        if (_spotify.Expanded)
+        var shown = _spotify.Running || _spotify.SignedIn;
+        _spotifyPanel.Visible = _spotify.Expanded || shown;
+        if (_spotify.Expanded) _spotifyPanel.BringToFront();
+        else _web.BringToFront();
+        PostToSite(new JsonObject { ["kind"] = "visible", ["visible"] = shown });
+    }
+
+    private void OnBarMessage(string kind, string json)
+    {
+        if (InvokeRequired) { BeginInvoke(() => OnBarMessage(kind, json)); return; }
+        PostToSite(kind == "toast"
+            ? new JsonObject { ["kind"] = "toast", ["text"] = JsonNode.Parse(json) }
+            : new JsonObject { ["kind"] = "bar", ["data"] = JsonNode.Parse(json) });
+    }
+
+    /// <summary>To the glass bar, only while the window shows the site (never Steam's sign-in pages).</summary>
+    private void PostToSite(JsonObject message)
+    {
+        var core = _web.CoreWebView2;
+        if (core is null || _spotify is null || !Uri.TryCreate(core.Source, UriKind.Absolute, out var page) || !_siteHosts.Contains(page.Host)) return;
+        message["type"] = "ge-spotify";
+        try { core.PostWebMessageAsJson(message.ToJsonString()); }
+        catch (Exception ex) when (ex is InvalidOperationException or System.Runtime.InteropServices.COMException) { }
+    }
+
+    /// <summary>The glass bar's clicks: "ready" when a page loads, else a player action (SpotifyPlayer checks it).</summary>
+    private async void OnSiteMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+    {
+        if (_spotify is null || !Uri.TryCreate(e.Source, UriKind.Absolute, out var source) || !_siteHosts.Contains(source.Host)) return;
+        JsonObject? message;
+        try { message = JsonNode.Parse(e.WebMessageAsJson) as JsonObject; }
+        catch (JsonException) { return; }
+        if (message is null || (string?)message["type"] != "ge-spotify" || (string?)message["action"] is not { } action) return;
+        if (action == "ready")
         {
-            _spotifyPanel.Visible = true;
-            _spotifyPanel.Dock = DockStyle.Fill;
-            _spotifyPanel.BringToFront();
+            LayOutSpotify();
+            if (_spotify.Bar is { } bar) OnBarMessage("bar", bar);
+            return;
         }
-        else
-        {
-            _spotifyPanel.Visible = _spotify.Running || _spotify.SignedIn;
-            _spotifyPanel.Dock = DockStyle.Bottom;
-            _spotifyPanel.Height = (int)Math.Round(92 * DeviceDpi / 96.0);
-            _web.BringToFront(); // the site fills what's left above the bar
-        }
+        double? value = message["value"] is JsonValue v && v.TryGetValue<double>(out var d) ? d : null;
+        if (action == "expand") await ShowSpotifyAsync();
+        else await _spotify.BarCommandAsync(action, value);
     }
 
     private WebView2 NewWebView()
@@ -196,6 +238,12 @@ internal sealed class LibraryWindow : Form
                 Log.Info($"Library page failed to load: {e.WebErrorStatus}");
         };
         core.ProcessFailed += OnProcessFailed;
+        if (_spotify is not null)
+        {
+            var hosts = JsonSerializer.Serialize(_siteHosts.Select(h => h.ToLowerInvariant()).ToArray());
+            await core.AddScriptToExecuteOnDocumentCreatedAsync(GlassBarScript.Value.Replace("__HOSTS__", hosts));
+            core.WebMessageReceived += OnSiteMessage;
+        }
         // A page asking for fullscreen (a video's fullscreen button) gets the whole screen, as in Chrome.
         core.ContainsFullScreenElementChanged += (_, _) => SetFullScreen(core.ContainsFullScreenElement);
         core.Environment.ProcessInfosChanged += (_, _) => ApplyEfficiency();

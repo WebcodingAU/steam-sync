@@ -81,6 +81,26 @@ internal sealed class SpotifyPlayer : IDisposable
     /// <summary>The player started or stopped; the Library window shows or hides its space.</summary>
     public event Action? RunningChanged;
 
+    /// <summary>What the Library page's glass bar shows (glassbar.js), as the page's JSON; null until it reports.</summary>
+    public string? Bar { get; private set; }
+
+    /// <summary>A message for the glass bar: kind "bar" (Bar changed) or "toast", with its JSON.</summary>
+    public event Action<string, string>? BarMessage;
+
+    // The glass bar's buttons. Play, next and previous also start the player; the rest need it running.
+    private static readonly HashSet<string> BarActions = ["shuffle", "repeat", "like", "here", "mute", "seek", "volume"];
+
+    /// <summary>A click on the glass bar (anything the page's bar could do, nothing more).</summary>
+    public async Task BarCommandAsync(string action, double? value)
+    {
+        if (action is "toggle" or "next" or "previous") { await CommandAsync(action); return; }
+        if (action == "expand") { SetExpanded(true); return; }
+        if (!BarActions.Contains(action) || !_pageReady) return;
+        var command = new JsonObject { ["type"] = "command", ["action"] = action };
+        if (value is { } v && double.IsFinite(v)) command["value"] = v;
+        Post(command);
+    }
+
     /// <summary>Shows the player in a Library window's panel (starting it if it isn't running).</summary>
     public async Task AttachAsync(Control host)
     {
@@ -258,6 +278,13 @@ internal sealed class SpotifyPlayer : IDisposable
                 var text = (string?)message["message"] ?? "";
                 Log.Info($"Spotify player: {(text.Length <= 300 ? text : text[..300] + "…")}");
                 break;
+            case "bar" when message["data"] is JsonObject barData:
+                Bar = barData.ToJsonString();
+                BarMessage?.Invoke("bar", Bar);
+                break;
+            case "toast" when message["text"] is JsonValue toastText:
+                BarMessage?.Invoke("toast", toastText.ToJsonString());
+                break;
             case "nowplaying":
                 var title = (string?)message["title"];
                 SetNowPlaying(title is null ? null : new NowPlaying(title, (string?)message["artist"] ?? "",
@@ -311,6 +338,7 @@ internal sealed class SpotifyPlayer : IDisposable
         catch (Exception ex) when (ex is InvalidOperationException or System.Runtime.InteropServices.COMException) { }
         _controller = null;
         Current = null;
+        Bar = null;
         RunningChanged?.Invoke();
     }
 

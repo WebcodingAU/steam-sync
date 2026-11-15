@@ -112,6 +112,10 @@ It needs Spotify Premium; that's Spotify's rule for the SDK.
   click on the song) expands it over the whole window: Home, Search, Liked Songs, your playlists, Queue. The arrow or
   Esc collapses it again. Play here moves playback over from another device. The tray's **Spotify → Show Spotify**
   opens the window expanded; sign-in starts from there.
+- **The glass bar:** collapsed, the player's engine sits behind the site and the site's page draws the bar itself
+  (`Spotify/glassbar.js`, added by `LibraryWindow` to the site's pages only, in a closed shadow root), so the library
+  shows through it blurred. The player page reports what the bar shows (`bar`, `toast`) and the bar's clicks come back
+  through the app; `SpotifyPlayer.BarCommandAsync` only passes on the actions the player's own bar has.
 - **Hosting:** the page (`spotify.html`, embedded) is served from memory to its own WebView2 engine (profile
   `WebView2-Spotify`) as `https://spotify.gaming-enjoyer.invalid/`. It's a bare `CoreWebView2Controller` so it can
   move between windows. The SDK's Widevine DRM needs a secure page and WebView2's component updates; with

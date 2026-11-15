@@ -240,7 +240,7 @@ const artistLinks = artists => (artists || []).map(a => a.id ? `<span class="lin
 const artistNames = artists => (artists || []).map(a => a.name).join(", ");
 
 let toastTimer;
-function toast(text, ms = 3500) { const t = $("toast"); t.textContent = text; t.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), ms); }
+function toast(text, ms = 3500) { if (!expanded) send({ type: "toast", text }); const t = $("toast"); t.textContent = text; t.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), ms); }
 
 // ---- tokens and the Web API ----
 let cachedToken = null, tokenSeq = 0;
@@ -361,7 +361,22 @@ async function refresh() {
 
 function currentPosition() { return state.playing ? Math.min(state.duration, state.position + (Date.now() - state.at)) : state.position; }
 
-let seeking = false, lastReported = "";
+let seeking = false, lastReported = "", lastBar = "";
+
+// What the glass bar over the Library page shows (glassbar.js; the app passes it on). Sent when it changes.
+function reportBar() {
+  const t = state.track;
+  const data = {
+    title: t ? t.name : null, artist: t ? artistNames(t.artists) : "", art: t ? img(t.album?.images, 64) : "",
+    playing: state.playing, duration: state.duration || 0, shuffle: !!state.shuffle, repeat: state.repeat,
+    liked: t ? state.liked : null, volume: +$("vol").value, device: state.active && !state.here ? state.device : null,
+    canHere: !!(deviceId && !state.here && t),
+  };
+  const key = JSON.stringify([data, state.position, state.at]);
+  if (key === lastBar) return;
+  lastBar = key;
+  send({ type: "bar", data: { ...data, position: Math.round(currentPosition()) } });
+}
 function render() {
   const t = state.track;
   $("np-title").textContent = t ? t.name : "Nothing playing";
@@ -388,6 +403,7 @@ function render() {
   $("t-dur").textContent = fmt(state.duration);
   tick();
   document.querySelectorAll("tr.row").forEach(r => r.classList.toggle("playing", !!t && r.dataset.uri === t.uri));
+  reportBar();
   const report = JSON.stringify([t?.name, artistNames(t?.artists), state.playing, state.here, state.device]);
   if (report !== lastReported) {
     lastReported = report;
@@ -455,12 +471,12 @@ $("np-like").onclick = () => state.track && setLiked(state.track.uri, !state.lik
 $("b-shuffle").onclick = guard(async () => { await api("/me/player/shuffle", { method: "PUT", query: { state: !state.shuffle } }); state.shuffle = !state.shuffle; render(); });
 $("b-repeat").onclick = guard(async () => { const next = { off: "context", context: "track", track: "off" }[state.repeat]; await api("/me/player/repeat", { method: "PUT", query: { state: next } }); state.repeat = next; render(); });
 $("seek").oninput = e => { seeking = true; const ms = e.target.value / 1000 * state.duration; $("t-pos").textContent = fmt(ms); e.target.style.setProperty("--p", e.target.value / 10 + "%"); };
-$("seek").onchange = guard(async e => {
-  const ms = Math.round(e.target.value / 1000 * state.duration);
+const seekTo = guard(async ms => {
   seeking = false;
   if (state.here && player) await player.seek(ms); else await api("/me/player/seek", { method: "PUT", query: { position_ms: ms } });
-  state.position = ms; state.at = Date.now(); tick();
+  state.position = ms; state.at = Date.now(); tick(); reportBar();
 });
+$("seek").onchange = e => seekTo(Math.round(e.target.value / 1000 * state.duration));
 
 // Storage is a convenience (volume, last search): the page works without it.
 const store = {
@@ -469,7 +485,7 @@ const store = {
 };
 function savedVolume() { const raw = store.get("localStorage", "volume"); const v = +raw; return raw !== null && Number.isFinite(v) ? v : 60; }
 let volTimer, lastVolume = savedVolume();
-function showVolume(v) { $("vol").value = v; $("vol").style.setProperty("--p", v + "%"); $("b-mute").querySelector("use").setAttribute("href", v == 0 ? "#i-mute" : "#i-vol"); }
+function showVolume(v) { $("vol").value = v; $("vol").style.setProperty("--p", v + "%"); $("b-mute").querySelector("use").setAttribute("href", v == 0 ? "#i-mute" : "#i-vol"); reportBar(); }
 showVolume(savedVolume());
 async function setVolume(v) {
   showVolume(v);
@@ -482,6 +498,17 @@ async function setVolume(v) {
 }
 $("vol").oninput = e => setVolume(+e.target.value);
 $("b-mute").onclick = () => { const v = +$("vol").value; if (v > 0) { lastVolume = v; setVolume(0); } else setVolume(lastVolume || 50); };
+
+// The glass bar's other buttons (play, next and previous go through command()).
+const barActions = {
+  shuffle: () => $("b-shuffle").onclick(),
+  repeat: () => $("b-repeat").onclick(),
+  like: () => state.liked !== null && $("np-like").onclick(),
+  here: () => $("here").onclick(),
+  mute: () => $("b-mute").onclick(),
+  seek: v => Number.isFinite(+v) && seekTo(Math.max(0, Math.min(state.duration, Math.round(+v)))),
+  volume: v => Number.isFinite(+v) && setVolume(Math.max(0, Math.min(100, Math.round(+v)))),
+};
 
 if ("mediaSession" in navigator) {
   navigator.mediaSession.setActionHandler("play", () => command("toggle"));
@@ -756,7 +783,8 @@ if (hostView) hostView.addEventListener("message", e => {
       break;
     case "command":
       if (!signedIn) break;
-      if (!deviceId && !state.active) pendingCommand = m.action; else command(m.action);
+      if (barActions[m.action]) { if (state.track || m.action === "volume" || m.action === "mute") barActions[m.action](m.value); }
+      else if (!deviceId && !state.active) pendingCommand = m.action; else command(m.action);
       break;
   }
 });
