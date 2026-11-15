@@ -129,14 +129,14 @@
   .toast.show { opacity: 1; }
   .hidden { display: none !important; }
   /* Bar mode: only the player bar, along the bottom of the Library window (SpotifyPlayer / LibraryWindow). */
-  body.bar .app { display: block; }
-  body.bar .side, body.bar .main, body.bar .toast { display: none; }
-  body.bar .bar { height: 100vh; border-top: 1px solid var(--line); }
-  body.bar .np { cursor: pointer; }
+  body.mini .app { display: block; }
+  body.mini .side, body.mini .main, body.mini .toast { display: none; }
+  body.mini .bar { height: 100vh; border-top: 1px solid var(--line); }
+  body.mini .np { cursor: pointer; }
   .expand { color: var(--dim); display: grid; place-items: center; padding: 4px; }
   .expand:hover { color: var(--text); }
   .expand svg { width: 20px; height: 20px; transition: transform .15s; }
-  body:not(.bar) .expand svg { transform: rotate(180deg); }
+  body:not(.mini) .expand svg { transform: rotate(180deg); }
   @media (max-width: 820px) { .bar { grid-template-columns: minmax(140px, 1fr) minmax(260px, 1.6fr) auto; } .right input[type=range], .device { display: none; } }
   @media (max-width: 600px) { #b-shuffle, #b-repeat, .prog span { display: none; } }
   ::-webkit-scrollbar { width: 12px; }
@@ -494,7 +494,7 @@ if ("mediaSession" in navigator) {
 let expanded = true;
 function applyMode(on) {
   expanded = on;
-  document.body.classList.toggle("bar", !on);
+  document.body.classList.toggle("mini", !on);
   $("b-expand").title = on ? "Back to your library (Esc)" : "Show Spotify";
   if (on && !currentView && signedIn) showHome();
 }
