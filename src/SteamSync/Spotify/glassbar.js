@@ -24,6 +24,8 @@
     heart: icon(stroke(heart)),
     heartOn: icon(fill(heart)),
     up: icon(stroke("m6 15 6-6 6 6")),
+    down: icon(stroke("m6 9 6 6 6-6")),
+    logo: icon(fill("M12 1.5a10.5 10.5 0 1 0 0 21 10.5 10.5 0 0 0 0-21Zm4.82 15.15a.65.65 0 0 1-.9.22c-2.46-1.5-5.56-1.84-9.21-1a.66.66 0 0 1-.29-1.28c4-.91 7.43-.52 10.18 1.16.31.19.41.6.22.9Zm1.28-2.86a.82.82 0 0 1-1.12.27c-2.82-1.73-7.12-2.23-10.45-1.22a.82.82 0 1 1-.48-1.57c3.81-1.15 8.54-.6 11.78 1.4.38.23.5.74.27 1.12Zm.11-2.98C14.83 8.8 9.25 8.61 6.02 9.6a.98.98 0 1 1-.57-1.88c3.71-1.12 9.88-.9 13.77 1.41a.98.98 0 0 1-1.01 1.68Z")),
   };
 
   const css = `
@@ -78,6 +80,16 @@
     opacity: 0; transition: opacity .2s; pointer-events: none; }
   .toast.show { opacity: 1; }
   .hidden { display: none !important; }
+  .bubble { position: fixed; left: 16px; bottom: 16px; width: 68px; height: 68px; border-radius: 50%; z-index: 2147483000;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+    font: 600 11px/1 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; color: var(--text); letter-spacing: .01em;
+    background: var(--glass); border: 1px solid var(--edge); box-shadow: 0 8px 26px var(--shadow);
+    -webkit-backdrop-filter: blur(24px) saturate(180%); backdrop-filter: blur(24px) saturate(180%);
+    transition: transform .25s ease, opacity .25s ease, box-shadow .2s; }
+  .bubble svg { width: 26px; height: 26px; color: var(--accent); }
+  .bubble:hover { transform: scale(1.06); }
+  .bubble.playing { box-shadow: 0 8px 26px var(--shadow), 0 0 0 2px var(--accent); }
+  .bubble.off { transform: scale(.4); opacity: 0; pointer-events: none; }
   @media (max-width: 820px) { .bar { grid-template-columns: minmax(140px, 1fr) minmax(260px, 1.6fr) auto; } .vol, .device { display: none; } }
   @media (max-width: 600px) { .shuffle, .repeat, .prog span { display: none; } }`;
 
@@ -103,14 +115,19 @@
       <button class="here hidden" title="Move playback to Gaming Enjoyer">Play here</button>
       <button class="icon mute" title="Mute">${I.vol}</button>
       <input type="range" class="vol" min="0" max="100" value="60" title="Volume">
+      <button class="icon min" title="Minimise to a bubble">${I.down}</button>
       <button class="icon expand" title="Show Spotify">${I.up}</button>
     </div>
   </div>
+  <button class="bubble off" title="Show the Spotify bar">${I.logo}<span>Spotify</span></button>
   <div class="toast"></div></div>`;
 
   let root, bar, toastEl, room, toastTimer, seeking = false, volTimer;
   let s = { title: null, artist: "", art: "", playing: false, position: 0, duration: 0, shuffle: false, repeat: "off", liked: null, volume: 60, device: null, canHere: false };
   let receivedAt = 0, visible = false, volTouched = 0;
+  // Minimised to the bubble, remembered across the site's pages (a convenience: without storage it starts as the bar).
+  const minKey = "ge_spotify_minimized";
+  let minimized = (() => { try { return localStorage.getItem(minKey) === "1"; } catch { return false; } })();
   const q = sel => root.querySelector(sel);
   const fmt = ms => { if (!ms || ms < 0) ms = 0; const t = Math.floor(ms / 1000); return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`; };
   const position = () => s.playing ? Math.min(s.duration, s.position + (Date.now() - receivedAt)) : s.position;
@@ -126,6 +143,8 @@
     room = document.createElement("style");
     room.textContent = "body::after { content: ''; display: block; height: 96px; pointer-events: none; }";
 
+    q(".min").onclick = () => setMinimized(true);
+    q(".bubble").onclick = () => setMinimized(false);
     q(".pp").onclick = () => send("toggle");
     q(".next").onclick = () => send("next");
     q(".prev").onclick = () => send("previous");
@@ -181,6 +200,9 @@
     const pp = q(".pp");
     pp.innerHTML = s.playing ? I.pause : I.play;
     pp.title = s.playing ? "Pause" : "Play";
+    const bubble = q(".bubble");
+    bubble.classList.toggle("playing", !!s.playing);
+    bubble.title = s.title ? `${s.title} · ${s.artist}\nShow the Spotify bar` : "Show the Spotify bar";
     q(".shuffle").classList.toggle("on", !!s.shuffle);
     const repeat = q(".repeat");
     repeat.classList.toggle("on", s.repeat !== "off");
@@ -206,8 +228,20 @@
 
   function setVisible(on) {
     visible = on;
-    bar.classList.toggle("off", !on);
-    if (on) document.head?.appendChild(room); else room.remove();
+    layOut();
+  }
+
+  function setMinimized(on) {
+    minimized = on;
+    try { localStorage.setItem(minKey, on ? "1" : "0"); } catch { }
+    layOut();
+  }
+
+  // The bar along the bottom, or only the bubble in the bottom-left corner (no room needed at the end of the page).
+  function layOut() {
+    bar.classList.toggle("off", !visible || minimized);
+    q(".bubble").classList.toggle("off", !visible || !minimized);
+    if (visible && !minimized) document.head?.appendChild(room); else room.remove();
   }
 
   function toast(text) {
