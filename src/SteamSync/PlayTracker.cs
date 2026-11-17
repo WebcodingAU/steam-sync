@@ -21,7 +21,8 @@ internal sealed record RunningGame(string Key, string Name, IReadOnlyList<int> P
 /// over to the real game exe, so the launched process can't simply be timed), or, for a Steam game, inside the folder
 /// of the same name in another Steam library (Neverwinter's launcher patches the game there). A process whose path can't be read
 /// (some anti-cheat-protected games) is matched by exe name against the exes found in each game's folder. Crash
-/// reporters, updaters, installers and anti-cheat services don't count.
+/// reporters, updaters, installers, anti-cheat services, bundled tools like ffmpeg and anything running as a Windows
+/// service (session 0) don't count.
 /// </para>
 /// <para>
 /// A session starts with the first matching process and is reported as running straight away, so the site's
@@ -50,7 +51,9 @@ internal sealed class PlayTracker : IDisposable
 
     private static readonly Regex NotTheGame = new(
         @"^(unins.*|.*crash.*|.*report.*|.*updat.*|.*setup.*|.*install.*|.*redist.*|.*prereq.*|dxsetup|"
-        + @"easyanticheat.*|eac.*|battleye.*|beservice.*|.*_be|gamelaunchhelper|.*helper)\.exe$",
+        + @"easyanticheat.*|eac.*|battleye.*|beservice.*|.*_be|gamelaunchhelper|.*helper|"
+        // Tools games ship a copy of, which other programs run too (RIFT's ffmpeg.exe was matched to a camera recorder's).
+        + @"ffmpeg|ffprobe|ffplay)\.exe$",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     private static readonly string StateFile = Path.Combine(AppInfo.DataDir, "play_sessions.json");
@@ -262,7 +265,11 @@ internal sealed class PlayTracker : IDisposable
             {
                 if (p.Id == self || p.Id <= 4) continue;
                 string processName;
-                try { processName = p.ProcessName; } catch (InvalidOperationException) { continue; }
+                int session;
+                try { processName = p.ProcessName; session = p.SessionId; } catch (InvalidOperationException) { continue; }
+                // Games run on someone's desktop; session 0 is services only, and a service's path is hidden from
+                // us, so its exe name could be mistaken for a game's.
+                if (session == 0) continue;
                 alive.Add(p.Id);
 
                 if (!_pidCache.TryGetValue(p.Id, out var known) || known.Name != processName)
