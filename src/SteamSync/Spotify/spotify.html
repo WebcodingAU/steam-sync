@@ -707,8 +707,17 @@ const showAlbum = guard(async id => {
   v.querySelector("#al-list").appendChild(trackRows(items, { context: a.uri, showAlbum: false, showArt: false }));
 });
 
+// Spotify takes at most 10 per page here for a development-mode app (since February 2026), so follow the pages.
+async function artistAlbums(id) {
+  const all = [];
+  let page = await api(`/artists/${id}/albums`, { query: { include_groups: "album,single", limit: 10 } });
+  all.push(...(page.items || []).filter(Boolean));
+  while (page.next && all.length < 30) { page = await api(page.next); all.push(...(page.items || []).filter(Boolean)); }
+  return { items: all };
+}
+
 const showArtist = guard(async id => {
-  const [a, albums] = await Promise.all([api(`/artists/${id}`), api(`/artists/${id}/albums`, { query: { include_groups: "album,single", limit: 30 } })]);
+  const [a, albums] = await Promise.all([api(`/artists/${id}`), artistAlbums(id)]);
   const v = view(`<div class="hero">${img(a.images) ? `<img src="${esc(img(a.images))}" alt="" style="border-radius:50%">` : `<div class="ph" style="border-radius:50%"></div>`}
     <div><div class="kind">Artist</div><h1>${esc(a.name)}</h1><div class="sub">${esc((a.genres || []).slice(0, 3).join(", "))}</div></div></div>
     <div class="actions"><button class="play-big" id="ar-play" title="Play this artist"><svg><use href="#i-play"/></svg></button></div><h2>Albums and singles</h2>`, "artist:" + id);
