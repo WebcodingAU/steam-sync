@@ -56,6 +56,25 @@ internal sealed class LibraryWindow : Form
     // The player fills the window, behind the site while the glass bar shows and in front when expanded. Behind (not
     // hidden) keeps its page counted as visible, so its timers aren't throttled and the bar stays up to date.
     private readonly Panel _spotifyPanel = new() { Dock = DockStyle.Fill, Visible = false, BackColor = Color.FromArgb(10, 12, 17) };
+    // The title bar follows the site's light/dark switch (html[data-theme="light"] is light, anything else dark), and
+    // starts as it was last time so it doesn't flash light before the page loads.
+    private bool _dark;
+    private const string ThemeScript = """
+        (() => {
+          const hosts = __HOSTS__;
+          if (!window.chrome?.webview || window.top !== window || !hosts.includes(location.hostname.toLowerCase())) return;
+          let last = null;
+          const send = () => {
+            const dark = document.documentElement.getAttribute("data-theme") !== "light";
+            if (dark !== last) { last = dark; chrome.webview.postMessage({ type: "ge-theme", dark }); }
+          };
+          // <html> doesn't exist yet when this runs; the page sets data-theme in its <head>, before this event.
+          document.addEventListener("DOMContentLoaded", () => {
+            new MutationObserver(send).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+            send();
+          });
+        })();
+        """;
     private static readonly Lazy<string> GlassBarScript = new(() =>
     {
         using var script = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream("SteamSync.glassbar.js")!;
@@ -178,6 +197,36 @@ internal sealed class LibraryWindow : Form
         else await _spotify.BarCommandAsync(action, value);
     }
 
+    /// <summary>The site's light/dark switch (ThemeScript): the title bar follows it.</summary>
+    private void OnThemeMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+    {
+        if (!Uri.TryCreate(e.Source, UriKind.Absolute, out var source) || !_siteHosts.Contains(source.Host)) return;
+        JsonObject? message;
+        try { message = JsonNode.Parse(e.WebMessageAsJson) as JsonObject; }
+        catch (JsonException) { return; }
+        if (message is null || (string?)message["type"] != "ge-theme" || message["dark"] is not JsonValue v || !v.TryGetValue<bool>(out var dark)) return;
+        _dark = dark;
+        ApplyTitleBarTheme();
+    }
+
+    private void ApplyTitleBarTheme()
+    {
+        if (!IsHandleCreated) return;
+        var on = _dark ? 1 : 0;
+        DwmSetWindowAttribute(Handle, DwmUseImmersiveDarkMode, ref on, sizeof(int));
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        ApplyTitleBarTheme();
+    }
+
+    private const int DwmUseImmersiveDarkMode = 20;
+
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
     private WebView2 NewWebView()
     {
         var web = new WebView2 { Dock = DockStyle.Fill, DefaultBackgroundColor = Color.FromArgb(10, 12, 17) };
@@ -238,9 +287,11 @@ internal sealed class LibraryWindow : Form
                 Log.Info($"Library page failed to load: {e.WebErrorStatus}");
         };
         core.ProcessFailed += OnProcessFailed;
+        var hosts = JsonSerializer.Serialize(_siteHosts.Select(h => h.ToLowerInvariant()).ToArray());
+        await core.AddScriptToExecuteOnDocumentCreatedAsync(ThemeScript.Replace("__HOSTS__", hosts));
+        core.WebMessageReceived += OnThemeMessage;
         if (_spotify is not null)
         {
-            var hosts = JsonSerializer.Serialize(_siteHosts.Select(h => h.ToLowerInvariant()).ToArray());
             await core.AddScriptToExecuteOnDocumentCreatedAsync(GlassBarScript.Value.Replace("__HOSTS__", hosts));
             core.WebMessageReceived += OnSiteMessage;
         }
@@ -435,6 +486,7 @@ internal sealed class LibraryWindow : Form
             {
                 bounds = new Rectangle(saved.X, saved.Y, Math.Max(saved.Width, 480), Math.Max(saved.Height, 360));
                 maximized = saved.Maximized;
+                _dark = saved.Dark;
             }
         }
         catch (Exception ex) when (ex is IOException or JsonException) { }
@@ -455,7 +507,7 @@ internal sealed class LibraryWindow : Form
         var b = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
         try
         {
-            File.WriteAllText(BoundsFile, JsonSerializer.Serialize(new SavedBounds(b.X, b.Y, b.Width, b.Height, WindowState == FormWindowState.Maximized)));
+            File.WriteAllText(BoundsFile, JsonSerializer.Serialize(new SavedBounds(b.X, b.Y, b.Width, b.Height, WindowState == FormWindowState.Maximized, _dark)));
         }
         catch (IOException) { }
     }
@@ -469,5 +521,5 @@ internal sealed class LibraryWindow : Form
         base.OnFormClosed(e);
     }
 
-    private sealed record SavedBounds(int X, int Y, int Width, int Height, bool Maximized);
+    private sealed record SavedBounds(int X, int Y, int Width, int Height, bool Maximized, bool Dark = false);
 }
