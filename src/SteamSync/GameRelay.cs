@@ -35,6 +35,12 @@ namespace SteamSync;
 /// also be typed into relay.json by hand (UDP-only games, whose peers can't be seen without admin rights).
 /// </para>
 /// <para>
+/// Only where it's faster: each learned server is timed through the relay and direct while the game is connected to
+/// it (StartCheck), and one that's 15 ms or more faster direct leaves the relay once the game is done with it, for 14
+/// days before it's timed again. The relay is in Sydney and its own route to the US is slow, so a US server (a WoW
+/// dungeon with players from other regions) is faster over Starlink. Typed-in ranges always go through the relay.
+/// </para>
+/// <para>
 /// When changes apply: moving a live connection between the direct path and the relay changes the address the server
 /// sees, which drops it. With "Switch mid-game" on (the default, RelaySettings.SwitchMidGame) a newly learned server goes
 /// through the relay straight away, like ExitLag: the game loses that connection once and, if it reconnects by itself,
@@ -57,6 +63,10 @@ internal sealed class GameRelay : IDisposable
     private static readonly TimeSpan StaleHandshake = TimeSpan.FromMinutes(3);
     private static readonly TimeSpan RetryDownAfter = TimeSpan.FromMinutes(5);
     private const int MaxRangesPerGame = 64;
+    // Faster-path check: direct must beat the relay by this much to skip it, and a verdict is trusted this long.
+    private const int DirectMarginMs = 15;
+    private static readonly TimeSpan CheckValidFor = TimeSpan.FromDays(14);
+    private static readonly TimeSpan CheckRetryAfter = TimeSpan.FromMinutes(2);
 
     public static string SettingsFile { get; } = Path.Combine(AppInfo.DataDir, "relay.json");
     private static string PackagedHelper => Path.Combine(AppContext.BaseDirectory, HelperExeName);
@@ -71,6 +81,11 @@ internal sealed class GameRelay : IDisposable
     private readonly Dictionary<(int Pid, uint Remote, int Port), DateTimeOffset> _firstSeen = [];
     private readonly UdpPeers _udp = new();      // the games' UDP servers (raids), which the TCP table can't show
     private HashSet<string> _liveUdp = [];        // /24s the running games have a live UDP flow with, as of the last Learn
+    // The running games' TCP servers by /24 (any age), as of the last Learn: what the faster-path check times, and what
+    // keeps a range found faster direct on the relay until the game is done with it.
+    private Dictionary<string, (string GameKey, uint Remote, int Port)> _held = [];
+    private readonly Dictionary<string, DateTimeOffset> _checkTried = new(StringComparer.Ordinal);
+    private Task? _checking;
     private List<string>? _applied;          // the ranges last sent with "up"; null = down or not known yet
     private DateTimeOffset _upSince, _lastHealth = DateTimeOffset.MinValue, _downUntil = DateTimeOffset.MinValue;
     private int _ticking;
@@ -786,6 +801,7 @@ internal sealed class GameRelay : IDisposable
         {
             var running = _play.Running;
             Learn(running);
+            StartCheck();
             if (running.Count == 0 || _settings.SwitchMidGame) await ApplyAsync();
             Pending = running.Count > 0 && !_settings.SwitchMidGame && !DesiredRanges().SequenceEqual(_applied ?? []);
             await SyncDuplicateAsync();
@@ -844,6 +860,7 @@ internal sealed class GameRelay : IDisposable
     {
         var now = DateTimeOffset.UtcNow;
         var seen = new HashSet<(int, uint, int)>();
+        var held = new Dictionary<string, (string, uint, int)>(StringComparer.Ordinal);
         var changed = false;
         if (running.Count > 0)
         {
@@ -854,6 +871,7 @@ internal sealed class GameRelay : IDisposable
                 if (!byPid.TryGetValue(row.Pid, out var game) || !IsPublic(row.Remote) || NotLearnedPorts.Contains(row.RemotePort) || IsLauncher(row.Pid) || OnRelayServer(row.Remote)) continue;
                 var key = (row.Pid, row.Remote, row.RemotePort);
                 seen.Add(key);
+                held.TryAdd(Slash24(row.Remote), (game.Key, row.Remote, row.RemotePort));
                 if (!_firstSeen.TryGetValue(key, out var first)) _firstSeen[key] = first = now;
                 if (now - first < (_settings.SwitchMidGame ? LearnAfterMidGame : LearnAfter)) continue;
                 lock (_gate)
@@ -891,18 +909,87 @@ internal sealed class GameRelay : IDisposable
             _liveUdp = live;
         }
         else _liveUdp = [];
+        _held = held;
         foreach (var gone in _firstSeen.Keys.Where(k => !seen.Contains(k)).ToList()) _firstSeen.Remove(gone);
         if (running.Count == 0) lock (_launchers) _launchers.Clear(); // pids get reused
         if (changed) lock (_gate) SaveSettings();
     }
 
-    /// <summary>The relayed games' ranges, sorted.</summary>
+    /// <summary>The relayed games' ranges, sorted: typed-in ones always, learned ones unless found faster direct.</summary>
     private List<string> DesiredRanges()
     {
         lock (_gate)
         {
-            return _settings.Games.Values.Where(g => g.Enabled).SelectMany(g => g.Ranges.Union(g.Learned))
+            return _settings.Games.Values.Where(g => g.Enabled).SelectMany(g => g.Ranges.Union(g.Learned.Where(r => !FasterDirect(g, r))))
                 .Where(r => Cidr.TryParse(r, out _)).Distinct().OrderBy(r => r, StringComparer.Ordinal).ToList();
+        }
+    }
+
+    /// <summary>A learned range timed recently and found faster without the relay (under _gate).</summary>
+    private static bool FasterDirect(RelayGame g, string range) =>
+        !g.Ranges.Contains(range) && g.Checked.TryGetValue(range, out var c) && c.Direct && DateTimeOffset.UtcNow - c.At < CheckValidFor;
+
+    /// <summary>
+    /// Times one server the games are connected to through the relay and direct, when its range goes through the relay
+    /// now and hasn't been timed in the last CheckValidFor: three rounds of the best of 3 TCP handshakes to the game's
+    /// own port each way, interleaved, medians compared. Direct by DirectMarginMs or more takes the range off the relay
+    /// (a US dungeon server from Sydney: the Linode's own route to the US is ~120 ms slower than Starlink's). It runs in
+    /// the background, one at a time; ApplyAsync keeps the range on the relay until the game lets go of it.
+    /// </summary>
+    private void StartCheck()
+    {
+        if (_checking is { IsCompleted: false } || _applied is not { } applied || Probe.DefaultSource() is not { } direct) return;
+        var now = DateTimeOffset.UtcNow;
+        (string Range, string GameKey, uint Remote, int Port)? pick = null;
+        lock (_gate)
+        {
+            foreach (var (range, (key, remote, port)) in _held)
+            {
+                if (!applied.Contains(range) || !_settings.Games.TryGetValue(key, out var g) || !g.Learned.Contains(range) || g.Ranges.Contains(range)) continue;
+                if (g.Checked.TryGetValue(range, out var c) && now - c.At < CheckValidFor) continue;
+                if (_checkTried.TryGetValue(range, out var tried) && now - tried < CheckRetryAfter) continue;
+                pick = (range, key, remote, port);
+                break;
+            }
+        }
+        if (pick is not { } p) return;
+        _checkTried[p.Range] = now;
+        _checking = Task.Run(() => CheckAsync(p.Range, p.GameKey, new IPAddress(p.Remote), p.Port, direct));
+    }
+
+    private async Task CheckAsync(string range, string gameKey, IPAddress server, int port, IPAddress direct)
+    {
+        try
+        {
+            var relayed = new List<int>();
+            var straight = new List<int>();
+            for (var round = 0; round < 3; round++)
+            {
+                if (await Probe.BestHandshakeAsync(server, port, source: null) is { } r) relayed.Add(r); // routed: through the tunnel
+                if (await Probe.BestHandshakeAsync(server, port, direct) is { } d) straight.Add(d);
+                await Task.Delay(1000);
+            }
+            if (relayed.Count < 2 || straight.Count < 2) return; // no verdict; tried again after CheckRetryAfter
+            int relayMs = Median(relayed), directMs = Median(straight);
+            var directWins = directMs + DirectMarginMs <= relayMs;
+            lock (_gate)
+            {
+                if (!_settings.Games.TryGetValue(gameKey, out var g) || !g.Learned.Contains(range)) return;
+                g.Checked[range] = new RangeCheck { Direct = directWins, RelayMs = relayMs, DirectMs = directMs, At = DateTimeOffset.UtcNow };
+                SaveSettings();
+                Log.Info($"Relay: {range} ({g.Name}, {server}:{port}) {relayMs} ms through the relay, {directMs} ms direct; "
+                    + (directWins ? "goes direct once the game is done with it" : "stays on the relay"));
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Relay: timing {range} failed", ex);
+        }
+
+        static int Median(List<int> values)
+        {
+            var sorted = values.Order().ToList();
+            return sorted[sorted.Count / 2];
         }
     }
 
@@ -914,8 +1001,14 @@ internal sealed class GameRelay : IDisposable
         // reconnect like a TCP session): a range with one keeps its current path until that flow goes quiet.
         var live = _liveUdp;
         var desired = DesiredRanges();
+        // The same for a range just found faster direct: it leaves the relay once the game holds no connection there,
+        // so the check never drops a dungeon or match in progress.
+        var held = _held;
+        HashSet<string> wentDirect;
+        lock (_gate) wentDirect = _settings.Games.Values.SelectMany(g => g.Learned.Where(r => FasterDirect(g, r))).ToHashSet(StringComparer.Ordinal);
         var ranges = desired.Where(r => !live.Contains(r) || (_applied?.Contains(r) ?? false))
-            .Union((_applied ?? []).Where(live.Contains)).Distinct().OrderBy(r => r, StringComparer.Ordinal).ToList();
+            .Union((_applied ?? []).Where(r => live.Contains(r) || (held.ContainsKey(r) && wentDirect.Contains(r))))
+            .Distinct().OrderBy(r => r, StringComparer.Ordinal).ToList();
         if (ranges.Count == 0)
         {
             if (_applied is not null || Status.StartsWith("Relay: starting"))
@@ -1222,6 +1315,18 @@ internal sealed class RelayGame
     [JsonIgnore] public bool Enabled => !Excluded;
     public List<string> Ranges { get; set; } = [];
     public List<string> Learned { get; set; } = [];
+    /// <summary>Learned ranges timed both ways (GameRelay.CheckAsync), by range.</summary>
+    public Dictionary<string, RangeCheck> Checked { get; set; } = new(StringComparer.Ordinal);
+}
+
+/// <summary>A learned range timed through the relay and direct: the medians, and whether direct won by enough to skip
+/// the relay for it.</summary>
+internal sealed class RangeCheck
+{
+    public bool Direct { get; set; }
+    public int RelayMs { get; set; }
+    public int DirectMs { get; set; }
+    public DateTimeOffset At { get; set; }
 }
 
 /// <summary>An IPv4 range like 66.40.178.0/24, compared against addresses in network byte order.</summary>
@@ -1364,6 +1469,15 @@ internal static class Probe
     public static async Task<int?> TimeAsync(IPAddress target, int port, IPAddress? source)
     {
         if (await Task.Run(() => Icmp(target, source)) is { } ms) return ms;
+        int? best = null;
+        for (var i = 0; i < 3; i++)
+            if (await TcpHandshakeAsync(target, port, source) is { } t && (best is null || t < best)) best = t;
+        return best;
+    }
+
+    /// <summary>The best of 3 TCP handshakes to the port from the source (null: wherever it's routed), or null.</summary>
+    public static async Task<int?> BestHandshakeAsync(IPAddress target, int port, IPAddress? source)
+    {
         int? best = null;
         for (var i = 0; i < 3; i++)
             if (await TcpHandshakeAsync(target, port, source) is { } t && (best is null || t < best)) best = t;
