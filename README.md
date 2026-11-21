@@ -42,8 +42,9 @@ The engine is read-only once built, so it can answer from any thread; to change 
   `Scriptlets`).
 - `tests/AdVoid.Tests`: `dotnet test AdVoid.slnx`.
 
-Gaming Enjoyer (`C:\Repos\steam-sync`) references `src/AdVoid/AdVoid.csproj` by path, so this repo has to sit next to
-it in `C:\Repos`.
+Gaming Enjoyer (`C:\Repos\steam-sync`) carries a copy of this repo in its `advoid/` folder as a git subtree, so its
+GitHub build has the engine. After committing here, update the copy from steam-sync with
+`git subtree pull --prefix=advoid C:/Repos/advoid main`.
 
 ## Where it goes next
 
