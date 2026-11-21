@@ -54,7 +54,13 @@ public sealed partial class TwitchAds(HttpClient http)
     /// <summary>Called with a line worth logging (an ad break starting or ending, a failed backup).</summary>
     public Action<string>? Log { get; set; }
 
-    /// <summary>What kind of Twitch playlist <paramref name="url"/> is; only these need <see cref="FetchAsync"/>.</summary>
+    /// <summary>
+    /// What kind of Twitch playlist <paramref name="url"/> is; only these need <see cref="FetchAsync"/>. Media playlists
+    /// are known from the master playlists that listed them (some are on cloudfront.net, not ttvnw.net).
+    /// </summary>
+    public PlaylistKind Kind(string url) => _known.ContainsKey(url) ? PlaylistKind.Media : Classify(url);
+
+    /// <summary>What kind of Twitch playlist <paramref name="url"/> looks like from its address alone.</summary>
     public static PlaylistKind Classify(string url)
     {
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps) return PlaylistKind.None;
@@ -75,7 +81,7 @@ public sealed partial class TwitchAds(HttpClient http)
     /// </summary>
     public async Task<PlaylistResponse> FetchAsync(string url, IEnumerable<KeyValuePair<string, string>> requestHeaders, CancellationToken cancel = default)
     {
-        var kind = Classify(url);
+        var kind = Kind(url);
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         foreach (var (name, value) in requestHeaders)
         {
