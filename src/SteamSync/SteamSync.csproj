@@ -56,9 +56,9 @@
     <Exec Command="&quot;$(ZigExe)&quot; cc -target x86_64-windows-gnu -O2 -fno-sanitize=undefined -shared -o &quot;$(LimiterDll)&quot; limiter\limiter.c -ladvapi32" EnvironmentVariables="ZIG_GLOBAL_CACHE_DIR=$(ZigDir)\cache;ZIG_LOCAL_CACHE_DIR=$(ZigDir)\cache" />
   </Target>
 
-  <!-- AdVoid, the user's own ad-block engine (its own repo, next to this one in C:\Repos), for the YouTube window. -->
+  <!-- AdVoid, the user's own ad-block engine, for the YouTube window: a git subtree of C:\Repos\advoid in advoid/. -->
   <ItemGroup>
-    <ProjectReference Include="..\..\..\advoid\src\AdVoid\AdVoid.csproj" />
+    <ProjectReference Include="..\..\advoid\src\AdVoid\AdVoid.csproj" />
   </ItemGroup>
 
   <ItemGroup>
