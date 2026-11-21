@@ -1,48 +1,79 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using AdVoid;
+using AdVoid.Twitch;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 using Microsoft.Win32;
 
 namespace SteamSync;
 
-/// <summary>
-/// A YouTube window (the tray's "Open YouTube"), for guides on a second monitor without a browser open. It has its own
-/// WebView2 profile (its own YouTube sign-in) and blocks ads with AdVoid: every request is checked by the engine
-/// (WebResourceRequested), each page gets its element-hiding CSS, and AdVoid's YouTube script removes the video ads
-/// YouTube schedules inside the video's own data. Only YouTube and Google's sign-in pages open here; other links go
-/// to the default browser. It remembers where it was (the second monitor the first time there is one), and the
-/// title bar's menu has "Keep on top". Closing it ends its browser engine.
-/// </summary>
-internal sealed class YouTubeWindow : Form
+/// <summary>A site the tray can open in its own window: YouTube or Twitch.</summary>
+/// <param name="Sites">Registrable domains that stay in the window; any other link opens in the default browser.</param>
+/// <param name="GoogleSignIn">Google's sign-in and consent pages stay in the window too (YouTube accounts).</param>
+/// <param name="TwitchStreams">Live stream playlists go through AdVoid's Twitch ad remover.</param>
+internal sealed record WatchSite(string Name, string Home, Color Background, string[] Sites, bool GoogleSignIn, bool TwitchStreams)
 {
-    private static readonly string ProfileDir = Path.Combine(AppInfo.DataDir, "WebView2-YouTube");
-    private static readonly string BoundsFile = Path.Combine(AppInfo.DataDir, "youtube-window.json");
-    private static readonly Uri Home = new("https://www.youtube.com/");
+    public static readonly WatchSite YouTube = new("YouTube", "https://www.youtube.com/", Color.FromArgb(15, 15, 15),
+        ["youtube.com", "youtu.be", "youtube-nocookie.com", "ytimg.com", "googlevideo.com"], GoogleSignIn: true, TwitchStreams: false);
+
+    public static readonly WatchSite Twitch = new("Twitch", "https://www.twitch.tv/", Color.FromArgb(14, 14, 16),
+        ["twitch.tv", "ttvnw.net", "jtvnw.net", "twitchcdn.net", "twitchsvc.net"], GoogleSignIn: false, TwitchStreams: true);
+
+    public bool IsInApp(Uri uri)
+    {
+        var site = Domains.Registrable(uri.Host.ToLowerInvariant());
+        return Sites.Contains(site)
+            || GoogleSignIn && site.StartsWith("google.", StringComparison.Ordinal); // sign-in and consent pages (google.com, google.com.au, ...)
+    }
+}
+
+/// <summary>
+/// A YouTube or Twitch window (the tray's "Open YouTube" / "Open Twitch"), for guides and streams on a second monitor
+/// without a browser open. Each site has its own WebView2 profile (its own sign-in) and blocks ads with AdVoid: every
+/// request is checked by the engine (WebResourceRequested), each page gets its element-hiding CSS, AdVoid's YouTube
+/// script removes the video ads YouTube schedules inside the video's own data, and on Twitch the stream's playlists go
+/// through AdVoid's Twitch ad remover, which swaps in an ad-free copy of the stream during ad breaks. Only the site's
+/// own pages open here; other links go to the default browser. It remembers where it was (the second monitor the first
+/// time there is one), and the title bar's menu has "Keep on top". Closing it ends its browser engine.
+/// </summary>
+internal sealed class WatchWindow : Form
+{
     private const string BrowserArguments = "--disable-sync --no-first-run --disable-default-apps "
         + "--disable-features=Translate,OptimizationHints,MediaRouter,msSmartScreenProtection,msEdgeShoppingAssistant,msShowSearchInSidebar";
 
-    private readonly WebView2 _web = new() { Dock = DockStyle.Fill, DefaultBackgroundColor = Color.FromArgb(15, 15, 15) };
+    private readonly WatchSite _site;
+    private readonly string _profileDir;
+    private readonly string _boundsFile;
+    private readonly WebView2 _web;
     private readonly System.Windows.Forms.Timer _titleTimer = new() { Interval = 1000 };
-    private string _pageTitle = "YouTube";
-    private string _page = Home.AbsoluteUri;       // the top page, for third-party checks and $domain= options
+    private string _pageTitle;
+    private string _page;                          // the top page, for third-party checks and $domain= options
     private string? _navigatingTo;                 // the top-level document being loaded (never blocked)
     private long _blockedHere;
+    private int _adBreaksHere;                     // Twitch ad breaks skipped in this window
+    private bool _inAdBreak;
+    private bool _playlistErrorLogged;
     private bool _fullScreen;
     private FormWindowState _stateBeforeFullScreen;
 
-    private static bool _open;
-    /// <summary>A YouTube window is open (the tray process stays out of Efficiency mode meanwhile, see Efficiency.Held).</summary>
-    public static bool IsOpen => _open;
+    // Open windows: while any is, the tray process stays out of Efficiency mode (see Efficiency.Held).
+    private static int _openCount;
 
-    public YouTubeWindow()
+    public WatchWindow(WatchSite site)
     {
-        Text = "YouTube";
+        _site = site;
+        _profileDir = Path.Combine(AppInfo.DataDir, "WebView2-" + site.Name);
+        _boundsFile = Path.Combine(AppInfo.DataDir, site.Name.ToLowerInvariant() + "-window.json");
+        _web = new WebView2 { Dock = DockStyle.Fill, DefaultBackgroundColor = site.Background };
+        _pageTitle = site.Name;
+        _page = site.Home;
+        Text = site.Name;
         Icon = AppInfo.LoadIcon();
-        BackColor = Color.FromArgb(15, 15, 15);
+        BackColor = site.Background;
         MinimumSize = new Size(400, 260);
         StartPosition = FormStartPosition.Manual;
         LoadBounds();
@@ -60,20 +91,20 @@ internal sealed class YouTubeWindow : Form
 
     private async Task InitAsync()
     {
-        _open = true;
+        _openCount++;
         Efficiency.Held = true;
         Efficiency.SetSelf(false); // the engine's request checks run on this process's UI thread: never at idle priority
         AdBlocker.EnsureStarted();
         try
         {
             var options = new CoreWebView2EnvironmentOptions(BrowserArguments) { AreBrowserExtensionsEnabled = false };
-            var env = await CoreWebView2Environment.CreateAsync(null, ProfileDir, options);
+            var env = await CoreWebView2Environment.CreateAsync(null, _profileDir, options);
             await _web.EnsureCoreWebView2Async(env);
         }
         catch (Exception ex)
         {
-            Log.Error("YouTube window could not start", ex);
-            MessageBox.Show(this, $"The YouTube window could not start: {ex.Message}", AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log.Error($"{_site.Name} window could not start", ex);
+            MessageBox.Show(this, $"The {_site.Name} window could not start: {ex.Message}", AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             Close();
             return;
         }
@@ -87,9 +118,9 @@ internal sealed class YouTubeWindow : Form
         core.Settings.AreDevToolsEnabled = false;
 #endif
         core.NavigationStarting += OnNavigationStarting;
-        core.SourceChanged += (_, _) => { _page = core.Source; _navigatingTo = null; };
+        core.SourceChanged += (_, _) => { _page = core.Source; _navigatingTo = null; _inAdBreak = false; }; // a new channel starts its own break, if any
         core.NewWindowRequested += OnNewWindowRequested;
-        core.DocumentTitleChanged += (_, _) => { _pageTitle = string.IsNullOrWhiteSpace(core.DocumentTitle) ? "YouTube" : core.DocumentTitle; UpdateTitle(); };
+        core.DocumentTitleChanged += (_, _) => { _pageTitle = string.IsNullOrWhiteSpace(core.DocumentTitle) ? _site.Name : core.DocumentTitle; UpdateTitle(); };
         core.ContainsFullScreenElementChanged += (_, _) => SetFullScreen(core.ContainsFullScreenElement);
         core.WebMessageReceived += OnWebMessage;
 
@@ -100,9 +131,9 @@ internal sealed class YouTubeWindow : Form
         core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All, CoreWebView2WebResourceRequestSourceKinds.All);
         core.WebResourceRequested += OnWebResourceRequested;
 
-        Log.Info($"YouTube window opened (WebView2 {core.Environment.BrowserVersionString})");
+        Log.Info($"{_site.Name} window opened (WebView2 {core.Environment.BrowserVersionString})");
         _titleTimer.Start();
-        core.Navigate(Home.AbsoluteUri);
+        core.Navigate(_site.Home);
     }
 
     // Asks the host for the page's hiding CSS once the document exists, and adds it as a stylesheet. Also hides the
@@ -144,6 +175,11 @@ internal sealed class YouTubeWindow : Form
     private void OnWebResourceRequested(object? sender, CoreWebView2WebResourceRequestedEventArgs e)
     {
         var url = e.Request.Uri;
+        if (_site.TwitchStreams && e.Request.Method == "GET" && AdBlocker.Twitch.Kind(url) != PlaylistKind.None)
+        {
+            _ = AnswerPlaylistAsync(e, url);
+            return;
+        }
         var type = e.ResourceContext switch
         {
             // The page being opened is never blocked; any other document is an iframe.
@@ -166,21 +202,45 @@ internal sealed class YouTubeWindow : Form
         AdBlocker.CountBlocked();
     }
 
+    // A Twitch stream playlist: fetched by AdVoid's Twitch ad remover, which answers with the playlist as it is, or with
+    // an ad-free copy (or the ad cut out) during an ad break. If fetching fails, the request goes ahead normally.
+    private async Task AnswerPlaylistAsync(CoreWebView2WebResourceRequestedEventArgs e, string url)
+    {
+        using var deferral = e.GetDeferral();
+        try
+        {
+            var headers = e.Request.Headers.Select(h => new KeyValuePair<string, string>(h.Key, h.Value)).ToList();
+            var answer = await AdBlocker.Twitch.FetchAsync(url, headers);
+            if (IsDisposed || _web.CoreWebView2 is null) return;
+            var body = new MemoryStream(Encoding.UTF8.GetBytes(answer.Body));
+            var headerText = string.Join("\r\n", answer.Headers.Select(h => $"{h.Key}: {h.Value}"));
+            e.Response = _web.CoreWebView2.Environment.CreateWebResourceResponse(body, answer.Status, answer.Reason, headerText);
+            if (AdBlocker.Twitch.Kind(url) != PlaylistKind.Media) return;
+            var inBreak = answer.Action != PlaylistAction.None;
+            if (inBreak && !_inAdBreak) _adBreaksHere++;
+            _inAdBreak = inBreak;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or IOException or COMException or InvalidOperationException)
+        {
+            if (!_playlistErrorLogged) Log.Error("Twitch: fetching a stream playlist failed; letting it through", ex);
+            _playlistErrorLogged = true;
+        }
+        finally { deferral.Complete(); }
+    }
+
     private void UpdateTitle()
     {
-        var text = _blockedHere > 0 ? $"{_pageTitle} · AdVoid blocked {_blockedHere:N0}" : _pageTitle;
+        var parts = new List<string> { _pageTitle };
+        if (_blockedHere > 0) parts.Add($"AdVoid blocked {_blockedHere:N0}");
+        if (_inAdBreak) parts.Add("skipping an ad break");
+        else if (_adBreaksHere > 0) parts.Add(_adBreaksHere == 1 ? "1 ad break skipped" : $"{_adBreaksHere} ad breaks skipped");
+        var text = string.Join(" · ", parts);
         if (Text != text) Text = text;
     }
 
     // ---- what stays in the window ----
 
-    private static bool IsInApp(Uri uri)
-    {
-        var host = uri.Host.ToLowerInvariant();
-        var site = Domains.Registrable(host);
-        return site is "youtube.com" or "youtu.be" or "youtube-nocookie.com" or "ytimg.com" or "googlevideo.com"
-            || site.StartsWith("google.", StringComparison.Ordinal); // sign-in and consent pages (google.com, google.com.au, ...)
-    }
+    private bool IsInApp(Uri uri) => _site.IsInApp(uri);
 
     private void OnNavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
     {
@@ -196,7 +256,7 @@ internal sealed class YouTubeWindow : Form
 
     private void OnNewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
     {
-        e.Handled = true; // never a second browser window: YouTube links open here, anything else in the default browser
+        e.Handled = true; // never a second browser window: the site's links open here, anything else in the default browser
         if (Uri.TryCreate(e.Uri, UriKind.Absolute, out var uri) && IsInApp(uri)) _web.CoreWebView2.Navigate(uri.AbsoluteUri);
         else if (uri is not null && (uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeHttp)) OpenExternally(uri.AbsoluteUri);
     }
@@ -235,7 +295,7 @@ internal sealed class YouTubeWindow : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        // Dark title bar when Windows' apps are dark (YouTube follows the same setting).
+        // Dark title bar when Windows' apps are dark (YouTube and Twitch follow it too).
         var dark = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme", 1) is 0;
         var on = dark ? 1 : 0;
         DwmSetWindowAttribute(Handle, 20, ref on, sizeof(int));
@@ -262,7 +322,7 @@ internal sealed class YouTubeWindow : Form
     private void LoadBounds()
     {
         SavedBounds? saved = null;
-        try { if (File.Exists(BoundsFile)) saved = JsonSerializer.Deserialize<SavedBounds>(File.ReadAllText(BoundsFile)); }
+        try { if (File.Exists(_boundsFile)) saved = JsonSerializer.Deserialize<SavedBounds>(File.ReadAllText(_boundsFile)); }
         catch (Exception ex) when (ex is IOException or JsonException) { }
 
         var bounds = saved is null ? Rectangle.Empty : new Rectangle(saved.X, saved.Y, Math.Max(saved.Width, 400), Math.Max(saved.Height, 260));
@@ -283,7 +343,7 @@ internal sealed class YouTubeWindow : Form
     {
         if (_fullScreen) return;
         var b = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
-        try { File.WriteAllText(BoundsFile, JsonSerializer.Serialize(new SavedBounds(b.X, b.Y, b.Width, b.Height, WindowState == FormWindowState.Maximized, TopMost))); }
+        try { File.WriteAllText(_boundsFile, JsonSerializer.Serialize(new SavedBounds(b.X, b.Y, b.Width, b.Height, WindowState == FormWindowState.Maximized, TopMost))); }
         catch (IOException) { }
     }
 
@@ -291,10 +351,14 @@ internal sealed class YouTubeWindow : Form
     {
         _titleTimer.Dispose();
         _web.Dispose(); // ends this window's browser processes
-        _open = false;
-        Efficiency.Held = false;
-        Efficiency.SetSelf(true);
-        Log.Info($"YouTube window closed; AdVoid blocked {_blockedHere:N0} request(s) in it");
+        _openCount = Math.Max(0, _openCount - 1);
+        if (_openCount == 0)
+        {
+            Efficiency.Held = false;
+            Efficiency.SetSelf(true);
+        }
+        var breaks = _site.TwitchStreams ? $", {_adBreaksHere} ad break(s) skipped" : "";
+        Log.Info($"{_site.Name} window closed; AdVoid blocked {_blockedHere:N0} request(s) in it{breaks}");
         base.OnFormClosed(e);
     }
 

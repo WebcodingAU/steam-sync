@@ -138,22 +138,28 @@ It needs Spotify Premium; that's Spotify's rule for the SDK.
   - artists have no top tracks;
   - at most five accounts can use the Client ID.
 
-## YouTube window
+## YouTube and Twitch windows
 
-**Open YouTube** in the tray menu opens YouTube in its own window (`YouTubeWindow.cs`), for guides on a second
-monitor without a browser open. It has its own WebView2 profile (`%LOCALAPPDATA%\SteamSync\WebView2-YouTube`, so its
-own YouTube sign-in), opens on the second monitor the first time and then where it was left (`youtube-window.json`),
-and has **Keep on top** in the title bar's menu (right-click the title bar). F11 is full screen. Only YouTube and
-Google's sign-in pages open in it; other links go to the default browser. The page's scrollbar is hidden. Closing
-the window ends its browser engine.
+**Open YouTube** and **Open Twitch** in the tray menu open the site in its own window (`WatchWindow.cs`; `WatchSite`
+says what differs per site), for guides and streams on a second monitor without a browser open. Each site has its own
+WebView2 profile (`%LOCALAPPDATA%\SteamSync\WebView2-YouTube` / `WebView2-Twitch`, so its own sign-in), opens on the
+second monitor the first time and then where it was left (`youtube-window.json` / `twitch-window.json`), and has
+**Keep on top** in the title bar's menu (right-click the title bar). F11 is full screen. Only the site's own pages (and
+Google's sign-in pages, for YouTube) open in it; other links go to the default browser. The page's scrollbar is
+hidden. Closing a window ends its browser engine.
 
 Ads are blocked by **AdVoid**, the user's own engine. It's developed in its own repo (`C:\Repos\advoid`) and copied
-into `advoid/` here as a git subtree, so this repo builds on its own. `AdBlocker.cs` keeps EasyList and EasyPrivacy in `%LOCALAPPDATA%\SteamSync\AdVoid` (fetched
-from their publishers, refreshed when 4 days old) and shares one engine across windows. The window checks every
-request with it (`WebResourceRequested`), adds each page's element-hiding CSS, and runs AdVoid's YouTube script,
-which removes the video ads YouTube schedules inside the video's own data. The title shows how many requests were
-blocked. While the window is open the tray process stays out of Efficiency mode (`Efficiency.Held`), because the
-request checks run on its UI thread.
+into `advoid/` here as a git subtree, so this repo builds on its own. `AdBlocker.cs` keeps EasyList and EasyPrivacy in
+`%LOCALAPPDATA%\SteamSync\AdVoid` (fetched from their publishers, refreshed when 4 days old) and shares one engine
+across windows. The window checks every request with it (`WebResourceRequested`), adds each page's element-hiding CSS,
+and runs AdVoid's YouTube script, which removes the video ads YouTube schedules inside the video's own data.
+
+Twitch splices its ads into the live stream's playlist instead, so the Twitch window answers the player's playlist
+requests itself through AdVoid's `TwitchAds` (`AdBlocker.Twitch`): during an ad break the player gets the same quality
+from Twitch's ad-free `embed` copy of the stream (then `popout`, then the 360p `autoplay`), or the ad cut out if every
+copy has it. A break lasts about a minute (the ad, then its segments scrolling out of the playlist); the log notes each
+one. The title shows how many requests were blocked and ad breaks skipped. While a window is open the tray process
+stays out of Efficiency mode (`Efficiency.Held`), because the request checks run on its UI thread.
 
 ## PC load (beta builds only)
 

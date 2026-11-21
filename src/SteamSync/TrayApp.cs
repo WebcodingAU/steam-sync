@@ -38,7 +38,7 @@ internal sealed class TrayApp : ApplicationContext
     private readonly Updater _updater = new();
     private readonly ToolStripMenuItem _updateItem = new() { Visible = false };
     private LibraryWindow? _library;
-    private YouTubeWindow? _youtube;
+    private readonly Dictionary<WatchSite, WatchWindow> _watch = [];
     private EqualizerWindow? _eqWindow;
     private readonly System.Windows.Forms.Timer _limiterWatch = new() { Interval = 30_000 };
     private readonly Dictionary<SyncState, Icon> _icons = new()
@@ -94,7 +94,8 @@ internal sealed class TrayApp : ApplicationContext
         menu.Items.AddRange(
         [
             new ToolStripMenuItem("Open Library", null, (_, _) => OpenLibrary()) { Font = new Font(menu.Font, FontStyle.Bold) },
-            new ToolStripMenuItem("Open YouTube", null, (_, _) => OpenYouTube()) { ToolTipText = "YouTube in its own window, with AdVoid blocking ads" },
+            new ToolStripMenuItem("Open YouTube", null, (_, _) => OpenWatch(WatchSite.YouTube)) { ToolTipText = "YouTube in its own window, with AdVoid blocking ads" },
+            new ToolStripMenuItem("Open Twitch", null, (_, _) => OpenWatch(WatchSite.Twitch)) { ToolTipText = "Twitch in its own window, with AdVoid skipping stream ads" },
             _spotifyItem,
             new ToolStripSeparator(),
             _statusItem,
@@ -174,20 +175,21 @@ internal sealed class TrayApp : ApplicationContext
         _library.Activate();
     }
 
-    /// <summary>Shows the YouTube window (one at a time), starting its browser engine only now.</summary>
-    private void OpenYouTube()
+    /// <summary>Shows the site's window (one per site), starting its browser engine only now.</summary>
+    private void OpenWatch(WatchSite site)
     {
-        if (_youtube is null || _youtube.IsDisposed)
+        if (!_watch.TryGetValue(site, out var window) || window.IsDisposed)
         {
-            _youtube = new YouTubeWindow();
-            _youtube.FormClosed += (_, _) => _youtube = null;
-            _youtube.Show();
+            window = new WatchWindow(site);
+            _watch[site] = window;
+            window.FormClosed += (_, _) => _watch.Remove(site);
+            window.Show();
         }
-        else if (_youtube.WindowState == FormWindowState.Minimized)
+        else if (window.WindowState == FormWindowState.Minimized)
         {
-            _youtube.WindowState = FormWindowState.Normal;
+            window.WindowState = FormWindowState.Normal;
         }
-        _youtube.Activate();
+        window.Activate();
     }
 
     private void Render(SyncStatus s)

@@ -1,10 +1,11 @@
 using AdVoid;
+using AdVoid.Twitch;
 
 namespace SteamSync;
 
 /// <summary>
 /// The app's ad blocker: AdVoid (the user's own engine, C:\Repos\advoid) with EasyList and EasyPrivacy, shared by every
-/// window that browses other sites (the YouTube window). The lists live in %LocalAppData%\SteamSync\AdVoid; they're
+/// window that browses other sites (the YouTube and Twitch windows), plus AdVoid's Twitch stream ad remover. The lists live in %LocalAppData%\SteamSync\AdVoid; they're
 /// read on a worker thread when first needed and refreshed from their publishers when 4 days old (checked at start
 /// and every 12 hours). Until the first download, AdVoid's own YouTube ad remover and a few big ad hosts still apply.
 /// </summary>
@@ -25,6 +26,14 @@ internal static class AdBlocker
     private static Task? _loading;
     private static System.Threading.Timer? _timer;
     private static long _blocked;
+
+    private static readonly HttpClient TwitchHttp = new(new SocketsHttpHandler { PooledConnectionLifetime = TimeSpan.FromMinutes(5), AutomaticDecompression = System.Net.DecompressionMethods.All })
+    {
+        Timeout = TimeSpan.FromSeconds(10),
+    };
+
+    /// <summary>Twitch's stream ads: the Twitch window routes the stream's playlists through this.</summary>
+    public static readonly TwitchAds Twitch = new(TwitchHttp) { Log = line => SteamSync.Log.Info(line) };
 
     /// <summary>The current engine (swapped whole when lists change, so readers never see a half-built one).</summary>
     public static FilterEngine Engine => _engine;
