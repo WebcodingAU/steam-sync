@@ -35,6 +35,7 @@ internal sealed class SpotifyAuth
     private readonly SemaphoreSlim _gate = new(1, 1);
     private string? _accessToken;
     private DateTimeOffset _expires;
+    private DateTimeOffset _renewedAt = DateTimeOffset.MinValue;
 
     public SpotifyAuth(string clientId) => _clientId = clientId;
 
@@ -42,13 +43,17 @@ internal sealed class SpotifyAuth
     public static bool HasStoredSignIn => File.Exists(TokenFile);
 
     /// <summary>A valid access token, refreshed when it's within a minute of expiring, with its expiry. Null when the
-    /// user isn't signed in or Spotify refused the refresh (then the stored sign-in is forgotten).</summary>
-    public async Task<(string Token, DateTimeOffset Expires)?> GetTokenAsync()
+    /// user isn't signed in or Spotify refused the refresh (then the stored sign-in is forgotten). Fresh: the player
+    /// had the current one refused (401, or 404 on a lookup that works after a restart), so get a new one now, at most
+    /// once every 30 seconds.</summary>
+    public async Task<(string Token, DateTimeOffset Expires)?> GetTokenAsync(bool fresh = false)
     {
         await _gate.WaitAsync();
         try
         {
-            if (_accessToken is not null && DateTimeOffset.UtcNow < _expires - TimeSpan.FromMinutes(1)) return (_accessToken, _expires);
+            var renew = fresh && DateTimeOffset.UtcNow - _renewedAt > TimeSpan.FromSeconds(30);
+            if (_accessToken is not null && !renew && DateTimeOffset.UtcNow < _expires - TimeSpan.FromMinutes(1)) return (_accessToken, _expires);
+            if (renew) { _renewedAt = DateTimeOffset.UtcNow; Log.Info("Spotify: getting a new access token (the player's was refused)"); }
             if (LoadRefreshToken() is not { } refresh) return null;
             var reply = await PostTokenAsync(new() { ["grant_type"] = "refresh_token", ["refresh_token"] = refresh, ["client_id"] = _clientId });
             if (reply is null) return null;

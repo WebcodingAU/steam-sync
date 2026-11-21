@@ -245,7 +245,7 @@ internal sealed class SpotifyPlayer : IDisposable
                 }
                 break;
             case "token":
-                var token = _auth is null ? null : await _auth.GetTokenAsync();
+                var token = _auth is null ? null : await _auth.GetTokenAsync(fresh: (bool?)message["fresh"] == true);
                 Post(new JsonObject
                 {
                     ["type"] = "token",

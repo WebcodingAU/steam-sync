@@ -245,22 +245,31 @@ function toast(text, ms = 3500) { if (!expanded) send({ type: "toast", text }); 
 // ---- tokens and the Web API ----
 let cachedToken = null, tokenSeq = 0;
 const tokenWaiters = new Map();
-function getToken() {
-  if (cachedToken && cachedToken.expires - Date.now() > 60000) return Promise.resolve(cachedToken.token);
-  return new Promise(resolve => { const id = ++tokenSeq; tokenWaiters.set(id, resolve); send({ type: "token", id }); });
+// fresh: the current token was refused, so the app gets a new one from Spotify instead of handing back its copy.
+function getToken(fresh = false) {
+  if (!fresh && cachedToken && cachedToken.expires - Date.now() > 60000) return Promise.resolve(cachedToken.token);
+  return new Promise(resolve => { const id = ++tokenSeq; tokenWaiters.set(id, resolve); send({ type: "token", id, fresh }); });
 }
 
-async function api(path, { method = "GET", query, body, retry = true } = {}) {
-  const token = await getToken();
+async function api(path, { method = "GET", query, body, retry = true, fresh = false } = {}) {
+  const token = await getToken(fresh);
   if (!token) throw Object.assign(new Error("Not signed in to Spotify"), { status: 401 });
   let url = path.startsWith("https://") ? path : "https://api.spotify.com/v1" + path;
   if (query) url += (url.includes("?") ? "&" : "?") + new URLSearchParams(query);
   const r = await fetch(url, { method, headers: { Authorization: "Bearer " + token, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
-  if (r.status === 401 && retry) { cachedToken = null; return api(path, { method, query, body, retry: false }); }
+  if (r.status === 401 && retry) { cachedToken = null; return api(path, { method, query, body, retry: false, fresh: true }); }
   if (r.status === 429 && retry) { await new Promise(res => setTimeout(res, Math.min(10, +(r.headers.get("Retry-After") || 2)) * 1000)); return api(path, { method, query, body, retry: false }); }
   const text = await r.text();
   let data = null; try { data = text ? JSON.parse(text) : null; } catch { }
-  if (!r.ok) throw Object.assign(new Error(data?.error?.message || `Spotify said ${r.status}`), { status: r.status, reason: data?.error?.reason });
+  if (!r.ok) {
+    // To the app's log (path only: queries can hold search text; never the token).
+    const where = url.replace("https://api.spotify.com/v1", "").split("?")[0];
+    send({ type: "log", message: `API ${method} ${where} -> ${r.status} ${data?.error?.message || ""}${data?.error?.reason ? " (" + data.error.reason + ")" : ""}${retry ? "" : " (retry)"}` });
+    // A lookup that worked again after restarting the app said "Not found." after ~18 hours of running (beta.45):
+    // try once more with a fresh token before giving up.
+    if (r.status === 404 && method === "GET" && retry) { cachedToken = null; return api(path, { method, query, body, retry: false, fresh: true }); }
+    throw Object.assign(new Error(data?.error?.message || `Spotify said ${r.status}`), { status: r.status, reason: data?.error?.reason });
+  }
   return data;
 }
 
@@ -708,16 +717,28 @@ const showAlbum = guard(async id => {
 });
 
 // Spotify takes at most 10 per page here for a development-mode app (since February 2026), so follow the pages.
+// Pages are asked for by offset (not Spotify's next link), and one that fails after the first keeps what came before.
 async function artistAlbums(id) {
   const all = [];
-  let page = await api(`/artists/${id}/albums`, { query: { include_groups: "album,single", limit: 10 } });
-  all.push(...(page.items || []).filter(Boolean));
-  while (page.next && all.length < 30) { page = await api(page.next); all.push(...(page.items || []).filter(Boolean)); }
+  for (let offset = 0; offset < 30; offset += 10) {
+    let page;
+    try { page = await api(`/artists/${id}/albums`, { query: { include_groups: "album,single", limit: 10, offset } }); }
+    catch (e) { if (offset === 0) throw e; console.warn("artist albums page", offset, e); break; }
+    all.push(...(page.items || []).filter(Boolean));
+    if (!page.next) break;
+  }
   return { items: all };
 }
 
 const showArtist = guard(async id => {
-  const [a, albums] = await Promise.all([api(`/artists/${id}`), artistAlbums(id)]);
+  // Either request may fail on its own: the page shows whatever came back, and only fails when both did.
+  const [info, list] = await Promise.allSettled([api(`/artists/${id}`), artistAlbums(id)]);
+  if (info.status === "rejected" && list.status === "rejected") throw info.reason;
+  if (info.status === "rejected") console.warn("artist", id, info.reason);
+  if (list.status === "rejected") console.warn("artist albums", id, list.reason);
+  const albums = list.status === "fulfilled" ? list.value : { items: [] };
+  const a = info.status === "fulfilled" ? info.value
+    : { uri: `spotify:artist:${id}`, images: [], genres: [], name: albums.items.flatMap(al => al.artists || []).find(ar => ar.id === id)?.name || "Artist" };
   const v = view(`<div class="hero">${img(a.images) ? `<img src="${esc(img(a.images))}" alt="" style="border-radius:50%">` : `<div class="ph" style="border-radius:50%"></div>`}
     <div><div class="kind">Artist</div><h1>${esc(a.name)}</h1><div class="sub">${esc((a.genres || []).slice(0, 3).join(", "))}</div></div></div>
     <div class="actions"><button class="play-big" id="ar-play" title="Play this artist"><svg><use href="#i-play"/></svg></button></div><h2>Albums and singles</h2>`, "artist:" + id);
