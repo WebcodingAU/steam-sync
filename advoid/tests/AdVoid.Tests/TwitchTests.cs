@@ -70,6 +70,41 @@ public class TwitchTests
         Assert.Equal(0, variants[3].Height);
     }
 
+    // The 2026 format: no #EXT-X-MEDIA, names in IVS-NAME, ids in STABLE-VARIANT-ID.
+    private const string MasterIvs = """
+        #EXTM3U
+        #EXT-X-SESSION-DATA:DATA-ID="SUPPRESS",VALUE="false"
+        #EXT-X-STREAM-INF:BANDWIDTH=6348158,CODECS="avc1.64002A,mp4a.40.2",RESOLUTION=1920x1080,FRAME-RATE=59.940,STABLE-VARIANT-ID="1080p60",IVS-NAME="1080p60",IVS-VARIANT-SOURCE="source"
+        https://d1.cloudfront.net/x/1080p60/index-dvr.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=1459403,CODECS="avc1.4D401F,mp4a.40.2",RESOLUTION=852x480,FRAME-RATE=30.221,STABLE-VARIANT-ID="480p30",IVS-NAME="480p",IVS-VARIANT-SOURCE="transcode"
+        https://d1.cloudfront.net/x/480p30/index-dvr.m3u8
+        """;
+
+    [Fact]
+    public void ReadsTheNewerQualities()
+    {
+        var variants = Hls.ParseMaster(MasterIvs);
+        Assert.Equal(2, variants.Count);
+        Assert.Equal(new Variant("https://d1.cloudfront.net/x/480p30/index-dvr.m3u8", "480p", "480p30", 480, 30.221, 1459403), variants[1]);
+        Assert.Equal("1080p60", variants[0].Name);
+    }
+
+    [Fact]
+    public async Task KnowsMediaPlaylistsFromTheirMaster()
+    {
+        var ads = new TwitchAds(new HttpClient(new Canned(MasterIvs)));
+        var media = "https://d1.cloudfront.net/x/480p30/index-dvr.m3u8";
+        Assert.Equal(PlaylistKind.None, ads.Kind(media));
+        await ads.FetchAsync("https://usher.ttvnw.net/api/v2/channel/hls/someone.m3u8?sig=x", []);
+        Assert.Equal(PlaylistKind.Media, ads.Kind(media));
+    }
+
+    private sealed class Canned(string body) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancel) =>
+            Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK) { Content = new StringContent(body) });
+    }
+
     [Fact]
     public void PicksTheClosestQuality()
     {

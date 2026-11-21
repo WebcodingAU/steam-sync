@@ -6,7 +6,7 @@ namespace AdVoid.Twitch;
 
 /// <summary>One quality in a Twitch master playlist: its media playlist's URL and what it is.</summary>
 /// <param name="Name">Twitch's name for it ("1080p60 (source)", "720p60", "audio_only").</param>
-/// <param name="Group">The VIDEO group id ("chunked", "720p60"): the same quality has the same id in every copy.</param>
+/// <param name="Group">The quality's stable id ("chunked" or "1080p60" for the source, "720p60"): the same quality has the same id in every copy.</param>
 public sealed record Variant(string Url, string Name, string Group, int Height, double FrameRate, long Bandwidth);
 
 /// <summary>
@@ -37,12 +37,14 @@ public static partial class Hls
             else if (line.StartsWith("#EXT-X-STREAM-INF:", StringComparison.Ordinal)) streamInf = line;
             else if (streamInf is not null && line.Length > 0 && !line.StartsWith('#'))
             {
-                var group = Attribute(streamInf, "VIDEO") ?? "";
+                // Older masters name qualities with VIDEO groups and #EXT-X-MEDIA; newer ones (2026) with STABLE-VARIANT-ID and IVS-NAME.
+                var group = Attribute(streamInf, "VIDEO") ?? Attribute(streamInf, "STABLE-VARIANT-ID") ?? "";
                 var resolution = Attribute(streamInf, "RESOLUTION");
                 var height = resolution?.Split('x') is [_, var h] && int.TryParse(h, out var hv) ? hv : 0;
                 double.TryParse(Attribute(streamInf, "FRAME-RATE"), NumberStyles.Float, CultureInfo.InvariantCulture, out var fps);
                 long.TryParse(Attribute(streamInf, "BANDWIDTH"), out var bandwidth);
-                variants.Add(new Variant(line, names.GetValueOrDefault(group, group), group, height, fps, bandwidth));
+                var name = names.GetValueOrDefault(group) ?? Attribute(streamInf, "IVS-NAME") ?? group;
+                variants.Add(new Variant(line, name, group, height, fps, bandwidth));
                 streamInf = null;
             }
         }
