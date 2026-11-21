@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>AdVoid</RootNamespace>
+    <AssemblyName>AdVoid</AssemblyName>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- AdVoid's own page scripts (the YouTube ad remover), handed to the host by Scriptlets. -->
+    <EmbeddedResource Include="Scriptlets\*.js" LogicalName="AdVoid.Scriptlets.%(Filename)%(Extension)" />
+    <InternalsVisibleTo Include="AdVoid.Tests" />
+  </ItemGroup>
+
+</Project>
