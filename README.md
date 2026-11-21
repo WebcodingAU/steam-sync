@@ -138,6 +138,23 @@ It needs Spotify Premium; that's Spotify's rule for the SDK.
   - artists have no top tracks;
   - at most five accounts can use the Client ID.
 
+## YouTube window
+
+**Open YouTube** in the tray menu opens YouTube in its own window (`YouTubeWindow.cs`), for guides on a second
+monitor without a browser open. It has its own WebView2 profile (`%LOCALAPPDATA%\SteamSync\WebView2-YouTube`, so its
+own YouTube sign-in), opens on the second monitor the first time and then where it was left (`youtube-window.json`),
+and has **Keep on top** in the title bar's menu (right-click the title bar). F11 is full screen. Only YouTube and
+Google's sign-in pages open in it; other links go to the default browser. The page's scrollbar is hidden. Closing
+the window ends its browser engine.
+
+Ads are blocked by **AdVoid**, the user's own engine in its own repo (`C:\Repos\advoid`, referenced by path, so it has
+to sit next to this repo). `AdBlocker.cs` keeps EasyList and EasyPrivacy in `%LOCALAPPDATA%\SteamSync\AdVoid` (fetched
+from their publishers, refreshed when 4 days old) and shares one engine across windows. The window checks every
+request with it (`WebResourceRequested`), adds each page's element-hiding CSS, and runs AdVoid's YouTube script,
+which removes the video ads YouTube schedules inside the video's own data. The title shows how many requests were
+blocked. While the window is open the tray process stays out of Efficiency mode (`Efficiency.Held`), because the
+request checks run on its UI thread.
+
 ## PC load (beta builds only)
 
 While a game runs, a beta build (a version with `-beta` in it) sends the PC's load once a second (`PcLoad.cs`,
@@ -179,6 +196,9 @@ Pairing turns on **Start with Windows** (`HKCU\...\Run`); toggle it from the tra
 dotnet build src/SteamSync
 dotnet publish src/SteamSync -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
 ```
+
+The build needs AdVoid checked out next to this repo (`C:\Repos\advoid`); the project references
+`..\..\..\advoid\src\AdVoid\AdVoid.csproj`.
 
 The equalizer's limiter (`src/SteamSync/limiter/limiter.c`, the "Only when needed" choice under **Prevent clipping**) is a
 native VST2 plugin that Equalizer APO loads after the EQ. The build compiles it with [Zig](https://ziglang.org), downloaded

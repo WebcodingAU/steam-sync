@@ -31,7 +31,11 @@ internal static class Efficiency
     [DllImport("kernel32.dll")]
     private static extern bool CloseHandle(IntPtr handle);
 
-    public static void SetSelf(bool on) => Set(Environment.ProcessId, on);
+    /// <summary>Something needs the tray process responsive (the YouTube window, whose ad blocking checks run on this
+    /// process's UI thread): while set, SetSelf never turns Efficiency mode on.</summary>
+    public static bool Held { get; set; }
+
+    public static void SetSelf(bool on) => Set(Environment.ProcessId, on && !Held);
 
     /// <summary>Best effort: a process that has already exited, or one we may not touch, is simply skipped.</summary>
     public static void Set(int processId, bool on)

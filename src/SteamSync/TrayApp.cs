@@ -38,6 +38,7 @@ internal sealed class TrayApp : ApplicationContext
     private readonly Updater _updater = new();
     private readonly ToolStripMenuItem _updateItem = new() { Visible = false };
     private LibraryWindow? _library;
+    private YouTubeWindow? _youtube;
     private EqualizerWindow? _eqWindow;
     private readonly System.Windows.Forms.Timer _limiterWatch = new() { Interval = 30_000 };
     private readonly Dictionary<SyncState, Icon> _icons = new()
@@ -93,6 +94,7 @@ internal sealed class TrayApp : ApplicationContext
         menu.Items.AddRange(
         [
             new ToolStripMenuItem("Open Library", null, (_, _) => OpenLibrary()) { Font = new Font(menu.Font, FontStyle.Bold) },
+            new ToolStripMenuItem("Open YouTube", null, (_, _) => OpenYouTube()) { ToolTipText = "YouTube in its own window, with AdVoid blocking ads" },
             _spotifyItem,
             new ToolStripSeparator(),
             _statusItem,
@@ -170,6 +172,22 @@ internal sealed class TrayApp : ApplicationContext
             _library.WindowState = FormWindowState.Normal;
         }
         _library.Activate();
+    }
+
+    /// <summary>Shows the YouTube window (one at a time), starting its browser engine only now.</summary>
+    private void OpenYouTube()
+    {
+        if (_youtube is null || _youtube.IsDisposed)
+        {
+            _youtube = new YouTubeWindow();
+            _youtube.FormClosed += (_, _) => _youtube = null;
+            _youtube.Show();
+        }
+        else if (_youtube.WindowState == FormWindowState.Minimized)
+        {
+            _youtube.WindowState = FormWindowState.Normal;
+        }
+        _youtube.Activate();
     }
 
     private void Render(SyncStatus s)
