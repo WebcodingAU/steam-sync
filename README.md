@@ -16,6 +16,12 @@ first home; the goal is to grow it into one of the best blockers around.
   servers, so request blocking can't stop them. The script removes `adPlacements`, `adSlots` and `playerAds` from
   `ytInitialPlayerResponse` and from every JSON response before the player reads them, hides ad tiles and banners,
   and skips any ad that still starts.
+- **Twitch** (`Twitch/TwitchAds.cs`, `Twitch/Hls.cs`). Twitch splices ads into the live stream's own playlist. The
+  host routes the player's playlist requests through `TwitchAds.FetchAsync`: master playlists pass through (noting
+  which URL is which quality), and while a media playlist carries an ad (`twitch-stitched-ad`, or segments not titled
+  `live`), the player gets the same quality from Twitch's `embed` copy of the stream, which usually has no ads (then
+  `popout`, then the 360p `autoplay`). If every copy has the ad, the ad segments are cut out, so the picture freezes
+  instead. Tested 2026-11-22 from Australia: ad-free 720p/1080p through 30 s and 2 min 20 s breaks.
 - **Lists.** `FilterListStore` downloads EasyList and EasyPrivacy from their publishers and keeps them cached; they're
   never shipped with AdVoid.
 - Filters using options it doesn't support yet (`$csp`, `$redirect`, `$removeparam`, ...) are skipped rather than
