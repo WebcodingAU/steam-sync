@@ -175,10 +175,19 @@ internal sealed class WatchWindow : Form
     private void OnWebResourceRequested(object? sender, CoreWebView2WebResourceRequestedEventArgs e)
     {
         var url = e.Request.Uri;
-        if (_site.TwitchStreams && e.Request.Method == "GET" && AdBlocker.Twitch.Kind(url) != PlaylistKind.None)
+        if (_site.TwitchStreams)
         {
-            _ = AnswerPlaylistAsync(e, url);
-            return;
+            if (e.Request.Method == "GET" && AdBlocker.Twitch.Kind(url) != PlaylistKind.None)
+            {
+                _ = AnswerPlaylistAsync(e, url);
+                return;
+            }
+            // The page's own Twitch session (when signed in), so ad-free copies come in the viewer's qualities and
+            // codecs. AdVoid keeps it in memory, sends it only to gql.twitch.tv and never logs it.
+            if (url.StartsWith("https://gql.twitch.tv/", StringComparison.Ordinal) && e.Request.Headers.Contains("Authorization"))
+                AdBlocker.Twitch.SetViewerHeaders(TwitchAds.ViewerHeaderNames
+                    .Where(e.Request.Headers.Contains)
+                    .Select(name => new KeyValuePair<string, string>(name, e.Request.Headers.GetHeader(name))));
         }
         var type = e.ResourceContext switch
         {
@@ -216,7 +225,7 @@ internal sealed class WatchWindow : Form
             var headerText = string.Join("\r\n", answer.Headers.Select(h => $"{h.Key}: {h.Value}"));
             e.Response = _web.CoreWebView2.Environment.CreateWebResourceResponse(body, answer.Status, answer.Reason, headerText);
             if (AdBlocker.Twitch.Kind(url) != PlaylistKind.Media) return;
-            var inBreak = answer.Action != PlaylistAction.None;
+            var inBreak = answer.Action is PlaylistAction.Replaced or PlaylistAction.Stripped; // not Continued: the copy after a break
             if (inBreak && !_inAdBreak) _adBreaksHere++;
             _inAdBreak = inBreak;
         }
