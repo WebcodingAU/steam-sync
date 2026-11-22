@@ -143,6 +143,12 @@ public sealed partial class TwitchAds(HttpClient http)
     public async Task<PlaylistResponse> FetchAsync(string url, IEnumerable<KeyValuePair<string, string>> requestHeaders, CancellationToken cancel = default)
     {
         var kind = Kind(url);
+        // A channel already on a copy: fetch the copy alongside the stream's own playlist, not after it, so the
+        // player's playlist requests take no longer than without AdVoid.
+        Task<(string Text, Variant Variant, Source Source)?>? early = null;
+        if (kind == PlaylistKind.Media && _known.TryGetValue(url, out var knownEarly)
+            && _breaks.TryGetValue(knownEarly.Login, out var breakEarly) && breakEarly.Source is { } sourceEarly)
+            early = TryCopyAsync(knownEarly, sourceEarly, cancel);
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         foreach (var (name, value) in requestHeaders)
         {
@@ -192,8 +198,14 @@ public sealed partial class TwitchAds(HttpClient http)
             // The copy already in use first (switching copies is a jump for the player), then the rest in order.
             var order = (_viewer.Count > 0 ? SignedInSources.Concat(AnonymousSources) : AnonymousSources).ToList();
             if (brk.Source is not null && order.Remove(brk.Source)) order.Insert(0, brk.Source);
-            foreach (var source in order)
-                if ((copy = await TryCopyAsync(known, source, cancel).ConfigureAwait(false)) is not null) break;
+            if (early is not null && brk.Source is not null)
+            {
+                copy = await early.ConfigureAwait(false);
+                order.Remove(brk.Source);
+            }
+            if (copy is null)
+                foreach (var source in order)
+                    if ((copy = await TryCopyAsync(known, source, cancel).ConfigureAwait(false)) is not null) break;
             if (copy is null) _noCopy[known.Login] = DateTime.UtcNow + NoCopyFor;
         }
 
