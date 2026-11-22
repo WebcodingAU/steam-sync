@@ -40,6 +40,7 @@ internal sealed class TrayApp : ApplicationContext
     private LibraryWindow? _library;
     private readonly Dictionary<WatchSite, WatchWindow> _watch = [];
     private readonly GlobalHotkeys _hotkeys = new(); // Shift+F1 YouTube, Shift+F2 Twitch, from any app
+    private readonly MouseShortcut _mouse;           // Ctrl+Shift+mouse side button: the Library
     private EqualizerWindow? _eqWindow;
     private readonly System.Windows.Forms.Timer _limiterWatch = new() { Interval = 30_000 };
     private readonly Dictionary<SyncState, Icon> _icons = new()
@@ -55,6 +56,7 @@ internal sealed class TrayApp : ApplicationContext
     {
         _config = config;
         _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+        _mouse = new MouseShortcut(() => _ui.Post(_ => ToggleLibrary(), null));
         _sync = new SyncService(config);
         _play = new PlayTracker(config);
         _sync.Scanned += _play.UpdateGames;
@@ -94,7 +96,11 @@ internal sealed class TrayApp : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Items.AddRange(
         [
-            new ToolStripMenuItem("Open Library", null, (_, _) => OpenLibrary()) { Font = new Font(menu.Font, FontStyle.Bold) },
+            new ToolStripMenuItem("Open Library", null, (_, _) => OpenLibrary())
+            {
+                Font = new Font(menu.Font, FontStyle.Bold),
+                ShortcutKeyDisplayString = _mouse.Active ? "Ctrl+Shift+Mouse side button" : null,
+            },
             WatchItem("Open YouTube", WatchSite.YouTube, Keys.F1, "YouTube in its own window, with AdVoid blocking ads"),
             WatchItem("Open Twitch", WatchSite.Twitch, Keys.F2, "Twitch in its own window, with AdVoid skipping stream ads"),
             _spotifyItem,
@@ -174,6 +180,19 @@ internal sealed class TrayApp : ApplicationContext
             _library.WindowState = FormWindowState.Normal;
         }
         _library.Activate();
+    }
+
+    /// <summary>The mouse shortcut: opens the Library from anywhere, or minimizes it when it's already the window in front.
+    /// The hook's input doesn't give this app the right to come to the front, so it's brought there explicitly.</summary>
+    private void ToggleLibrary()
+    {
+        if (_library is { IsDisposed: false } && Form.ActiveForm == _library && _library.WindowState != FormWindowState.Minimized)
+        {
+            _library.WindowState = FormWindowState.Minimized;
+            return;
+        }
+        OpenLibrary();
+        if (_library is not null) MouseShortcut.BringToFront(_library);
     }
 
     /// <summary>The menu item for a site's window, and its Shift+F-key shortcut (shown on the item when Windows gave it
@@ -601,6 +620,7 @@ internal sealed class TrayApp : ApplicationContext
     {
         _openWait.Unregister(null);
         _hotkeys.Dispose();
+        _mouse.Dispose();
         _updater.Dispose();
         _library?.Close();
         _spotify?.Dispose();

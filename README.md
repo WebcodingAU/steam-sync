@@ -11,7 +11,8 @@ WebView2 runtime if the PC lacks it, and updates itself.
 
 ## Library window
 
-Tray → **Open Library** (or the Start menu entry, or double-click the tray icon) opens gamingenjoyer.com
+Tray → **Open Library** (or the Start menu entry, double-click the tray icon, or **Ctrl+Shift+mouse side button** from any
+app: `MouseShortcut.cs`, a low-level mouse hook on its own top-priority thread; again minimizes it) opens gamingenjoyer.com
 in a single-site window on the WebView2 (Edge) runtime that ships with Windows:
 
 - Its own profile under `%LocalAppData%\SteamSync\WebView2`; sign in once.
