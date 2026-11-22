@@ -12,7 +12,18 @@ namespace AdVoid.Twitch;
 /// <param name="Action">What AdVoid did: passed through, swapped for an ad-free copy, or ads cut out.</param>
 public sealed record PlaylistResponse(int Status, string Reason, string Body, IReadOnlyList<KeyValuePair<string, string>> Headers, PlaylistAction Action);
 
-public enum PlaylistAction { None, Replaced, Stripped }
+/// <summary>What AdVoid answered a media playlist with.</summary>
+public enum PlaylistAction
+{
+    /// <summary>The stream's own playlist, as it came.</summary>
+    None,
+    /// <summary>An ad-free copy, during an ad break.</summary>
+    Replaced,
+    /// <summary>The ad cut out (no copy to use), during an ad break.</summary>
+    Stripped,
+    /// <summary>The ad-free copy again after the break: a channel stays on its copy (see <see cref="TwitchAds"/>).</summary>
+    Continued,
+}
 
 /// <summary>Which of Twitch's playlists a request is for.</summary>
 public enum PlaylistKind { None, Master, Media }
@@ -31,8 +42,10 @@ public enum PlaylistKind { None, Master, Media }
 /// <c>popout</c> and the 360p <c>autoplay</c> anonymously. A copy is only used in the same codec as what the player is
 /// playing: a player can't switch codecs mid-stream (it goes black). With no copy to use, the ad segments are cut out,
 /// which pauses the picture for the break instead of showing it.</para>
-/// <para>A break ends once the stream's playlist has come back without ads twice in a row, so the player isn't
-/// switched back and forth by a playlist that flickers between the two at the end of a break.</para>
+/// <para>Once a channel has been switched to a copy, it stays on it (every quality, from then on): a stream that
+/// started with an ad numbers its segments from 0, the copies by the live stream, so handing the stream back after the
+/// break would give the player segment numbers it has already passed, and it would wait for ever. The copy is the same
+/// stream, so staying costs nothing but one playlist request per poll.</para>
 /// <para>Thread-safe; one instance can serve every window. The viewer's headers are only ever sent to gql.twitch.tv,
 /// and never logged.</para>
 /// </remarks>
@@ -53,7 +66,6 @@ public sealed partial class TwitchAds(HttpClient http)
     private static readonly Source[] AnonymousSources = [new("embed", false), new("popout", false), new("autoplay", false)];
     private static readonly TimeSpan BackupLifetime = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan NoCopyFor = TimeSpan.FromSeconds(8);
-    private const int AdFreeToEnd = 2;
     private static readonly string[] PassedHeaders =
         ["Content-Type", "Cache-Control", "Access-Control-Allow-Origin", "Access-Control-Allow-Credentials", "Access-Control-Expose-Headers", "Timing-Allow-Origin"];
     // Usher parameters that belong to one request or one player type; the rest (codecs, platform, ...) are reused.
@@ -64,19 +76,19 @@ public sealed partial class TwitchAds(HttpClient http)
     private sealed record Backup(List<Variant> Variants, DateTime Expires);
     private sealed record Usher(string Path, List<KeyValuePair<string, string>> Parameters);
 
-    // A media playlist's ad break: which copy it's on (null: cutting the ad out) and how many ad-free polls since.
+    // A channel's switch to a copy: which copy (null: cutting the ad out), what was last logged, whether a break is on.
     private sealed class Break
     {
         public Source? Source;
         public string Shown = "";
-        public int AdFree;
+        public bool InAd = true;
     }
 
     private readonly ConcurrentDictionary<string, Known> _known = new(StringComparer.Ordinal);    // media playlist URL -> channel, quality
     private readonly ConcurrentDictionary<string, Usher> _usher = new(StringComparer.Ordinal);    // login -> how the player asked for it
     private readonly ConcurrentDictionary<string, Backup> _backups = new(StringComparer.Ordinal); // "login|source" -> its qualities
     private readonly ConcurrentDictionary<string, DateTime> _noCopy = new(StringComparer.Ordinal); // login -> until when not to look
-    private readonly ConcurrentDictionary<string, Break> _breaks = new(StringComparer.Ordinal);   // media playlist URL -> its break
+    private readonly ConcurrentDictionary<string, Break> _breaks = new(StringComparer.Ordinal);   // login -> its switch to a copy
     private volatile IReadOnlyList<KeyValuePair<string, string>> _viewer = [];
     private long _replaced, _stripped;
 
@@ -155,32 +167,25 @@ public sealed partial class TwitchAds(HttpClient http)
         }
 
         var known = _known.GetValueOrDefault(url);
-        _breaks.TryGetValue(url, out var brk);
+        var hasAds = Hls.HasAds(body);
         var passThrough = new PlaylistResponse(200, "OK", body, headers, PlaylistAction.None);
-
-        if (!Hls.HasAds(body))
+        if (known is null) // a media playlist no master listed: cut any ad out, nothing better to offer
         {
-            if (brk is null || known is null) return passThrough;
-            // The break may be ending: stay on the copy until the stream has been ad-free twice in a row.
-            if (++brk.AdFree < AdFreeToEnd && brk.Source is not null
-                && await TryCopyAsync(known, brk.Source, cancel).ConfigureAwait(false) is { } still)
-            {
-                Interlocked.Increment(ref _replaced);
-                return new(200, "OK", still.Text, headers, PlaylistAction.Replaced);
-            }
-            _breaks.TryRemove(url, out _);
-            Log?.Invoke($"Twitch: ad break on {known.Login} is over ({known.Variant.Name})");
-            return passThrough;
-        }
-
-        if (known is null) // a media playlist no master listed: cut the ad out, nothing better to offer
-        {
+            if (!hasAds) return passThrough;
             Interlocked.Increment(ref _stripped);
             return new(200, "OK", Hls.StripAds(body), headers, PlaylistAction.Stripped);
         }
 
-        brk ??= _breaks.GetOrAdd(url, _ => new Break());
-        brk.AdFree = 0;
+        _breaks.TryGetValue(known.Login, out var brk);
+        if (brk is null && !hasAds) return passThrough;
+        brk ??= _breaks.GetOrAdd(known.Login, _ => new Break());
+        if (brk.InAd != hasAds)
+        {
+            brk.InAd = hasAds;
+            if (!hasAds) Log?.Invoke($"Twitch: ad break on {known.Login} is over (staying on the ad-free copy)");
+            else brk.Shown = ""; // a new break: log which copy it plays
+        }
+
         (string Text, Variant Variant, Source Source)? copy = null;
         if (!(_noCopy.TryGetValue(known.Login, out var until) && DateTime.UtcNow < until))
         {
@@ -197,13 +202,15 @@ public sealed partial class TwitchAds(HttpClient http)
         {
             brk.Source = c.Source;
             var shown = $"{c.Source}|{c.Variant.Name}";
-            if (brk.Shown != shown)
-                Log?.Invoke($"Twitch: ad break on {known.Login} ({what}): playing the {c.Source} copy at {c.Variant.Name} until it ends");
+            if (brk.Shown != shown && hasAds)
+                Log?.Invoke($"Twitch: ad break on {known.Login} ({what}): playing the {c.Source} copy at {c.Variant.Name}");
             brk.Shown = shown;
+            if (!hasAds) return new(200, "OK", c.Text, headers, PlaylistAction.Continued);
             Interlocked.Increment(ref _replaced);
             return new(200, "OK", c.Text, headers, PlaylistAction.Replaced);
         }
 
+        if (!hasAds) return passThrough; // no copy right now (failed): the stream itself is all there is
         brk.Source = null;
         if (brk.Shown != "cut")
             Log?.Invoke($"Twitch: ad break on {known.Login} ({what}): no ad-free copy in that codec, cutting the ad out (the picture pauses)");

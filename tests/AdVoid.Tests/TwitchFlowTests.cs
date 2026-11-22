@@ -107,30 +107,32 @@ public class TwitchFlowTests
     }
 
     [Fact]
-    public async Task ABreakEndsAfterTwoAdFreePolls()
+    public async Task AChannelStaysOnTheCopyAfterTheBreak()
     {
         var (ads, twitch, log) = await Start(t =>
         {
-            t.SiteMaster = MasterOf("site", ("1440p60", 1440, "avc1.640033"));
-            t.CopyMasters["embed"] = MasterOf("anon", ("1080p60", 1080, "avc1.64002A"));
-            t.Pages["https://anon.example/1080p60.m3u8"] = Live.Replace("live1", "copy");
+            t.SiteMaster = MasterOf("site", ("1440p60", 1440, "avc1.640033"), ("720p60", 720, "avc1.4D401F"));
+            t.CopyMasters["embed"] = MasterOf("anon", ("1080p60", 1080, "avc1.64002A"), ("720p60", 720, "avc1.4D401F"));
+            t.Pages["https://anon.example/1080p60.m3u8"] = Live.Replace("live1", "copy1080");
+            t.Pages["https://anon.example/720p60.m3u8"] = Live.Replace("live1", "copy720");
+            t.Pages["https://site.example/720p60.m3u8"] = Live.Replace("live1", "site720");
         }, signedIn: false);
 
+        Assert.Equal(PlaylistAction.None, (await ads.FetchAsync("https://site.example/720p60.m3u8", [])).Action); // no ad yet: the stream itself
         Assert.Equal(PlaylistAction.Replaced, (await Poll(ads)).Action);
-        twitch.Site1440 = Live;                                            // the stream comes back...
-        var first = await Poll(ads);
-        Assert.Equal(PlaylistAction.Replaced, first.Action);               // ...but stay on the copy one more poll
-        Assert.Contains("copy", first.Body);
-        twitch.Site1440 = WithAd;                                          // it flickers back: still the same break
+        twitch.Site1440 = Live;                                            // the break is over...
+        var after = await Poll(ads);
+        Assert.Equal(PlaylistAction.Continued, after.Action);              // ...but the copy keeps numbering the segments
+        Assert.Contains("copy1080", after.Body);
+        var other = await ads.FetchAsync("https://site.example/720p60.m3u8", []);
+        Assert.Equal(PlaylistAction.Continued, other.Action);              // every quality of the channel, not just the one
+        Assert.Contains("copy720", other.Body);
+        twitch.Site1440 = WithAd;                                          // a later break: still the copy, logged again
         Assert.Equal(PlaylistAction.Replaced, (await Poll(ads)).Action);
-        twitch.Site1440 = Live;
-        Assert.Equal(PlaylistAction.Replaced, (await Poll(ads)).Action);
-        var back = await Poll(ads);
-        Assert.Equal(PlaylistAction.None, back.Action);                    // two ad-free in a row: back to the stream
-        Assert.Contains("live1", back.Body);
-        Assert.Single(log, l => l.Contains("playing the embed copy"));     // one break logged once, not per flicker
-        Assert.Single(log, l => l.Contains("is over"));
-        Assert.Equal(PlaylistAction.None, (await Poll(ads)).Action);
+        await ads.FetchAsync(PlayerUsher, []);                             // the player reloads its master: still the copy
+        Assert.Contains("copy1080", (await Poll(ads)).Body);
+        Assert.Equal(2, log.Count(l => l.Contains("playing the embed copy at 1080p60")));
+        Assert.Single(log, l => l.Contains("is over (staying on the ad-free copy)"));
     }
 
     [Fact]
