@@ -22,8 +22,11 @@ internal static class AppInfo
         Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0]
         ?? "0.0.0";
 
+    /// <summary>%LocalAppData%\SteamSync, or GAMING_ENJOYER_DATA_DIR when set (test tools such as tools/WatchCheck, so
+    /// they never share the installed app's profiles, sign-ins or log).</summary>
     public static string DataDir { get; } = Directory.CreateDirectory(
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SteamSync")).FullName;
+        Environment.GetEnvironmentVariable("GAMING_ENJOYER_DATA_DIR") is { Length: > 0 } dir ? dir
+        : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SteamSync")).FullName;
 }
 
 /// <param name="SpotifyClientId">The Spotify developer app's Client ID for the Spotify player (SpotifyAuth). Public by

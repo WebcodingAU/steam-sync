@@ -59,6 +59,8 @@
   <!-- AdVoid, the user's own ad-block engine, for the YouTube window: a git subtree of C:\Repos\advoid in advoid/. -->
   <ItemGroup>
     <ProjectReference Include="..\..\advoid\src\AdVoid\AdVoid.csproj" />
+    <!-- tools/WatchCheck drives the YouTube and Twitch windows for AdVoid's nightly check. -->
+    <InternalsVisibleTo Include="WatchCheck" />
   </ItemGroup>
 
   <ItemGroup>

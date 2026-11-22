@@ -161,6 +161,12 @@ copy has it. A break lasts about a minute (the ad, then its segments scrolling o
 one. The title shows how many requests were blocked and ad breaks skipped. While a window is open the tray process
 stays out of Efficiency mode (`Efficiency.Held`), because the request checks run on its UI thread.
 
+`tools/WatchCheck` drives these windows for AdVoid's nightly check (`advoid/tools/nightly-check.ps1`).
+- `WatchCheck youtube [seconds]` plays a few popular videos. `WatchCheck twitch <channel> [seconds]` plays a stream.
+- It watches for an ad on screen, a stall or a black picture, and prints a JSON report.
+- It is muted and keeps its data in `%LOCALAPPDATA%\GamingEnjoyer-WatchCheck`: the app reads `GAMING_ENJOYER_DATA_DIR`
+  for this, so the check never shares the installed app's profiles or log.
+
 ## PC load (beta builds only)
 
 While a game runs, a beta build (a version with `-beta` in it) sends the PC's load once a second (`PcLoad.cs`,
