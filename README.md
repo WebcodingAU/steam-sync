@@ -47,6 +47,18 @@ The engine is read-only once built, so it can answer from any thread; to change 
 - `src/AdVoid`: the engine (`FilterEngine`, `NetworkFilter`, `CosmeticFilter`, `Domains`, `FilterListStore`,
   `Scriptlets`).
 - `tests/AdVoid.Tests`: `dotnet test AdVoid.slnx`.
+- `tools/LiveCheck`: checks AdVoid against the live sites over plain HTTP, signed out.
+  - `dotnet run --project tools/LiveCheck -- twitch [seconds]` reads the master playlists for every player type, waits
+    for an ad break on a top channel and runs `TwitchAds` on it.
+  - `-- youtube` lists every ad field and ad box in a few videos' player data and flags any that `youtube.js` doesn't
+    remove.
+- `tools/nightly-check.ps1`: the unit tests, both LiveCheck modes, and Gaming Enjoyer's `tools/WatchCheck`, which plays
+  YouTube and a Twitch stream in the app's real window and watches for ads, stalls and black pictures. Reports go to
+  `.nightly\<date>\` (git-ignored).
+  - A Claude Code scheduled task, "AdVoid nightly check", runs it every night at 3am Sydney time.
+  - When something broke, the task fixes AdVoid, brings the fix into steam-sync and releases a Gaming Enjoyer beta.
+  - It also reads the upstream changes to uBlock Origin's lists and TwitchAdSolutions for site changes, and keeps its
+    state in `.nightly\state.json`.
 
 Gaming Enjoyer (`C:\Repos\steam-sync`) carries a copy of this repo in its `advoid/` folder as a git subtree, so its
 GitHub build has the engine. After committing here, update the copy from steam-sync with
