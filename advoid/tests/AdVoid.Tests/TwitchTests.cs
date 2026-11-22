@@ -65,7 +65,8 @@ public class TwitchTests
     {
         var variants = Hls.ParseMaster(Master);
         Assert.Equal(4, variants.Count);
-        Assert.Equal(new Variant("https://a.playlist.ttvnw.net/v1/playlist/source.m3u8", "1080p60 (source)", "chunked", 1080, 60, 8000000), variants[0]);
+        Assert.Equal(new Variant("https://a.playlist.ttvnw.net/v1/playlist/source.m3u8", "1080p60 (source)", "chunked", 1080, 60, 8000000, "avc1.64002A"), variants[0]);
+        Assert.Equal("", variants[3].Codec); // audio only
         Assert.Equal("480p", variants[2].Name);
         Assert.Equal(0, variants[3].Height);
     }
@@ -85,7 +86,7 @@ public class TwitchTests
     {
         var variants = Hls.ParseMaster(MasterIvs);
         Assert.Equal(2, variants.Count);
-        Assert.Equal(new Variant("https://d1.cloudfront.net/x/480p30/index-dvr.m3u8", "480p", "480p30", 480, 30.221, 1459403), variants[1]);
+        Assert.Equal(new Variant("https://d1.cloudfront.net/x/480p30/index-dvr.m3u8", "480p", "480p30", 480, 30.221, 1459403, "avc1.4D401F"), variants[1]);
         Assert.Equal("1080p60", variants[0].Name);
     }
 
@@ -115,6 +116,22 @@ public class TwitchTests
         Assert.Equal("chunked", Hls.Closest(variants, null)!.Group);                          // unknown: the best
         Assert.Equal("480p30", Hls.Closest(variants, variants[1] with { Group = "x", Height = 600 })!.Group); // tallest not taller
         Assert.Null(Hls.Closest(variants.Where(v => v.Height == 0).ToList(), variants[0]));   // audio only
+    }
+
+    [Fact]
+    public void NeverSwitchesCodec()
+    {
+        var hevc1440 = new Variant("u", "1440p60", "1440p60", 1440, 60, 9000000, "hev1.1.6.L150.90");
+        var av1440 = hevc1440 with { Codec = "av01.0.12M.08" };
+        var avc = Hls.ParseMaster(Master);                                           // 1080p/720p/480p, all H.264
+        Assert.Null(Hls.Closest(avc, hevc1440));                                      // no HEVC copy: nothing to swap to
+        var mixed = avc.Append(hevc1440 with { Url = "h" }).Append(av1440 with { Url = "a", Group = "1440p60-av1" }).ToList();
+        Assert.Equal("h", Hls.Closest(mixed, hevc1440)!.Url);                         // the HEVC one, even with others the same height
+        Assert.Equal("a", Hls.Closest(mixed, av1440 with { Group = "x" })!.Url);
+        Assert.Equal("chunked", Hls.Closest(mixed, avc[0])!.Group);                   // H.264 stays H.264
+        Assert.Equal("chunked", Hls.Closest(avc, hevc1440 with { Codec = "avc1.640033" })!.Group); // H.264 1440p: 1080p is fine
+        Assert.Equal("hevc", Hls.CodecFamily("hvc1.2.4.L153"));
+        Assert.Equal("avc", Hls.CodecFamily("avc1.4D401F"));
     }
 
     [Fact]
