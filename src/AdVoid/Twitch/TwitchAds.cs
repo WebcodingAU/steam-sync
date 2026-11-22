@@ -22,28 +22,62 @@ public enum PlaylistKind { None, Master, Media }
 /// the stream's own playlist, so request blocking can't touch them. But Twitch serves several copies of each stream,
 /// one per player type, and the copies for embedded players usually come without ads. So the host routes the
 /// player's playlist requests through here: master playlists are passed on (remembering which URL is which quality),
-/// and while a media playlist carries an ad, the player is given the same quality from an ad-free copy instead
-/// (<c>embed</c>, then <c>popout</c>, then the 360p <c>autoplay</c>). If every copy has the ad, the ad segments are cut
-/// out, which freezes the picture for the break instead of showing it.
+/// and while a media playlist carries an ad, the player is given the same quality from an ad-free copy instead.
 /// </summary>
-/// <remarks>Thread-safe; one instance can serve every window. Uses Twitch's public web client id, never an account.</remarks>
+/// <remarks>
+/// <para>Copies are tried in order: <c>embed</c> and <c>popout</c> as the signed-in viewer (when the host has passed on
+/// the page's own Twitch headers, see <see cref="SetViewerHeaders"/>), so the copy has the same qualities as the
+/// viewer's stream (signed-in viewers get 1440p and HEVC/AV1 tiers anonymous ones don't), then <c>embed</c>,
+/// <c>popout</c> and the 360p <c>autoplay</c> anonymously. A copy is only used in the same codec as what the player is
+/// playing: a player can't switch codecs mid-stream (it goes black). With no copy to use, the ad segments are cut out,
+/// which pauses the picture for the break instead of showing it.</para>
+/// <para>A break ends once the stream's playlist has come back without ads twice in a row, so the player isn't
+/// switched back and forth by a playlist that flickers between the two at the end of a break.</para>
+/// <para>Thread-safe; one instance can serve every window. The viewer's headers are only ever sent to gql.twitch.tv,
+/// and never logged.</para>
+/// </remarks>
 public sealed partial class TwitchAds(HttpClient http)
 {
     /// <summary>The client id twitch.tv's own web player uses (public, part of the site).</summary>
     public const string ClientId = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 
-    private static readonly string[] BackupPlayerTypes = ["embed", "popout", "autoplay"];
+    /// <summary>The page's request headers worth reusing for the signed-in copy (the viewer's session with Twitch).</summary>
+    public static readonly string[] ViewerHeaderNames = ["Authorization", "Client-Integrity", "Device-ID", "Client-Version", "Client-Session-Id"];
+
+    private sealed record Source(string PlayerType, bool SignedIn)
+    {
+        public override string ToString() => SignedIn ? PlayerType + " (signed in)" : PlayerType;
+    }
+
+    private static readonly Source[] SignedInSources = [new("embed", true), new("popout", true)];
+    private static readonly Source[] AnonymousSources = [new("embed", false), new("popout", false), new("autoplay", false)];
     private static readonly TimeSpan BackupLifetime = TimeSpan.FromMinutes(10);
-    private static readonly TimeSpan AllBackupsHadAdsFor = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan NoCopyFor = TimeSpan.FromSeconds(8);
+    private const int AdFreeToEnd = 2;
     private static readonly string[] PassedHeaders =
         ["Content-Type", "Cache-Control", "Access-Control-Allow-Origin", "Access-Control-Allow-Credentials", "Access-Control-Expose-Headers", "Timing-Allow-Origin"];
+    // Usher parameters that belong to one request or one player type; the rest (codecs, platform, ...) are reused.
+    private static readonly HashSet<string> OwnUsherParameters = new(StringComparer.OrdinalIgnoreCase)
+        { "sig", "token", "p", "player_type", "play_session_id", "acmb" };
 
     private sealed record Known(string Login, Variant Variant);
     private sealed record Backup(List<Variant> Variants, DateTime Expires);
+    private sealed record Usher(string Path, List<KeyValuePair<string, string>> Parameters);
+
+    // A media playlist's ad break: which copy it's on (null: cutting the ad out) and how many ad-free polls since.
+    private sealed class Break
+    {
+        public Source? Source;
+        public string Shown = "";
+        public int AdFree;
+    }
 
     private readonly ConcurrentDictionary<string, Known> _known = new(StringComparer.Ordinal);    // media playlist URL -> channel, quality
-    private readonly ConcurrentDictionary<string, Backup> _backups = new(StringComparer.Ordinal); // "login|playerType" -> its qualities
-    private readonly ConcurrentDictionary<string, DateTime> _allHadAds = new(StringComparer.Ordinal); // login -> until when to stop asking
+    private readonly ConcurrentDictionary<string, Usher> _usher = new(StringComparer.Ordinal);    // login -> how the player asked for it
+    private readonly ConcurrentDictionary<string, Backup> _backups = new(StringComparer.Ordinal); // "login|source" -> its qualities
+    private readonly ConcurrentDictionary<string, DateTime> _noCopy = new(StringComparer.Ordinal); // login -> until when not to look
+    private readonly ConcurrentDictionary<string, Break> _breaks = new(StringComparer.Ordinal);   // media playlist URL -> its break
+    private volatile IReadOnlyList<KeyValuePair<string, string>> _viewer = [];
     private long _replaced, _stripped;
 
     /// <summary>Media playlists answered with an ad-free copy.</summary>
@@ -51,8 +85,23 @@ public sealed partial class TwitchAds(HttpClient http)
     /// <summary>Media playlists answered with the ad segments cut out.</summary>
     public long Stripped => Interlocked.Read(ref _stripped);
 
-    /// <summary>Called with a line worth logging (an ad break starting or ending, a failed backup).</summary>
+    /// <summary>Called with a line worth logging (an ad break starting or ending, a failed copy).</summary>
     public Action<string>? Log { get; set; }
+
+    /// <summary>
+    /// Passes on the headers of one of the page's own gql.twitch.tv requests (only <see cref="ViewerHeaderNames"/> are
+    /// kept), so ad-free copies can be asked for as the signed-in viewer. Requests without an Authorization header
+    /// are ignored, so a signed-out page leaves the last session in place (a stale one just fails and falls back).
+    /// </summary>
+    public void SetViewerHeaders(IEnumerable<KeyValuePair<string, string>> pageHeaders)
+    {
+        var kept = pageHeaders.Where(h => ViewerHeaderNames.Contains(h.Key, StringComparer.OrdinalIgnoreCase) && h.Value.Length > 0).ToList();
+        if (!kept.Any(h => h.Key.Equals("Authorization", StringComparison.OrdinalIgnoreCase))) return;
+        _viewer = kept;
+    }
+
+    /// <summary>True once the page's signed-in headers are known.</summary>
+    public bool SignedIn => _viewer.Count > 0;
 
     /// <summary>
     /// What kind of Twitch playlist <paramref name="url"/> is; only these need <see cref="FetchAsync"/>. Media playlists
@@ -98,83 +147,122 @@ public sealed partial class TwitchAds(HttpClient http)
         {
             var login = Login(url);
             if (login is not null)
+            {
+                RememberUsher(login, url);
                 foreach (var variant in Hls.ParseMaster(body)) _known[variant.Url] = new Known(login, variant);
+            }
             return new(200, "OK", body, headers, PlaylistAction.None);
         }
 
         var known = _known.GetValueOrDefault(url);
+        _breaks.TryGetValue(url, out var brk);
+        var passThrough = new PlaylistResponse(200, "OK", body, headers, PlaylistAction.None);
+
         if (!Hls.HasAds(body))
         {
-            if (known is not null && _inBreak.TryRemove(known.Login, out _)) Log?.Invoke($"Twitch: ad break on {known.Login} is over");
-            return new(200, "OK", body, headers, PlaylistAction.None);
-        }
-
-        string? how = null, text = null;
-        if (known is not null && !(_allHadAds.TryGetValue(known.Login, out var until) && DateTime.UtcNow < until))
-        {
-            foreach (var playerType in BackupPlayerTypes)
+            if (brk is null || known is null) return passThrough;
+            // The break may be ending: stay on the copy until the stream has been ad-free twice in a row.
+            if (++brk.AdFree < AdFreeToEnd && brk.Source is not null
+                && await TryCopyAsync(known, brk.Source, cancel).ConfigureAwait(false) is { } still)
             {
-                try { text = await BackupPlaylistAsync(known, playerType, cancel).ConfigureAwait(false); }
-                catch (Exception ex) when (ex is HttpRequestException or JsonException || ex is TaskCanceledException && !cancel.IsCancellationRequested)
-                {
-                    Log?.Invoke($"Twitch: the {playerType} copy of {known.Login} failed: {ex.Message}");
-                    _backups.TryRemove(known.Login + "|" + playerType, out _);
-                    continue;
-                }
-                if (text is not null) { how = playerType; break; }
+                Interlocked.Increment(ref _replaced);
+                return new(200, "OK", still.Text, headers, PlaylistAction.Replaced);
             }
-            if (how is null) _allHadAds[known.Login] = DateTime.UtcNow + AllBackupsHadAdsFor;
+            _breaks.TryRemove(url, out _);
+            Log?.Invoke($"Twitch: ad break on {known.Login} is over ({known.Variant.Name})");
+            return passThrough;
         }
 
-        PlaylistAction action;
-        if (how is not null) { action = PlaylistAction.Replaced; Interlocked.Increment(ref _replaced); }
-        else { action = PlaylistAction.Stripped; how = "cut"; text = Hls.StripAds(body); Interlocked.Increment(ref _stripped); }
-        if (known is not null && (!_inBreak.TryGetValue(known.Login, out var before) || before != how))
-            Log?.Invoke(how == "cut"
-                ? $"Twitch: ad break on {known.Login} and no ad-free copy: cutting the ad out"
-                : $"Twitch: ad break on {known.Login}: playing the {how} copy ({known.Variant.Name}) until it ends");
-        if (known is not null) _inBreak[known.Login] = how;
-        return new(200, "OK", text!, headers, action);
-    }
-
-    private readonly ConcurrentDictionary<string, string> _inBreak = new(StringComparer.Ordinal); // login -> "embed"/"popout"/"autoplay"/"cut"
-
-    // The same quality from another player type's copy of the stream, or null if that copy has the ad too.
-    private async Task<string?> BackupPlaylistAsync(Known known, string playerType, CancellationToken cancel)
-    {
-        var key = known.Login + "|" + playerType;
-        if (!_backups.TryGetValue(key, out var backup) || DateTime.UtcNow >= backup.Expires)
+        if (known is null) // a media playlist no master listed: cut the ad out, nothing better to offer
         {
-            backup = await LoadBackupAsync(known.Login, playerType, cancel).ConfigureAwait(false);
-            _backups[key] = backup;
+            Interlocked.Increment(ref _stripped);
+            return new(200, "OK", Hls.StripAds(body), headers, PlaylistAction.Stripped);
         }
-        var variant = Hls.Closest(backup.Variants, known.Variant);
-        if (variant is null) return null;
-        var text = await http.GetStringAsync(variant.Url, cancel).ConfigureAwait(false);
-        return Hls.HasAds(text) || !Hls.HasLive(text) ? null : text;
+
+        brk ??= _breaks.GetOrAdd(url, _ => new Break());
+        brk.AdFree = 0;
+        (string Text, Variant Variant, Source Source)? copy = null;
+        if (!(_noCopy.TryGetValue(known.Login, out var until) && DateTime.UtcNow < until))
+        {
+            // The copy already in use first (switching copies is a jump for the player), then the rest in order.
+            var order = (_viewer.Count > 0 ? SignedInSources.Concat(AnonymousSources) : AnonymousSources).ToList();
+            if (brk.Source is not null && order.Remove(brk.Source)) order.Insert(0, brk.Source);
+            foreach (var source in order)
+                if ((copy = await TryCopyAsync(known, source, cancel).ConfigureAwait(false)) is not null) break;
+            if (copy is null) _noCopy[known.Login] = DateTime.UtcNow + NoCopyFor;
+        }
+
+        var what = $"{known.Variant.Name} {Hls.CodecFamily(known.Variant.Codec)}".TrimEnd();
+        if (copy is { } c)
+        {
+            brk.Source = c.Source;
+            var shown = $"{c.Source}|{c.Variant.Name}";
+            if (brk.Shown != shown)
+                Log?.Invoke($"Twitch: ad break on {known.Login} ({what}): playing the {c.Source} copy at {c.Variant.Name} until it ends");
+            brk.Shown = shown;
+            Interlocked.Increment(ref _replaced);
+            return new(200, "OK", c.Text, headers, PlaylistAction.Replaced);
+        }
+
+        brk.Source = null;
+        if (brk.Shown != "cut")
+            Log?.Invoke($"Twitch: ad break on {known.Login} ({what}): no ad-free copy in that codec, cutting the ad out (the picture pauses)");
+        brk.Shown = "cut";
+        Interlocked.Increment(ref _stripped);
+        return new(200, "OK", Hls.StripAds(body), headers, PlaylistAction.Stripped);
     }
 
-    private async Task<Backup> LoadBackupAsync(string login, string playerType, CancellationToken cancel)
+    // The same quality (same codec) from another copy of the stream, or null if it has none, has the ad too, or fails.
+    private async Task<(string Text, Variant Variant, Source Source)?> TryCopyAsync(Known known, Source source, CancellationToken cancel)
+    {
+        var key = $"{known.Login}|{source}";
+        try
+        {
+            if (!_backups.TryGetValue(key, out var backup) || DateTime.UtcNow >= backup.Expires)
+            {
+                backup = await LoadBackupAsync(known.Login, source, cancel).ConfigureAwait(false);
+                _backups[key] = backup;
+            }
+            var variant = Hls.Closest(backup.Variants, known.Variant);
+            if (variant is null) return null;
+            var text = await http.GetStringAsync(variant.Url, cancel).ConfigureAwait(false);
+            return Hls.HasAds(text) || !Hls.HasLive(text) ? null : (text, variant, source);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or JsonException || ex is TaskCanceledException && !cancel.IsCancellationRequested)
+        {
+            Log?.Invoke($"Twitch: the {source} copy of {known.Login} failed: {ex.Message}");
+            _backups.TryRemove(key, out _);
+            return null;
+        }
+    }
+
+    private async Task<Backup> LoadBackupAsync(string login, Source source, CancellationToken cancel)
     {
         var query = new JsonObject
         {
             ["operationName"] = "PlaybackAccessToken_Template",
             ["query"] = "query PlaybackAccessToken_Template($login: String!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, "
                 + "params: {platform: \"web\", playerBackend: \"mediaplayer\", playerType: $playerType}) { value signature } }",
-            ["variables"] = new JsonObject { ["login"] = login, ["playerType"] = playerType },
+            ["variables"] = new JsonObject { ["login"] = login, ["playerType"] = source.PlayerType },
         };
         using var tokenRequest = new HttpRequestMessage(HttpMethod.Post, "https://gql.twitch.tv/gql")
         {
             Content = new StringContent(query.ToJsonString(), Encoding.UTF8, "text/plain"),
         };
-        tokenRequest.Headers.Add("Client-Id", ClientId);
+        if (source.SignedIn)
+            foreach (var (name, headerValue) in _viewer) tokenRequest.Headers.TryAddWithoutValidation(name, headerValue);
+        if (!tokenRequest.Headers.Contains("Client-Id")) tokenRequest.Headers.Add("Client-Id", ClientId);
         using var tokenResponse = await http.SendAsync(tokenRequest, cancel).ConfigureAwait(false);
         tokenResponse.EnsureSuccessStatusCode();
         var json = JsonNode.Parse(await tokenResponse.Content.ReadAsStringAsync(cancel).ConfigureAwait(false));
         var token = json?["data"]?["streamPlaybackAccessToken"];
         var value = (string?)token?["value"];
         var signature = (string?)token?["signature"];
-        if (value is null || signature is null) throw new JsonException($"no {playerType} token for {login}");
+        if (value is null || signature is null)
+        {
+            var error = (string?)json?["errors"]?[0]?["message"];
+            throw new JsonException(error is null ? "no token" : "no token: " + error);
+        }
 
         var expires = DateTime.UtcNow + BackupLifetime;
         try
@@ -187,11 +275,33 @@ public sealed partial class TwitchAds(HttpClient http)
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException) { }
 
-        var usher = $"https://usher.ttvnw.net/api/channel/hls/{Uri.EscapeDataString(login)}.m3u8"
-            + $"?allow_source=true&fast_bread=true&player_type={playerType}&playlist_include_framerate=true"
-            + $"&p={Random.Shared.Next(1_000_000)}&sig={signature}&token={Uri.EscapeDataString(value)}";
-        var master = await http.GetStringAsync(usher, cancel).ConfigureAwait(false);
+        // Asked for the way the player asked for its own stream (same API, codecs, platform), so the copy has the same
+        // qualities in the same codecs.
+        var usher = _usher.GetValueOrDefault(login);
+        var builder = new StringBuilder("https://usher.ttvnw.net")
+            .Append(usher?.Path ?? $"/api/channel/hls/{Uri.EscapeDataString(login)}.m3u8").Append('?');
+        var parameters = usher?.Parameters ?? [new("allow_source", "true"), new("fast_bread", "true"), new("playlist_include_framerate", "true")];
+        foreach (var (name, v) in parameters) builder.Append(Uri.EscapeDataString(name)).Append('=').Append(Uri.EscapeDataString(v)).Append('&');
+        builder.Append("player_type=").Append(source.PlayerType)
+            .Append("&p=").Append(Random.Shared.Next(1_000_000))
+            .Append("&sig=").Append(signature)
+            .Append("&token=").Append(Uri.EscapeDataString(value));
+        var master = await http.GetStringAsync(builder.ToString(), cancel).ConfigureAwait(false);
         return new Backup(Hls.ParseMaster(master), expires);
+    }
+
+    private void RememberUsher(string login, string url)
+    {
+        var uri = new Uri(url);
+        var parameters = new List<KeyValuePair<string, string>>();
+        foreach (var pair in uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var eq = pair.IndexOf('=');
+            var name = Uri.UnescapeDataString(eq < 0 ? pair : pair[..eq]);
+            if (OwnUsherParameters.Contains(name)) continue;
+            parameters.Add(new(name, eq < 0 ? "" : Uri.UnescapeDataString(pair[(eq + 1)..])));
+        }
+        _usher[login] = new Usher(uri.AbsolutePath, parameters);
     }
 
     private static string? Login(string usherUrl)

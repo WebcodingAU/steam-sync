@@ -7,7 +7,8 @@ namespace AdVoid.Twitch;
 /// <summary>One quality in a Twitch master playlist: its media playlist's URL and what it is.</summary>
 /// <param name="Name">Twitch's name for it ("1080p60 (source)", "720p60", "audio_only").</param>
 /// <param name="Group">The quality's stable id ("chunked" or "1080p60" for the source, "720p60"): the same quality has the same id in every copy.</param>
-public sealed record Variant(string Url, string Name, string Group, int Height, double FrameRate, long Bandwidth);
+/// <param name="Codec">The video codec from CODECS ("avc1.64002A", "hev1.1.6.L150", "av01.0.12M.08"), or "" for audio only.</param>
+public sealed record Variant(string Url, string Name, string Group, int Height, double FrameRate, long Bandwidth, string Codec = "");
 
 /// <summary>
 /// The small part of HLS (the playlist format behind Twitch's streams) AdVoid needs: reading a master playlist's
@@ -44,24 +45,49 @@ public static partial class Hls
                 double.TryParse(Attribute(streamInf, "FRAME-RATE"), NumberStyles.Float, CultureInfo.InvariantCulture, out var fps);
                 long.TryParse(Attribute(streamInf, "BANDWIDTH"), out var bandwidth);
                 var name = names.GetValueOrDefault(group) ?? Attribute(streamInf, "IVS-NAME") ?? group;
-                variants.Add(new Variant(line, name, group, height, fps, bandwidth));
+                var codec = (Attribute(streamInf, "CODECS") ?? "").Split(',').Select(c => c.Trim())
+                    .FirstOrDefault(c => CodecFamily(c) is "avc" or "hevc" or "av1" or "vp9") ?? "";
+                variants.Add(new Variant(line, name, group, height, fps, bandwidth, codec));
                 streamInf = null;
             }
         }
         return variants;
     }
 
-    /// <summary>The variant in <paramref name="choices"/> closest to <paramref name="wanted"/>: the same quality, else the
-    /// tallest no taller than it, else the shortest. Null when there are no video qualities.</summary>
+    /// <summary>
+    /// The variant in <paramref name="choices"/> closest to <paramref name="wanted"/>, in the same video codec (a player
+    /// can't switch codecs mid-stream): the same quality, else the tallest no taller than it, else the shortest. Null
+    /// when there's no video quality in that codec.
+    /// </summary>
     public static Variant? Closest(IReadOnlyList<Variant> choices, Variant? wanted)
     {
         var video = choices.Where(v => v.Height > 0).ToList();
+        if (wanted is not null && wanted.Codec.Length > 0)
+        {
+            var family = CodecFamily(wanted.Codec);
+            video = video.Where(v => v.Codec.Length == 0 || CodecFamily(v.Codec) == family).ToList();
+        }
         if (video.Count == 0) return null;
         if (wanted is null) return video.MaxBy(v => (v.Height, v.FrameRate));
         return video.FirstOrDefault(v => v.Group == wanted.Group)
             ?? video.FirstOrDefault(v => v.Height == wanted.Height && Math.Abs(v.FrameRate - wanted.FrameRate) < 1)
             ?? video.Where(v => v.Height <= wanted.Height).MaxBy(v => (v.Height, v.FrameRate))
             ?? video.MinBy(v => v.Height);
+    }
+
+    /// <summary>The codec family of an RFC 6381 codec string: "avc", "hevc", "av1", "vp9", "aac", or the string's first part.</summary>
+    public static string CodecFamily(string codec)
+    {
+        var prefix = codec.Split('.')[0].Trim().ToLowerInvariant();
+        return prefix switch
+        {
+            "avc1" or "avc3" => "avc",
+            "hev1" or "hvc1" => "hevc",
+            "av01" => "av1",
+            "vp09" or "vp9" => "vp9",
+            "mp4a" => "aac",
+            _ => prefix,
+        };
     }
 
     /// <summary>True when a media playlist carries a stitched ad (marked break, or any segment that isn't the stream).</summary>
