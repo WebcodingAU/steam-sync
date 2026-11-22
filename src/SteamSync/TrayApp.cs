@@ -39,6 +39,7 @@ internal sealed class TrayApp : ApplicationContext
     private readonly ToolStripMenuItem _updateItem = new() { Visible = false };
     private LibraryWindow? _library;
     private readonly Dictionary<WatchSite, WatchWindow> _watch = [];
+    private readonly GlobalHotkeys _hotkeys = new(); // Shift+F1 YouTube, Shift+F2 Twitch, from any app
     private EqualizerWindow? _eqWindow;
     private readonly System.Windows.Forms.Timer _limiterWatch = new() { Interval = 30_000 };
     private readonly Dictionary<SyncState, Icon> _icons = new()
@@ -94,8 +95,8 @@ internal sealed class TrayApp : ApplicationContext
         menu.Items.AddRange(
         [
             new ToolStripMenuItem("Open Library", null, (_, _) => OpenLibrary()) { Font = new Font(menu.Font, FontStyle.Bold) },
-            new ToolStripMenuItem("Open YouTube", null, (_, _) => OpenWatch(WatchSite.YouTube)) { ToolTipText = "YouTube in its own window, with AdVoid blocking ads" },
-            new ToolStripMenuItem("Open Twitch", null, (_, _) => OpenWatch(WatchSite.Twitch)) { ToolTipText = "Twitch in its own window, with AdVoid skipping stream ads" },
+            WatchItem("Open YouTube", WatchSite.YouTube, Keys.F1, "YouTube in its own window, with AdVoid blocking ads"),
+            WatchItem("Open Twitch", WatchSite.Twitch, Keys.F2, "Twitch in its own window, with AdVoid skipping stream ads"),
             _spotifyItem,
             new ToolStripSeparator(),
             _statusItem,
@@ -173,6 +174,24 @@ internal sealed class TrayApp : ApplicationContext
             _library.WindowState = FormWindowState.Normal;
         }
         _library.Activate();
+    }
+
+    /// <summary>The menu item for a site's window, and its Shift+F-key shortcut (shown on the item when Windows gave it
+    /// to us). The shortcut opens the window from anywhere, or minimizes it when it's already the window in front.</summary>
+    private ToolStripMenuItem WatchItem(string text, WatchSite site, Keys key, string tip)
+    {
+        var item = new ToolStripMenuItem(text, null, (_, _) => OpenWatch(site)) { ToolTipText = tip };
+        if (_hotkeys.RegisterShift(key, () => ToggleWatch(site))) item.ShortcutKeyDisplayString = "Shift+" + key;
+        return item;
+    }
+
+    private void ToggleWatch(WatchSite site)
+    {
+        if (_watch.TryGetValue(site, out var window) && !window.IsDisposed && Form.ActiveForm == window
+            && window.WindowState != FormWindowState.Minimized)
+            window.WindowState = FormWindowState.Minimized;
+        else
+            OpenWatch(site);
     }
 
     /// <summary>Shows the site's window (one per site), starting its browser engine only now.</summary>
@@ -581,6 +600,7 @@ internal sealed class TrayApp : ApplicationContext
     protected override void ExitThreadCore()
     {
         _openWait.Unregister(null);
+        _hotkeys.Dispose();
         _updater.Dispose();
         _library?.Close();
         _spotify?.Dispose();

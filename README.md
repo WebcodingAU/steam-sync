@@ -141,7 +141,9 @@ It needs Spotify Premium; that's Spotify's rule for the SDK.
 ## YouTube and Twitch windows
 
 **Open YouTube** and **Open Twitch** in the tray menu open the site in its own window (`WatchWindow.cs`; `WatchSite`
-says what differs per site), for guides and streams on a second monitor without a browser open. Each site has its own
+says what differs per site), for guides and streams on a second monitor without a browser open. **Shift+F1** and
+**Shift+F2** do the same from any app (`GlobalHotkeys.cs`), and minimize the window when it's already in front; the menu
+shows a shortcut only if Windows gave it to the app (another app may hold it). Each site has its own
 WebView2 profile (`%LOCALAPPDATA%\SteamSync\WebView2-YouTube` / `WebView2-Twitch`, so its own sign-in), opens on the
 second monitor the first time and then where it was left (`youtube-window.json` / `twitch-window.json`), and has
 **Keep on top** in the title bar's menu (right-click the title bar). F11 is full screen. Only the site's own pages (and
