@@ -16,6 +16,13 @@ first home; the goal is to grow it into one of the best blockers around.
   servers, so request blocking can't stop them. The script removes `adPlacements`, `adSlots` and `playerAds` from
   `ytInitialPlayerResponse` and from every JSON response before the player reads them, hides ad tiles and banners,
   and skips any ad that still starts.
+  - YouTube also hunts for ad blockers. Once it flags a viewer, it shows "Ad blockers are not allowed on YouTube" and
+    pauses the video. To stay unflagged, every hooked built-in (`JSON.parse`, `Response.json`, `Promise.then`) is a
+    `Proxy` of the original, and `Function.prototype.toString` describes each by its original, so they read exactly
+    like native code.
+  - YouTube's `onAbnormalityDetected` handler never runs.
+  - The popup itself (`auxiliaryUi.messageRenderers.enforcementMessageViewModel`) is removed from the player data. If
+    it still reaches the page, it is closed and the video plays on.
 - **Twitch** (`Twitch/TwitchAds.cs`, `Twitch/Hls.cs`). Twitch splices ads into the live stream's own playlist. The
   host routes the player's playlist requests through `TwitchAds.FetchAsync`: master playlists pass through (noting
   which URL is which quality), and while a media playlist carries an ad (`twitch-stitched-ad`, or segments not titled
