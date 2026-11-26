@@ -17,4 +17,9 @@
     <ProjectReference Include="..\..\src\AdVoid\AdVoid.csproj" />
   </ItemGroup>
 
+  <!-- The page-script tests ScriptletTests runs in Node. -->
+  <ItemGroup>
+    <None Include="Scriptlets\*.mjs" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
