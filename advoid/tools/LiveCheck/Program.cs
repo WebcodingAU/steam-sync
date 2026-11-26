@@ -192,6 +192,10 @@ async Task<int> YouTube()
     report["videos"] = videos;
     var anyScheduled = 0;
     var seenTop = new SortedSet<string>(); var seenNested = new SortedSet<string>(); var seenRenderers = new SortedSet<string>();
+    // The popups the player data asks for (auxiliaryUi.messageRenderers). youtube.js removes POPUP_KEYS; a new kind of
+    // popup here may be a new ad-blocker warning.
+    var popupKeys = Regex.Match(script, @"POPUP_KEYS = \[(.*?)\]").Groups[1].Value.Split(',').Select(k => k.Trim().Trim('"')).ToHashSet();
+    var seenPopups = new SortedSet<string>();
     foreach (var id in ids)
     {
         var page = await http.GetStringAsync($"https://www.youtube.com/watch?v={id}&hl=en");
@@ -211,6 +215,8 @@ async Task<int> YouTube()
             if (path.Contains('.') && !adKeys.Contains(root) && adLike.IsMatch(key)) nested.Add(path);
         });
         entry["scheduled"] = string.Join(" ", top.Where(adKeys.Contains));
+        if (player["auxiliaryUi"]?["messageRenderers"] is JsonObject messages)
+            foreach (var (key, _) in messages) seenPopups.Add(key);
         if (top.Any(adKeys.Contains)) anyScheduled++;
         foreach (var k in top) seenTop.Add(k);
         foreach (var n in nested) seenNested.Add(Regex.Replace(n, @"\[\d+\]", "[]"));
@@ -225,6 +231,11 @@ async Task<int> YouTube()
     report["topLevelAdFields"] = string.Join(" ", seenTop);
     report["nestedAdFields"] = new JsonArray(seenNested.Take(60).Select(n => (JsonNode)n).ToArray());
     report["adRenderers"] = string.Join(" ", seenRenderers);
+    report["popupsRemoved"] = string.Join(" ", popupKeys);
+    report["popups"] = string.Join(" ", seenPopups);
+    foreach (var k in seenPopups.Where(k => popupKeys.Contains(k))) notes.Add($"a signed-out client was sent the ad-blocker popup ({k}); youtube.js removes it");
+    foreach (var k in seenPopups.Where(k => !popupKeys.Contains(k) && Regex.IsMatch(k, "(?i)enforce|block|adblock|warning")))
+        problems.Add($"player data asks for a popup youtube.js doesn't remove and may be an ad-blocker warning: {k}");
     report["uncoveredTopLevelAdFields"] = string.Join(" ", uncoveredTop);
     report["uncoveredAdRenderers"] = string.Join(" ", uncoveredRenderers);
     foreach (var k in uncoveredTop) problems.Add($"player data has a top-level ad field youtube.js doesn't remove: {k}");
