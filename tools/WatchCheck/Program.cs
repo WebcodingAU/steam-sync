@@ -90,7 +90,8 @@ internal static class Program
             var entry = new JsonObject { ["url"] = url };
             videos.Add(entry);
             double adSeconds = 0, streak = 0, longest = 0, firstT = -1, lastT = -1;
-            int frames = 0, black = 0, removed = 0;
+            int frames = 0, black = 0, removed = 0, popups = 0;
+            double popupSeconds = 0;
             var bot = false; var error = false;
             for (var tick = 0; tick < seconds * 2; tick++)
             {
@@ -100,7 +101,9 @@ internal static class Program
                       const text = document.body ? document.body.innerText : '';
                       if (v && v.paused && v.currentTime < 1) v.play().catch(() => {});
                       return { ad: !!(p && p.classList.contains('ad-showing')), t: v ? v.currentTime : -1,
-                               removed: window.__advoidYouTubeRemoved ?? -1, error: !!document.querySelector('.ytp-error'),
+                               stats: window[Symbol.for('advoid.youtube')]?.() ?? { removed: -1, popups: -1 },
+                               popup: [...document.querySelectorAll('ytd-enforcement-message-view-model')].some(e => e.getClientRects().length > 0),
+                               error: !!document.querySelector('.ytp-error'),
                                bot: /confirm you.re not a bot|Sign in to confirm/.test(text) }; })()
                     """);
                 if (s is null) continue;
@@ -110,7 +113,9 @@ internal static class Program
                 longest = Math.Max(longest, streak);
                 var t = s["t"]!.GetValue<double>();
                 if (t >= 0) { if (firstT < 0) firstT = t; lastT = t; }
-                removed = Math.Max(removed, s["removed"]!.GetValue<int>());
+                removed = Math.Max(removed, s["stats"]!["removed"]!.GetValue<int>());
+                popups = Math.Max(popups, s["stats"]!["popups"]!.GetValue<int>());
+                if (s["popup"]!.GetValue<bool>()) popupSeconds += 0.5;
                 bot |= s["bot"]!.GetValue<bool>();
                 error |= s["error"]!.GetValue<bool>();
                 if (tick % 20 == 19 && !ad && await IsBlack() is { } isBlack) { frames++; if (isBlack) black++; }
@@ -119,6 +124,7 @@ internal static class Program
             entry["adSeconds"] = adSeconds;
             entry["played"] = Math.Round(played, 1);
             entry["removed"] = removed;
+            if (popups > 0) entry["popupsRemoved"] = popups;
             entry["blackFrames"] = $"{black}/{frames}";
             if (bot) { entry["status"] = "bot check"; Notes.Add($"{url}: YouTube asked for a sign-in or bot check"); continue; }
             if (error) entry["status"] = "player error";
@@ -126,12 +132,55 @@ internal static class Program
             else if (adSeconds > 0) Notes.Add($"{url}: an ad started and the fallback skipped it in {adSeconds:0.#} s: the player data still had an ad youtube.js didn't remove");
             if (played < 5) Problems.Add($"{url}: the video didn't play ({played:0.#} s in {seconds} s){(error ? ", player error" : "")}");
             if (frames >= 2 && black >= 2) Problems.Add($"{url}: the picture was black in {black} of {frames} frames");
+            if (popupSeconds >= 1) Problems.Add($"{url}: YouTube's \"ad blockers are not allowed\" popup was on screen for {popupSeconds:0.#} s");
+            else if (popups > 0) Notes.Add($"{url}: YouTube sent its ad-blocker popup {popups} time(s); AdVoid removed it: YouTube has flagged this profile");
             if (removed > 0) proven++;
         }
+        await Stealth();
+        await PopupFallback();
         if (Problems.Count > 0) return 1;
         if (proven == 0) { Notes.Add("no video had an ad scheduled, so removing one wasn't tested"); return 2; }
         Notes.Add($"{proven} of {urls.Count} videos had ads scheduled and removed; all played");
         return 0;
+    }
+
+    // YouTube looks for ad blockers by how the page's built-in functions look: youtube.js's hooks must read exactly
+    // like the originals, and nothing on the page may be named after AdVoid.
+    private static async Task Stealth()
+    {
+        var r = await Js("""
+            (() => { const ts = Function.prototype.toString; const bad = [];
+              const want = { 'JSON.parse': [JSON.parse, 'parse'], 'Response.prototype.json': [Response.prototype.json, 'json'],
+                             'Promise.prototype.then': [Promise.prototype.then, 'then'], 'Function.prototype.toString': [ts, 'toString'] };
+              for (const [label, [fn, name]] of Object.entries(want))
+                if (ts.call(fn) !== 'function ' + name + '() { [native code] }') bad.push(label + ' shows "' + ts.call(fn).slice(0, 60) + '"');
+              if (Object.getOwnPropertyNames(window).some(k => /advoid/i.test(k))) bad.push('a global is named after AdVoid');
+              return bad; })()
+            """);
+        if (r is not JsonArray bad) { Notes.Add("couldn't run the stealth check"); return; }
+        Report["stealth"] = bad.Count == 0 ? "ok" : string.Join("; ", bad.Select(b => (string)b!));
+        foreach (var b in bad) Problems.Add($"youtube.js can be spotted: {b}");
+    }
+
+    // Signed-out profiles rarely get YouTube's ad-blocker popup, so it's staged: a copy of its dialog is put on the
+    // page over a paused video, and youtube.js must take it away and let the video play.
+    private static async Task PopupFallback()
+    {
+        await Js("""
+            (() => { const d = document.createElement('tp-yt-paper-dialog'); d.id = 'watchcheck-popup';
+              d.appendChild(document.createElement('ytd-enforcement-message-view-model')); document.body.appendChild(d);
+              document.querySelector('#movie_player video')?.pause(); return true; })()
+            """);
+        await Task.Delay(2000);
+        var r = await Js("""
+            (() => { const v = document.querySelector('#movie_player video');
+              return { gone: !document.getElementById('watchcheck-popup'), playing: !!v && !v.paused }; })()
+            """);
+        var gone = r?["gone"]?.GetValue<bool>() == true;
+        var playing = r?["playing"]?.GetValue<bool>() == true;
+        Report["popupFallback"] = gone && playing ? "ok" : $"gone={gone} playing={playing}";
+        if (!gone) Problems.Add("a staged ad-blocker popup stayed on the page (youtube.js's fallback didn't remove it)");
+        else if (!playing) Problems.Add("youtube.js removed a staged ad-blocker popup but the video stayed paused");
     }
 
     // ------------------------------------------------------------ Twitch
