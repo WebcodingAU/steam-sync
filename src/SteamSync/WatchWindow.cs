@@ -15,10 +15,11 @@ namespace SteamSync;
 /// <param name="Sites">Registrable domains that stay in the window; any other link opens in the default browser.</param>
 /// <param name="GoogleSignIn">Google's sign-in and consent pages stay in the window too (YouTube accounts).</param>
 /// <param name="TwitchStreams">Live stream playlists go through AdVoid's Twitch ad remover.</param>
-internal sealed record WatchSite(string Name, string Home, Color Background, string[] Sites, bool GoogleSignIn, bool TwitchStreams)
+/// <param name="Dislikes">Shows dislike counts (Return YouTube Dislike's estimates; YouTubeDislikes.cs).</param>
+internal sealed record WatchSite(string Name, string Home, Color Background, string[] Sites, bool GoogleSignIn, bool TwitchStreams, bool Dislikes = false)
 {
     public static readonly WatchSite YouTube = new("YouTube", "https://www.youtube.com/", Color.FromArgb(15, 15, 15),
-        ["youtube.com", "youtu.be", "youtube-nocookie.com", "ytimg.com", "googlevideo.com"], GoogleSignIn: true, TwitchStreams: false);
+        ["youtube.com", "youtu.be", "youtube-nocookie.com", "ytimg.com", "googlevideo.com"], GoogleSignIn: true, TwitchStreams: false, Dislikes: true);
 
     public static readonly WatchSite Twitch = new("Twitch", "https://www.twitch.tv/", Color.FromArgb(14, 14, 16),
         ["twitch.tv", "ttvnw.net", "jtvnw.net", "twitchcdn.net", "twitchsvc.net"], GoogleSignIn: false, TwitchStreams: true);
@@ -128,6 +129,7 @@ internal sealed class WatchWindow : Form
         // every request (from pages, workers and service workers) checked by the engine.
         await core.AddScriptToExecuteOnDocumentCreatedAsync(Scriptlets.All);
         await core.AddScriptToExecuteOnDocumentCreatedAsync(CosmeticLoader);
+        if (_site.Dislikes) await core.AddScriptToExecuteOnDocumentCreatedAsync(YouTubeDislikes.Script);
         core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All, CoreWebView2WebResourceRequestSourceKinds.All);
         core.WebResourceRequested += OnWebResourceRequested;
 
@@ -166,10 +168,23 @@ internal sealed class WatchWindow : Form
         JsonObject? message;
         try { message = JsonNode.Parse(e.WebMessageAsJson) as JsonObject; }
         catch (JsonException) { return; }
+        if (_site.Dislikes && (string?)message?["type"] == "dislikes" && message["id"]?.GetValueKind() == JsonValueKind.String)
+        {
+            _ = AnswerDislikesAsync((string)message["id"]!);
+            return;
+        }
         if ((string?)message?["type"] != "advoid-css") return;
         var css = AdBlocker.Engine.Cosmetics(e.Source);
         try { _web.CoreWebView2.PostWebMessageAsJson(new JsonObject { ["type"] = "advoid-css", ["css"] = css }.ToJsonString()); }
         catch (Exception ex) when (ex is InvalidOperationException or COMException) { }
+    }
+
+    private async Task AnswerDislikesAsync(string id)
+    {
+        var dislikes = await YouTubeDislikes.GetAsync(id);
+        var reply = new JsonObject { ["type"] = "dislikes", ["id"] = id, ["dislikes"] = dislikes };
+        try { _web.CoreWebView2?.PostWebMessageAsJson(reply.ToJsonString()); }
+        catch (Exception ex) when (ex is InvalidOperationException or COMException) { } // the window closed meanwhile
     }
 
     private void OnWebResourceRequested(object? sender, CoreWebView2WebResourceRequestedEventArgs e)

@@ -164,6 +164,11 @@ copy has it. A break lasts about a minute (the ad, then its segments scrolling o
 one. The title shows how many requests were blocked and ad breaks skipped. While a window is open the tray process
 stays out of Efficiency mode (`Efficiency.Held`), because the request checks run on its UI thread.
 
+The YouTube window also shows **dislike counts** on watch pages, next to the dislike button, as YouTube did
+before 2021 (`Scripts/youtube-dislikes.js` asks the app, `YouTubeDislikes.cs` fetches). The numbers are Return YouTube
+Dislike's estimates (returnyoutubedislike.com, credited in the count's tooltip), cached 10 minutes and kept within its
+API limits (100 calls a minute, 10,000 a day).
+
 `tools/WatchCheck` drives these windows for AdVoid's nightly check (`advoid/tools/nightly-check.ps1`).
 - `WatchCheck youtube [seconds]` plays a few popular videos. `WatchCheck twitch <channel> [seconds]` plays a stream.
 - It watches for an ad on screen, a stall or a black picture, and prints a JSON report.
@@ -243,7 +248,8 @@ closed port next to the game's, and download AWS's and Google Cloud's public add
 gstatic.com, gcping.com; kept for a week) to time a public endpoint in the server's cloud region.
 
 The app also checks the [releases repo](https://github.com/WebcodingAU/gaming-enjoyer-releases) on
-GitHub for updates, and the Library window loads gamingenjoyer.com. Nothing else is sent anywhere.
+GitHub for updates, and the Library window loads gamingenjoyer.com. The YouTube window sends the ID of each video you
+open to returnyoutubedislikeapi.com, to show its dislike count. Nothing else is sent anywhere.
 To stop syncing, choose **Unpair this PC** in the tray menu or remove the PC under **Settings** → **Your PCs**.
 
 ## Code signing policy

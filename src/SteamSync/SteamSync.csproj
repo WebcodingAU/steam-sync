@@ -28,6 +28,7 @@
     <!-- The Spotify player's page (SpotifyPlayer serves it from memory) and the glass bar LibraryWindow adds to the site. -->
     <EmbeddedResource Include="Spotify\spotify.html" LogicalName="SteamSync.spotify.html" />
     <EmbeddedResource Include="Spotify\glassbar.js" LogicalName="SteamSync.glassbar.js" />
+    <EmbeddedResource Include="Scripts\youtube-dislikes.js" LogicalName="SteamSync.youtube-dislikes.js" />
   </ItemGroup>
 
   <!-- The limiter behind "Prevent clipping" (limiter\limiter.c): a native VST2 plugin, because Equalizer APO loads it into

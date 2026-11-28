@@ -11,6 +11,9 @@ namespace WatchCheck;
 //
 //   WatchCheck youtube [seconds per video]     finds a few popular videos and plays each (default 40 s)
 //   WatchCheck twitch <channel> [seconds]      plays the channel (default 180 s)
+//   WatchCheck js <url> <script> [seconds]     opens the page in the YouTube or Twitch window (by the URL), waits
+//                                              (default 8 s) and prints what the script returns: for looking into a
+//                                              site change by hand
 //
 // Prints a JSON report. Exit code: 0 fine, 1 an ad showed, playback stalled or the picture was black, 2 nothing wrong
 // but nothing was proven either (no ad came up, or the site asked for a sign-in or a bot check).
@@ -36,7 +39,8 @@ internal static class Program
         Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        var site = args.FirstOrDefault() == "twitch" ? SteamSync.WatchSite.Twitch : SteamSync.WatchSite.YouTube;
+        var site = args.FirstOrDefault() == "twitch" || args.FirstOrDefault() == "js" && args.ElementAtOrDefault(1)?.Contains("twitch.tv") == true
+            ? SteamSync.WatchSite.Twitch : SteamSync.WatchSite.YouTube;
         var twitchLog = new List<string>();
         SteamSync.AdBlocker.Twitch.Log = line => { lock (twitchLog) twitchLog.Add(line); SteamSync.Log.Info(line); };
         var win = new SteamSync.WatchWindow(site) { Size = new Size(1280, 800) };
@@ -48,10 +52,15 @@ internal static class Program
                 for (var i = 0; i < 150 && web.CoreWebView2 is null; i++) await Task.Delay(200);
                 _core = web.CoreWebView2 ?? throw new InvalidOperationException("the window's browser didn't start");
                 _core.IsMuted = true;
+                // The window opens its home page itself once its browser is up; wait for that, so it doesn't replace the
+                // first page this check opens.
+                for (var i = 0; i < 75 && (string.IsNullOrEmpty(_core.Source) || _core.Source == "about:blank"); i++) await Task.Delay(200);
+                await Task.Delay(1500);
                 exit = args.FirstOrDefault() switch
                 {
                     "youtube" => await YouTube(args.Length > 1 ? int.Parse(args[1]) : 40),
                     "twitch" when args.Length > 1 => await Twitch(args[1], args.Length > 2 ? int.Parse(args[2]) : 180, twitchLog),
+                    "js" when args.Length > 2 => await Probe(args[1], args[2], args.Length > 3 ? int.Parse(args[3]) : 8),
                     _ => throw new ArgumentException("usage: WatchCheck youtube [seconds] | twitch <channel> [seconds]"),
                 };
             }
@@ -84,6 +93,7 @@ internal static class Program
         var videos = new JsonArray();
         Report["videos"] = videos;
         var proven = 0;
+        var withDislikes = 0;
         foreach (var url in urls)
         {
             await Navigate(url);
@@ -92,6 +102,7 @@ internal static class Program
             double adSeconds = 0, streak = 0, longest = 0, firstT = -1, lastT = -1;
             int frames = 0, black = 0, removed = 0, popups = 0;
             double popupSeconds = 0;
+            string? dislikes = null;
             var bot = false; var error = false;
             for (var tick = 0; tick < seconds * 2; tick++)
             {
@@ -103,6 +114,7 @@ internal static class Program
                       return { ad: !!(p && p.classList.contains('ad-showing')), t: v ? v.currentTime : -1,
                                stats: window[Symbol.for('advoid.youtube')]?.() ?? { removed: -1, popups: -1 },
                                popup: [...document.querySelectorAll('ytd-enforcement-message-view-model')].some(e => e.getClientRects().length > 0),
+                               dislikes: document.querySelector('ytd-watch-metadata [data-ge-dislikes]')?.textContent ?? null,
                                error: !!document.querySelector('.ytp-error'),
                                bot: /confirm you.re not a bot|Sign in to confirm/.test(text) }; })()
                     """);
@@ -116,15 +128,19 @@ internal static class Program
                 removed = Math.Max(removed, s["stats"]!["removed"]!.GetValue<int>());
                 popups = Math.Max(popups, s["stats"]!["popups"]!.GetValue<int>());
                 if (s["popup"]!.GetValue<bool>()) popupSeconds += 0.5;
+                if (s["dislikes"]?.GetValue<string>() is { Length: > 0 } d) dislikes = d;
                 bot |= s["bot"]!.GetValue<bool>();
                 error |= s["error"]!.GetValue<bool>();
                 if (tick % 20 == 19 && !ad && await IsBlack() is { } isBlack) { frames++; if (isBlack) black++; }
             }
             var played = lastT - Math.Max(firstT, 0);
+            await Shot("youtube-" + videos.Count);
             entry["adSeconds"] = adSeconds;
             entry["played"] = Math.Round(played, 1);
             entry["removed"] = removed;
             if (popups > 0) entry["popupsRemoved"] = popups;
+            entry["dislikes"] = dislikes;
+            if (dislikes is not null) withDislikes++;
             entry["blackFrames"] = $"{black}/{frames}";
             if (bot) { entry["status"] = "bot check"; Notes.Add($"{url}: YouTube asked for a sign-in or bot check"); continue; }
             if (error) entry["status"] = "player error";
@@ -136,6 +152,10 @@ internal static class Program
             else if (popups > 0) Notes.Add($"{url}: YouTube sent its ad-blocker popup {popups} time(s); AdVoid removed it: YouTube has flagged this profile");
             if (removed > 0) proven++;
         }
+        // The app's dislike counts (Scripts/youtube-dislikes.js): none at all means YouTube moved the button or the
+        // Return YouTube Dislike API is down.
+        if (withDislikes == 0) Problems.Add("no video showed a dislike count (the button moved, or returnyoutubedislikeapi.com is down)");
+        else if (withDislikes < urls.Count) Notes.Add($"{withDislikes} of {urls.Count} videos showed a dislike count");
         await Stealth();
         await PopupFallback();
         if (Problems.Count > 0) return 1;
@@ -232,7 +252,25 @@ internal static class Program
         return 0;
     }
 
+    private static async Task<int> Probe(string url, string script, int seconds)
+    {
+        await Navigate(url);
+        await Task.Delay(seconds * 1000);
+        Report["value"] = (await Js(script))?.DeepClone();
+        await Shot("probe");
+        return 0;
+    }
+
     // ------------------------------------------------------------ helpers
+
+    // With WATCHCHECK_SHOTS set to a folder, a picture of the window after each video or stream, to look at by eye.
+    private static async Task Shot(string name)
+    {
+        if (Environment.GetEnvironmentVariable("WATCHCHECK_SHOTS") is not { Length: > 0 } dir) return;
+        Directory.CreateDirectory(dir);
+        await using var file = File.Create(Path.Combine(dir, name + ".png"));
+        await _core.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png, file);
+    }
 
     private static async Task<JsonNode?> Js(string script)
     {
